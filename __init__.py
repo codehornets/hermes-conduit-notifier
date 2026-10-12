@@ -5,11 +5,14 @@ from __future__ import annotations
 import functools
 import logging
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-from . import call_tool, call_watches, calls, clarify_loop, settings_tool
+from hermes_constants import get_hermes_home
+
+from . import call_tool, call_watches, calls, clarify_loop, desktop_selected, settings_tool
 from .client import enqueue
 from .events import approval_decision, clarification_text, event_id, is_silent_response, push_event
 
@@ -19,6 +22,10 @@ _child_sessions: set[str] = set()
 _children_lock = threading.Lock()
 _profile = "default"
 _clarify_loop_active = False
+# turn_id -> when its pre_llm_call ran (#87, time.monotonic()), oldest first.
+_turn_started: dict[str, float] = {}
+_turn_started_lock = threading.Lock()
+MAX_TURN_STARTS = 256
 
 
 def register(ctx: Any) -> None:
@@ -97,6 +104,7 @@ def _post_llm_call(**kwargs: Any) -> None:
     response = kwargs.get("assistant_response")
     if _is_child(session_id):
         return
+    started = _take_turn_start(kwargs.get("turn_id"))
     ready = None if is_silent_response(response) else push_event(
         "response.ready",
         identifier=event_id("response", kwargs.get("turn_id"), session_id),
@@ -108,8 +116,26 @@ def _post_llm_call(**kwargs: Any) -> None:
     # request takes the place of the ready notification.
     if calls.turn_ended(session_id, "done", profile=_profile, fallback=ready):
         return
-    if ready is not None:
+    # A quick reply in a chat Hermes Desktop has selected: the user most
+    # likely watched it arrive there (#87).
+    if ready is not None and not _desktop_watched(session_id, started):
         enqueue(ready)
+
+
+def _take_turn_start(turn_id: Any) -> float | None:
+    """When this turn's pre_llm_call ran, if noted; the entry goes either way."""
+    if not isinstance(turn_id, str) or not turn_id:  # Hermes passes a str
+        return None
+    with _turn_started_lock:
+        return _turn_started.pop(turn_id, None)
+
+
+def _desktop_watched(session_id: str, started: float | None) -> bool:
+    try:
+        return desktop_selected.quick(started) and desktop_selected.selected(get_hermes_home(), session_id)
+    except Exception:  # noqa: BLE001 — can't tell, so the push goes out
+        logger.debug("conduit_push: Desktop selection unreadable", exc_info=True)
+        return False
 
 
 def _on_session_end(**kwargs: Any) -> None:
@@ -243,12 +269,28 @@ def _pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     """Context for this turn: calls from Hermes the user declined or missed
     since the last turn of this chat (#449), and the voice persona hint."""
     session_id = _text(kwargs.get("session_id"))
+    if not _is_child(session_id):
+        _note_turn_start(kwargs.get("turn_id"))
     notes = [
         None if _is_child(session_id) else calls.outcome_note(session_id),
         _voice_persona_note(kwargs.get("conversation_history")),
     ]
     context = "\n\n".join(note for note in notes if note)
     return {"context": context} if context else None
+
+
+def _note_turn_start(turn_id: Any) -> None:
+    """When each turn started, for the quick-reply check in post_llm_call. A
+    turn that never reaches post_llm_call leaves its entry, so the oldest go
+    once there are many."""
+    if not isinstance(turn_id, str) or not turn_id:
+        return
+    with _turn_started_lock:
+        # A repeated id moves to the end, so eviction takes the oldest turn.
+        _turn_started.pop(turn_id, None)
+        _turn_started[turn_id] = time.monotonic()
+        while len(_turn_started) > MAX_TURN_STARTS:
+            _turn_started.pop(next(iter(_turn_started)))
 
 
 def _voice_persona_note(history: Any) -> str | None:

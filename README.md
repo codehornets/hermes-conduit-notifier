@@ -730,6 +730,30 @@ writes Hermes' own read flag, so Desktop's unread dots don't change.
 - An open is skipped when the gateway can't say which profile its chat
   belongs to, rather than guessed onto the default profile.
 
+## Quiet while you read in Desktop (plugin 0.20+)
+
+A reply that comes back within 2 minutes in a chat Hermes Desktop (or the
+web dashboard) has selected on this host sends no "response ready" push:
+you most likely watched it arrive there. A longer turn still pushes, since
+you have likely walked away, and every other notification stays as it was:
+other chats, background jobs, approvals, questions, failed turns and calls.
+There is nothing to set up.
+
+- The selection is the one [Chats opened on Desktop](#chats-opened-on-desktop-plugin-012)
+  follows: each Desktop connection's selected chat, ended when it switches
+  chats or its socket closes. The host can't see whether the window is in
+  front, so a short reply in a chat left selected on an unattended Mac stays
+  quiet on the phone (Desktop's own notification still shows on the Mac
+  when its window is in the background).
+- The dashboard publishes the selected stored chat ids, per Hermes home, in
+  `<hermes home>/conduit-desktop-selected.json` (private to the user) when
+  they change, and renews the file every 30 seconds while anything is
+  selected. The turn hooks trust it for 45 seconds, so a stopped dashboard
+  stops quieting anything.
+- A turn's 2 minutes run from its `pre_llm_call` to its `post_llm_call`. A
+  turn with no start time, a file that can't be read, or `plugins.isolation:
+  host` (where Desktop views aren't observed) all push as before.
+
 ## Hermes calls you (plugin 0.13+)
 
 In a Live Voice call you can hand Hermes a long job and say "call me when

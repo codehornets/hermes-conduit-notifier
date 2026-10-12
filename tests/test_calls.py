@@ -845,3 +845,81 @@ def test_an_unreadable_store_says_nothing_and_never_raises(home, monkeypatch):
     monkeypatch.setattr(calls, "get_hermes_home", lambda: (_ for _ in ()).throw(RuntimeError("no home")))
     assert calls.outcome_note("rt-1") is None
     assert plugin._pre_llm_call(session_id="rt-1") is None
+
+
+
+def _desktop_selects(home, monkeypatch, *ids):
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: home)
+    sys.modules["conduit_push.desktop_selected"].publish(home, ids)
+
+
+def test_a_quick_reply_in_a_chat_desktop_has_selected_sends_no_ready_push(home, fake, monkeypatch):
+    _desktop_selects(home, monkeypatch, "st-1")
+    plugin._pre_llm_call(session_id="st-1", turn_id="t1")
+    plugin._post_llm_call(session_id="st-1", turn_id="t1", assistant_response="All done.")
+    assert fake.enqueued == []
+    # Another chat still notifies.
+    plugin._pre_llm_call(session_id="st-2", turn_id="t2")
+    plugin._post_llm_call(session_id="st-2", turn_id="t2", assistant_response="Also done.")
+    assert [event["session_id"] for event in fake.enqueued] == ["st-2"]
+
+
+def test_a_long_turn_in_a_chat_desktop_has_selected_still_pushes(home, fake, monkeypatch):
+    _desktop_selects(home, monkeypatch, "st-1")
+    plugin._pre_llm_call(session_id="st-1", turn_id="t1")
+    desktop_selected = sys.modules["conduit_push.desktop_selected"]
+    plugin._turn_started["t1"] -= desktop_selected.QUICK_TURN_S + 1
+    plugin._post_llm_call(session_id="st-1", turn_id="t1", assistant_response="All done.")
+    assert [event["type"] for event in fake.enqueued] == ["response.ready"]
+
+
+def test_a_turn_without_a_start_time_still_pushes(home, fake, monkeypatch):
+    _desktop_selects(home, monkeypatch, "st-1")
+    plugin._post_llm_call(session_id="st-1", turn_id="t-unknown", assistant_response="All done.")
+    assert [event["type"] for event in fake.enqueued] == ["response.ready"]
+
+
+def test_a_watched_job_in_a_chat_desktop_has_selected_still_calls(home, fake, monkeypatch):
+    _desktop_selects(home, monkeypatch, "rt-1")
+    _watch(home, "rt-1")
+    plugin._pre_llm_call(session_id="rt-1", turn_id="t1")
+    plugin._post_llm_call(session_id="rt-1", turn_id="t1", assistant_response="All done.")
+    assert fake.sent[0]["type"] == "call.requested"
+
+
+def test_an_unreadable_desktop_selection_never_drops_the_ready_push(home, fake, monkeypatch):
+    def broken(*_args, **_kwargs):
+        raise OSError("disk")
+
+    monkeypatch.setattr(sys.modules["conduit_push.desktop_selected"], "selected", broken)
+    plugin._pre_llm_call(session_id="rt-1", turn_id="t1")
+    plugin._post_llm_call(session_id="rt-1", turn_id="t1", assistant_response="All done.")
+    assert [event["type"] for event in fake.enqueued] == ["response.ready"]
+
+
+def test_turn_start_times_stay_bounded():
+    for index in range(plugin.MAX_TURN_STARTS + 10):
+        plugin._note_turn_start(f"bound-{index}")
+    assert len(plugin._turn_started) <= plugin.MAX_TURN_STARTS
+    assert "bound-0" not in plugin._turn_started
+
+
+def test_a_repeated_turn_id_is_kept_as_the_newest(monkeypatch):
+    monkeypatch.setattr(plugin, "_turn_started", {})
+    plugin._note_turn_start("again")
+    for index in range(plugin.MAX_TURN_STARTS - 1):
+        plugin._note_turn_start(f"other-{index}")
+    plugin._note_turn_start("again")
+    plugin._note_turn_start("one-more")
+    assert "again" in plugin._turn_started
+
+
+def test_child_and_silent_turns_leave_no_start_time(home, fake, monkeypatch):
+    monkeypatch.setattr(plugin, "_turn_started", {})
+    plugin._subagent_start(child_session_id="child-9")
+    plugin._pre_llm_call(session_id="child-9", turn_id="c1")
+    plugin._pre_llm_call(session_id="st-1", turn_id="s1")
+    plugin._post_llm_call(session_id="st-1", turn_id="s1", assistant_response="[Silent]")
+    assert plugin._turn_started == {}
+    plugin._subagent_stop(child_session_id="child-9", parent_session_id="st-1")
+
