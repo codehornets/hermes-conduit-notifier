@@ -19,6 +19,9 @@ agent's personality. Read-only.
 GPT-Live: exchanges Conduit's WebRTC offer for a GPT-Live answer using this
 host's Codex sign-in, so live voice bills the ChatGPT subscription. The OAuth
 token and account id stay on the host (hermes-agent#108940, host half).
+Conduit can instead ask for a session billed to this host's OpenAI API key
+(``billing: "api"``), only when the profile turns that on; the two never
+stand in for each other.
 
 Grok Live: relays Conduit's realtime socket to xAI, adding this host's
 SuperGrok sign-in (or XAI_API_KEY) on the way. The bearer stays on the host.
@@ -375,18 +378,38 @@ class _MintLimiter:
         self._mints: Dict[str, deque] = {}
         self._lock = threading.Lock()
 
-    def acquire(self, key: str) -> None:
+    def acquire(self, key: str, limit: Optional[int] = None) -> float:
+        """Takes a slot and returns its mint (for ``release``). ``limit`` overrides
+        the cap for this call (a cap read from the profile's config)."""
+        limit = self.limit if limit is None else limit
         now = self.clock()
         with self._lock:
-            # Drop buckets whose newest mint has aged out, so idle keys don't pile up.
-            for stale in [k for k, q in self._mints.items() if now - q[-1] >= self.window_s]:
+            # Drop buckets whose newest mint has aged out (or that are empty), so idle keys don't pile up.
+            for stale in [k for k, q in self._mints.items() if not q or now - q[-1] >= self.window_s]:
                 del self._mints[stale]
+            if limit <= 0:
+                raise TokenError(429, self.message)
             mints = self._mints.setdefault(key, deque())
             while mints and now - mints[0] >= self.window_s:
                 mints.popleft()
-            if len(mints) >= self.limit:
+            if len(mints) >= limit:
                 raise TokenError(429, self.message)
             mints.append(now)
+            return now
+
+    def release(self, key: str, mint: float) -> None:
+        """Gives back the slot ``acquire`` returned, for a request that failed
+        before it cost anything. The other mints keep their own times."""
+        with self._lock:
+            mints = self._mints.get(key)
+            if not mints:
+                return
+            try:
+                mints.remove(mint)
+            except ValueError:
+                return  # already aged out
+            if not mints:
+                del self._mints[key]
 
 
 _mint_limiter = _MintLimiter(MINT_LIMIT, MINT_WINDOW_S)
@@ -1048,6 +1071,16 @@ async def get_personality(response: Response, profile: Optional[str] = None) -> 
 # Once Hermes ships the same exchange (tools.voice_live grows
 # _create_subscription_session), this route hands the request to Hermes and
 # keeps only its URL, so Conduit needs no change when upstream lands.
+#
+# GPT-Live on an API key is a separate path Conduit must ask for by name
+# (``billing: "api"``): the public GPT-Live API (POST /v1/live/sessions, the
+# one Hermes' desktop voice mode uses) on this host's OpenAI key, billed per
+# minute. A request without ``billing`` is a subscription request, so an older
+# Conduit can never start an API-billed call. Each path fails on its own and
+# never falls back to the other, the response's ``auth`` names the path that
+# was used, and the profile must turn the API path on
+# (voice.gpt_live.conduit_api_billing: true): an OpenAI key that is here for
+# speech-to-text or TTS is not enough on its own.
 
 GPT_LIVE_URL = "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
 GPT_LIVE_DEFAULT_MODEL = "gpt-live-1-codex"
@@ -1070,6 +1103,28 @@ GPT_LIVE_REQUEST_TIMEOUT_S = GPT_LIVE_TIMEOUT_S + 2
 GPT_LIVE_NO_FALLBACK = "No API fallback was used."
 _GPT_LIVE_VOICE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _GPT_LIVE_CALL_ID = re.compile(r"rtc_[A-Za-z0-9_-]+|[0-9a-fA-F-]{36}")
+
+# The two ways a GPT-Live call is paid for. A request names one; a request
+# that names none is a subscription request.
+GPT_LIVE_BILLINGS = ("subscription", "api")
+# The public GPT-Live API, on this host's OpenAI key (Hermes' tools.voice_live
+# defaults, read from voice.gpt_live's model / voice / api_key / base_url).
+GPT_LIVE_API_BASE_URL = "https://api.openai.com/v1"
+GPT_LIVE_API_DEFAULT_MODEL = "gpt-live-1"
+GPT_LIVE_API_DEFAULT_VOICE = "marin"
+# The profile's own switch for API-billed calls from Conduit.
+GPT_LIVE_API_SWITCH = "conduit_api_billing"
+# API-billed calls one profile may start per day unless voice.gpt_live
+# .conduit_api_daily_calls says otherwise. Counted in memory: a restart of the
+# dashboard starts the count again.
+GPT_LIVE_API_DAILY_CALLS = 20
+GPT_LIVE_API_DAILY_KEY = "conduit_api_daily_calls"
+GPT_LIVE_API_HOST = "api.openai.com"
+GPT_LIVE_DAY_S = 24 * 60 * 60
+GPT_LIVE_NO_SUBSCRIPTION = "The ChatGPT subscription was not used."
+# Loose on purpose: the public API's id format is unverified and the id is only
+# echoed back to Conduit, never put in a URL or header.
+GPT_LIVE_API_SESSION_ID_MAX = 256
 
 # Hermes' own voice-layer persona (tools/voice_live.py), for a Hermes that
 # predates that module. Short on purpose: the live model delegates real work.
@@ -1100,6 +1155,9 @@ _gpt_live_executor = ThreadPoolExecutor(max_workers=GPT_LIVE_WORKERS, thread_nam
 _gpt_live_status_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="conduit-gpt-live-status")
 _gpt_live_limiter = _MintLimiter(GPT_LIVE_LIMIT, GPT_LIVE_WINDOW_S,
                                  message="Too many GPT-Live session requests; try again shortly")
+_gpt_live_api_daily = _MintLimiter(GPT_LIVE_API_DAILY_CALLS, GPT_LIVE_DAY_S,
+                                   message="This profile reached its daily limit of GPT-Live calls on the API key "
+                                           "(voice.gpt_live.conduit_api_daily_calls). Nothing was billed.")
 
 
 def _upstream_voice_live() -> Any:
@@ -1189,12 +1247,119 @@ def gpt_live_status() -> Dict[str, Any]:
     model, voice = _gpt_live_model_voice(live)
     status: Dict[str, Any] = {"auth": "subscription", "model": model, "voice": voice,
                               "source": "hermes" if _upstream_voice_live() else "plugin"}
+    # The API path's readiness rides along under its own key: the top-level
+    # fields stay the subscription's, which is all an older Conduit reads.
+    status["api"] = gpt_live_api_status(live)
     try:
         _codex_credentials(refresh_if_expiring=False)
     except TokenError as exc:
         # A readiness reason, not a call failure: without the "no fallback" sentence.
         return {**status, "available": False, "reason": str(exc).replace(" " + GPT_LIVE_NO_FALLBACK, "")}
     return {**status, "available": True, "reason": None}
+
+
+GPT_LIVE_API_OFF = ("GPT-Live on the API key is off for this profile. To allow it, set "
+                    "voice.gpt_live.conduit_api_billing: true in the Hermes config.")
+GPT_LIVE_API_NO_CALLS = ("GPT-Live on the API key allows no calls for this profile "
+                         "(voice.gpt_live.conduit_api_daily_calls is 0).")
+
+
+def _gpt_live_api_enabled(live: Dict[str, Any]) -> bool:
+    # Only a real true: "yes", 1 or a typo never turns on billing.
+    return live.get(GPT_LIVE_API_SWITCH) is True
+
+
+def _gpt_live_api_daily_calls(live: Dict[str, Any]) -> int:
+    value = live.get(GPT_LIVE_API_DAILY_KEY)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return GPT_LIVE_API_DAILY_CALLS
+    return value
+
+
+def _gpt_live_api_model_voice(live: Dict[str, Any]) -> tuple:
+    return (str(live.get("model") or "").strip() or GPT_LIVE_API_DEFAULT_MODEL,
+            str(live.get("voice") or "").strip() or GPT_LIVE_API_DEFAULT_VOICE)
+
+
+def _gpt_live_api_base_url(live: Dict[str, Any]) -> tuple:
+    """(base URL, its host) for the API path; TokenError(503) for one that isn't an https URL with a host."""
+    base_url = str(live.get("base_url") or GPT_LIVE_API_BASE_URL).strip().rstrip("/")
+    try:
+        parsed = urllib.parse.urlparse(base_url)
+        host = parsed.hostname or ""
+    except ValueError:
+        parsed, host = None, ""
+    if (parsed is None or parsed.scheme != "https" or not host or parsed.query or parsed.fragment
+            or any(c in base_url for c in "\r\n\t ")):
+        raise TokenError(503, "voice.gpt_live.base_url must be an https URL with a host and no query or "
+                              "fragment. " + GPT_LIVE_NO_SUBSCRIPTION)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise TokenError(503, "voice.gpt_live.base_url has an invalid port. " + GPT_LIVE_NO_SUBSCRIPTION)
+    # The shared key's gate below compares the host; a non-standard port is another service.
+    if port not in (None, 443):
+        host = f"{host}:{port}"
+    return base_url, host
+
+
+def _gpt_live_api_credentials(live: Dict[str, Any]) -> tuple:
+    """(api key, base URL, host) for the API path, the way Hermes' desktop voice
+    mode resolves them: voice.gpt_live.api_key, else the OpenAI audio key chain
+    (VOICE_TOOLS_OPENAI_KEY, OPENAI_API_KEY). The shared chain only ever goes to
+    OpenAI itself: a custom base_url needs its own voice.gpt_live.api_key, so the
+    host's general key never reaches another service. TokenError(503) otherwise."""
+    base_url, host = _gpt_live_api_base_url(live)
+    key = str(live.get("api_key") or "").strip()
+    if not key:
+        if host != GPT_LIVE_API_HOST:
+            raise TokenError(503, f"voice.gpt_live.base_url points at {host}, so GPT-Live needs its own key there "
+                                  "(voice.gpt_live.api_key); the host's OPENAI_API_KEY only goes to OpenAI. "
+                                  + GPT_LIVE_NO_SUBSCRIPTION)
+        try:
+            import tools.tool_backend_helpers as helpers
+        except ImportError as exc:
+            # Only a Hermes without the helper falls back to the environment; a
+            # broken import inside it is a failure, not an absent helper.
+            if exc.name not in ("tools", "tools.tool_backend_helpers"):
+                logger.warning("GPT-Live could not load Hermes' OpenAI key lookup: %s", type(exc).__name__)
+                raise TokenError(503, "GPT-Live could not read the OpenAI key on the Hermes host. " + GPT_LIVE_NO_SUBSCRIPTION)
+            helpers = None
+        resolve_openai_audio_api_key = getattr(helpers, "resolve_openai_audio_api_key", None)
+        if not callable(resolve_openai_audio_api_key):
+            # The profile's own .env where Hermes can say, as its key chain reads it.
+            try:
+                key = str(_env_value("VOICE_TOOLS_OPENAI_KEY") or _env_value("OPENAI_API_KEY") or "").strip()
+            except Exception as exc:
+                logger.warning("GPT-Live could not read the OpenAI key: %s", type(exc).__name__)
+                key = ""
+        else:
+            try:
+                key = str(resolve_openai_audio_api_key() or "").strip()
+            except Exception as exc:
+                logger.warning("GPT-Live could not read the OpenAI key: %s", type(exc).__name__)
+                key = ""
+    if not key or any(c in key for c in "\r\n"):
+        raise TokenError(503, "GPT-Live on the API key needs an OpenAI API key on the Hermes host "
+                              "(OPENAI_API_KEY or voice.gpt_live.api_key). " + GPT_LIVE_NO_SUBSCRIPTION)
+    return key, base_url, host
+
+
+def gpt_live_api_status(live: Dict[str, Any]) -> Dict[str, Any]:
+    """Readiness of the API path: the profile's switch, then a key. Never returns the key."""
+    model, voice = _gpt_live_api_model_voice(live)
+    status: Dict[str, Any] = {"auth": "api", "model": model, "voice": voice, "enabled": _gpt_live_api_enabled(live),
+                              "daily_limit": _gpt_live_api_daily_calls(live)}
+    if not status["enabled"]:
+        return {**status, "available": False, "reason": GPT_LIVE_API_OFF}
+    if status["daily_limit"] == 0:
+        return {**status, "available": False, "reason": GPT_LIVE_API_NO_CALLS}
+    try:
+        _key, _base_url, host = _gpt_live_api_credentials(live)
+    except TokenError as exc:
+        return {**status, "available": False, "reason": str(exc).replace(" " + GPT_LIVE_NO_SUBSCRIPTION, "")}
+    # Which OpenAI-compatible service bills the call; the host only, no path or key.
+    return {**status, "available": True, "reason": None, "host": host}
 
 
 def gpt_live_session_config(history: Optional[list], live: Dict[str, Any]) -> Dict[str, Any]:
@@ -1256,6 +1421,102 @@ def _plugin_gpt_live_session(sdp: str, config: Dict[str, Any], post: Callable[..
     if not _valid_answer(answer, call_id):
         raise TokenError(502, "GPT-Live returned an invalid WebRTC answer. " + GPT_LIVE_NO_FALLBACK)
     return {"auth": "subscription", "session": {"id": call_id}, "transport": {"type": "webrtc", "sdp": answer}}
+
+
+def _clean_billing(billing: Any) -> str:
+    """The path Conduit asked to be billed on. None is the subscription: only a
+    Conduit that names the API path by name can start an API-billed call."""
+    if billing is None:
+        return "subscription"
+    if not isinstance(billing, str) or billing not in GPT_LIVE_BILLINGS:
+        raise TokenError(400, "billing must be subscription or api")
+    return billing
+
+
+def gpt_live_api_session_config(history: Optional[list], live: Dict[str, Any]) -> Dict[str, Any]:
+    """The ``session`` object for POST /v1/live/sessions (client delegation, as Hermes' own)."""
+    model, voice = _gpt_live_api_model_voice(live)
+    config: Dict[str, Any] = {
+        "model": model,
+        "instructions": _gpt_live_instructions(live),
+        "audio": {"output": {"voice": voice}},
+        "delegation": {"type": "client"},
+    }
+    if history:
+        # The public API names seeded history input.
+        config["input"] = history
+    return config
+
+
+def _api_gpt_live_session(sdp: str, history: Optional[list], live: Dict[str, Any], limiter_key: Optional[str],
+                          post: Callable[..., tuple], *, briefing_applied: bool, greeting_applied: bool) -> Dict[str, Any]:
+    """A GPT-Live call billed to this host's OpenAI key. Never the subscription:
+    every failure here is an error, and nothing else is tried."""
+    if not _gpt_live_api_enabled(live):
+        raise TokenError(403, GPT_LIVE_API_OFF + " " + GPT_LIVE_NO_SUBSCRIPTION)
+    daily_limit = _gpt_live_api_daily_calls(live)
+    if daily_limit == 0:
+        raise TokenError(403, GPT_LIVE_API_NO_CALLS + " " + GPT_LIVE_NO_SUBSCRIPTION)
+    key, base_url, _host = _gpt_live_api_credentials(live)
+    # Counted only once the call can really be billed, so a missing key doesn't use up the day,
+    # and given back below when OpenAI doesn't start it.
+    daily_key = limiter_key or ""
+    mint = _gpt_live_api_daily.acquire(daily_key, limit=daily_limit)
+    try:
+        return _api_gpt_live_exchange(sdp, history, live, key, base_url, post,
+                                      briefing_applied=briefing_applied, greeting_applied=greeting_applied)
+    except _GPTLiveAPIAnsweredError:
+        # OpenAI said yes, so a billed session may exist: the slot stays counted.
+        raise
+    except BaseException:
+        _gpt_live_api_daily.release(daily_key, mint)
+        raise
+
+
+class _GPTLiveAPIAnsweredError(TokenError):
+    """A failure after OpenAI answered 2xx: a session may have started, so its daily slot stays used."""
+
+
+def _api_gpt_live_exchange(sdp: str, history: Optional[list], live: Dict[str, Any], key: str, base_url: str,
+                           post: Callable[..., tuple], *, briefing_applied: bool, greeting_applied: bool) -> Dict[str, Any]:
+    config = gpt_live_api_session_config(history, live)
+    try:
+        status, text, _location = post(f"{base_url}/live/sessions", {"Authorization": f"Bearer {key}"},
+                                       {"session": config, "transport": {"type": "webrtc", "sdp": sdp}})
+    except TokenError as exc:
+        # Said for this path, whatever the shared transport's own wording.
+        raise TokenError(exc.status, "GPT-Live on the API key could not connect, or its answer was invalid. "
+                                     + GPT_LIVE_NO_SUBSCRIPTION)
+    if not 200 <= status < 300:
+        logger.warning("GPT-Live API session was rejected: HTTP %s", status)
+        if status == 401:
+            raise TokenError(502, "OpenAI rejected the API key (HTTP 401); check voice.gpt_live.api_key or "
+                                  "OPENAI_API_KEY on the Hermes host. " + GPT_LIVE_NO_SUBSCRIPTION)
+        if status == 429:
+            raise TokenError(429, "OpenAI is rate-limiting or out of quota for this API key (HTTP 429); try "
+                                  "again later. " + GPT_LIVE_NO_SUBSCRIPTION)
+        raise TokenError(502, f"GPT-Live on the API key was rejected (HTTP {status}); check the OpenAI key "
+                              "and its access to GPT-Live. " + GPT_LIVE_NO_SUBSCRIPTION)
+    try:
+        answer = json.loads(text)
+    except ValueError:
+        answer = None
+    session = answer.get("session") if isinstance(answer, dict) else None
+    transport = answer.get("transport") if isinstance(answer, dict) else None
+    session_id = session.get("id") if isinstance(session, dict) else None
+    answer_sdp = transport.get("sdp") if isinstance(transport, dict) else None
+    if (not isinstance(answer_sdp, str) or not answer_sdp.startswith("v=0")
+            or transport.get("type") != "webrtc"
+            or not isinstance(session_id, str) or not session_id or len(session_id) > GPT_LIVE_API_SESSION_ID_MAX
+            or not session_id.isprintable()):
+        raise _GPTLiveAPIAnsweredError(502, "GPT-Live returned an invalid WebRTC answer. " + GPT_LIVE_NO_SUBSCRIPTION)
+    model, voice = _gpt_live_api_model_voice(live)
+    # Only the fields Conduit reads; "auth" names the path that was billed. The
+    # public API's answer doesn't echo the session, so briefing_applied,
+    # greeting_applied and voice say what was sent, not what OpenAI confirmed.
+    return {"auth": "api", "session": {"id": session_id}, "transport": {"type": "webrtc", "sdp": answer_sdp},
+            "source": "plugin", "model": model, "voice": voice,
+            "briefing_applied": briefing_applied, "greeting_applied": greeting_applied}
 
 
 def _clean_history(history: Any) -> Optional[list]:
@@ -1388,9 +1649,11 @@ def create_gpt_live_session(
     briefing: Any = None,
     greeting: Any = None,
     call_opening: Any = None,
+    billing: Any = None,
 ) -> Dict[str, Any]:
     if not isinstance(sdp, str) or not sdp.startswith("v=0"):
         raise TokenError(400, "sdp must be a WebRTC SDP offer")
+    billing = _clean_billing(billing)
     history = _clean_history(history)
     voice = _clean_voice(voice)
     briefing = _clean_briefing(briefing)
@@ -1398,9 +1661,9 @@ def create_gpt_live_session(
     call_opening = _clean_call_opening(call_opening)
     if limiter_key is not None:
         _gpt_live_limiter.acquire(limiter_key)
-    live = {**_gpt_live_settings(), "auth": "subscription"}
+    live = {**_gpt_live_settings(), "auth": billing}
     if voice:
-        live["subscription_voice"] = voice
+        live["voice" if billing == "api" else "subscription_voice"] = voice
     if briefing:
         # Part of the session's instructions, so the model has it before the first word:
         # sent as context appends after the call starts, it answers each chunk out loud.
@@ -1414,6 +1677,9 @@ def create_gpt_live_session(
     speaks_first = call_opening or greeting is not None
     extra = str(live.get("instructions") or "").strip()
     live["instructions"] = f"{extra}\n\n{opening}" if extra else opening
+    if billing == "api":
+        return _api_gpt_live_session(sdp, history, live, limiter_key, post or _post_sdp,
+                                     briefing_applied=bool(briefing), greeting_applied=speaks_first)
     # Echoed back so Conduit can tell a host that applied the chosen voice from one that ignored it.
     applied_voice = _gpt_live_model_voice(live)[1]
     upstream = _upstream_voice_live()
@@ -1475,7 +1741,7 @@ async def post_gpt_live_session(request: Request, response: Response, profile: O
                 profile,
                 lambda: create_gpt_live_session(body.get("sdp"), body.get("history"), limiter_key=_limiter_key(profile), voice=body.get("voice"),
                                                 briefing=body.get("briefing"), greeting=body.get("greeting"),
-                                                call_opening=body.get("call_opening")),
+                                                call_opening=body.get("call_opening"), billing=body.get("billing")),
                 _gpt_live_executor,
             ),
             timeout=GPT_LIVE_REQUEST_TIMEOUT_S,

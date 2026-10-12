@@ -272,7 +272,11 @@ def test_rejected_or_malformed_answers_are_a_502(client, openai, status, answer,
 def test_status_checks_credentials_without_refreshing(client, hermes):
     body = client.get(f"{BASE}/gpt-live/status").json()
     assert body == {"ok": True, "auth": "subscription", "model": "gpt-live-1-codex", "voice": "cove",
-                    "source": "plugin", "available": True, "reason": None}
+                    "source": "plugin", "available": True, "reason": None,
+                    "api": {"auth": "api", "model": "gpt-live-1", "voice": "marin", "enabled": False,
+                            "daily_limit": api.GPT_LIVE_API_DAILY_CALLS, "available": False,
+                            "reason": api.GPT_LIVE_API_OFF}}
+    assert "conduit_api_billing" in body["api"]["reason"]
     assert hermes.refresh == [False]
 
     hermes.auth_error = True
@@ -531,3 +535,275 @@ def test_an_unencodable_header_is_a_502_without_the_value(monkeypatch):
         api._post_sdp(api.GPT_LIVE_URL, {}, {"sdp": OFFER})
     assert raised.value.status == 502
     assert "No API fallback" in str(raised.value) and "SECRET-DETAIL" not in str(raised.value)
+
+
+# --- GPT-Live billed to the host's OpenAI API key ----------------------------
+
+API_ANSWER = {"session": {"id": "sess_live1"}, "transport": {"type": "webrtc", "sdp": ANSWER}}
+
+
+@pytest.fixture
+def api_key(hermes, openai, monkeypatch):
+    """The profile allows API billing, a key is set, and OpenAI answers like /v1/live/sessions."""
+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-live-test")
+    hermes.config = {"voice": {"gpt_live": {"conduit_api_billing": True}}}
+    openai.reply.update(status=200, answer=json.dumps(API_ANSWER), location="")
+    monkeypatch.setattr(api, "_gpt_live_api_daily", api._MintLimiter(api.GPT_LIVE_API_DAILY_CALLS, api.GPT_LIVE_DAY_S,
+                                                               message=api._gpt_live_api_daily.message))
+    return hermes
+
+
+def test_a_request_without_billing_is_never_billed_to_the_api_key(client, api_key, openai):
+    openai.reply.update(status=201, answer=ANSWER, location="/v1/realtime/calls/rtc_abc123")
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER})
+    assert response.json()["auth"] == "subscription"
+    assert openai.calls[0][0] == api.GPT_LIVE_URL
+
+
+def test_api_billing_uses_the_public_live_api_on_the_hosts_key(client, api_key, openai):
+    history = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api", "history": history,
+                                                           "voice": "cedar", "briefing": "Be brief."})
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True, "auth": "api", "source": "plugin", "model": "gpt-live-1", "voice": "cedar",
+        "briefing_applied": True, "greeting_applied": False,
+        "session": {"id": "sess_live1"}, "transport": {"type": "webrtc", "sdp": ANSWER},
+    }
+    url, headers, body = openai.calls[0]
+    assert url == "https://api.openai.com/v1/live/sessions"
+    assert headers == {"Authorization": "Bearer sk-live-test"}
+    # The offer goes byte-exact: the vendor's parser needs its trailing CRLF.
+    assert body["transport"] == {"type": "webrtc", "sdp": OFFER}
+    session = body["session"]
+    assert session["model"] == "gpt-live-1"
+    assert session["audio"] == {"output": {"voice": "cedar"}}
+    assert session["delegation"] == {"type": "client"}
+    assert session["input"] == history and "initial_items" not in session
+    assert "Be brief." in session["instructions"]
+    assert "sk-live-test" not in response.text
+
+
+def test_api_billing_reads_the_profiles_api_model_voice_and_base_url(client, api_key, openai):
+    api_key.config["voice"]["gpt_live"].update(model="gpt-live-1-mini", voice="quartz", base_url="https://example.test/openai/v1/",
+                                               api_key="sk-profile", subscription_voice="ember")
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.json()["voice"] == "quartz"
+    url, headers, body = openai.calls[0]
+    assert url == "https://example.test/openai/v1/live/sessions"
+    assert headers["Authorization"] == "Bearer sk-profile"
+    assert body["session"]["model"] == "gpt-live-1-mini"
+
+
+@pytest.mark.parametrize("switch", [None, False, "true", 1, "yes"])
+def test_api_billing_needs_the_profiles_own_switch(client, api_key, openai, switch):
+    live = api_key.config["voice"]["gpt_live"]
+    if switch is None:
+        del live["conduit_api_billing"]
+    else:
+        live["conduit_api_billing"] = switch
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.status_code == 403
+    assert "conduit_api_billing" in response.json()["detail"]
+    assert "subscription was not used" in response.json()["detail"]
+    assert openai.calls == []
+
+
+def test_api_billing_without_a_key_never_falls_back_to_the_subscription(client, api_key, openai, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY")
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.status_code == 503
+    assert "OPENAI_API_KEY" in response.json()["detail"]
+    assert openai.calls == []
+
+
+def test_a_failed_subscription_never_falls_back_to_the_api_key(client, api_key, openai):
+    api_key.auth_error = True
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER})
+    assert response.status_code == 503
+    assert openai.calls == []
+
+
+@pytest.mark.parametrize("status, answer", [
+    (401, ""), (200, "not json"), (200, json.dumps({"session": {"id": "sess_1"}})),
+    (200, json.dumps({"session": {"id": "bad\nid"}, "transport": {"type": "webrtc", "sdp": ANSWER}})),
+    (200, json.dumps({"session": {"id": "x" * 257}, "transport": {"type": "webrtc", "sdp": ANSWER}})),
+    (200, json.dumps({"session": {"id": "sess_1"}, "transport": {"type": "webrtc", "sdp": "nope"}})),
+])
+def test_api_billing_rejects_a_bad_answer(client, api_key, openai, status, answer):
+    openai.reply.update(status=status, answer=answer)
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.status_code == 502
+    assert "subscription was not used" in response.json()["detail"]
+
+
+def test_api_transport_failures_name_the_api_path(client, api_key, monkeypatch):
+    def post(url, headers, body):
+        raise api.TokenError(502, "GPT-Live connection failed. " + api.GPT_LIVE_NO_FALLBACK)
+    monkeypatch.setattr(api, "_post_sdp", post)
+    detail = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).json()["detail"]
+    assert "No API fallback" not in detail and "subscription was not used" in detail
+
+
+@pytest.mark.parametrize("billing", ["API", "both", 1, True, ""])
+def test_an_unknown_billing_is_refused(client, api_key, openai, billing):
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": billing})
+    assert response.status_code == 400
+    assert openai.calls == []
+
+
+def test_api_billing_has_a_daily_cap_that_a_missing_key_does_not_use_up(client, api_key, openai, monkeypatch):
+    api_key.config["voice"]["gpt_live"]["conduit_api_daily_calls"] = 2
+    monkeypatch.delenv("OPENAI_API_KEY")
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 503
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-live-test")
+    for _ in range(2):
+        assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 200
+    capped = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert capped.status_code == 429 and "conduit_api_daily_calls" in capped.json()["detail"]
+    assert len(openai.calls) == 2
+    # The subscription path has no daily cap.
+    openai.reply.update(status=201, answer=ANSWER, location="/v1/realtime/calls/rtc_abc123")
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER}).status_code == 200
+
+
+def test_status_reports_the_api_path_on_its_own(client, api_key):
+    body = client.get(f"{BASE}/gpt-live/status").json()
+    assert body["auth"] == "subscription" and body["available"] is True
+    assert body["api"] == {"auth": "api", "model": "gpt-live-1", "voice": "marin", "enabled": True,
+                           "daily_limit": api.GPT_LIVE_API_DAILY_CALLS, "available": True, "reason": None,
+                           "host": "api.openai.com"}
+    assert "sk-live-test" not in json.dumps(body)
+
+
+def test_status_api_path_without_a_key_says_so(client, api_key, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY")
+    body = client.get(f"{BASE}/gpt-live/status").json()["api"]
+    assert body["available"] is False and "OPENAI_API_KEY" in body["reason"]
+    assert "subscription was not used" not in body["reason"]
+
+
+def test_a_custom_base_url_never_gets_the_hosts_general_key(client, api_key, openai):
+    api_key.config["voice"]["gpt_live"]["base_url"] = "https://gateway.example.test/v1"
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.status_code == 503
+    assert "voice.gpt_live.api_key" in response.json()["detail"]
+    assert openai.calls == []
+    status = client.get(f"{BASE}/gpt-live/status").json()["api"]
+    assert status["available"] is False and "gateway.example.test" in status["reason"]
+
+
+@pytest.mark.parametrize("base_url", ["https://", "http://api.openai.com/v1", "https://api.openai.com/v1\r\nX: y", "ftp://x",
+                                      "https://api.openai.com/v1?x=1", "https://api.openai.com/v1#f",
+                                      "https://api.openai.com:99999/v1"])
+def test_a_base_url_without_https_and_a_host_is_refused(client, api_key, openai, base_url):
+    api_key.config["voice"]["gpt_live"].update(base_url=base_url, api_key="sk-profile")
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 503
+    assert openai.calls == []
+    status = client.get(f"{BASE}/gpt-live/status")
+    assert status.status_code == 200 and status.json()["api"]["available"] is False
+
+
+def test_a_call_openai_did_not_start_gives_its_daily_slot_back(client, api_key, openai):
+    api_key.config["voice"]["gpt_live"]["conduit_api_daily_calls"] = 1
+    openai.reply.update(status=401, answer="")
+    for _ in range(3):
+        assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 502
+    openai.reply.update(status=200, answer=json.dumps(API_ANSWER))
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 200
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 429
+
+
+def test_a_daily_limit_of_zero_says_api_calls_are_off(client, api_key, openai):
+    api_key.config["voice"]["gpt_live"]["conduit_api_daily_calls"] = 0
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.status_code == 403 and "is 0" in response.json()["detail"]
+    assert "daily limit" not in response.json()["detail"]
+    assert client.get(f"{BASE}/gpt-live/status").json()["api"]["available"] is False
+    assert openai.calls == []
+
+
+@pytest.mark.parametrize("status, code, words", [(401, 502, "rejected the API key"), (429, 429, "rate-limiting")])
+def test_openai_key_and_quota_errors_are_told_apart(client, api_key, openai, status, code, words):
+    openai.reply.update(status=status, answer="")
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.status_code == code
+    assert words in response.json()["detail"] and "subscription was not used" in response.json()["detail"]
+
+
+def test_an_answer_on_another_transport_is_refused(client, api_key, openai):
+    openai.reply.update(answer=json.dumps({"session": {"id": "sess_1"}, "transport": {"type": "websocket", "sdp": ANSWER}}))
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 502
+
+
+def test_a_broken_hermes_key_lookup_is_a_failure_not_the_environment(client, api_key, openai, monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def broken(name, *args, **kwargs):
+        if name == "tools.tool_backend_helpers":
+            raise ImportError("no module named 'httpx'", name="httpx")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken)
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.status_code == 503 and "could not read the OpenAI key" in response.json()["detail"]
+    assert openai.calls == []
+
+
+def test_release_gives_back_the_failed_calls_own_slot():
+    now = [0.0]
+    limiter = api._MintLimiter(2, 100.0, clock=lambda: now[0], message="capped")
+    early = limiter.acquire("p")
+    now[0] = 90.0
+    limiter.acquire("p")
+    limiter.release("p", early)
+    # The later call's slot is still counted: it keeps the window busy until 190, not 100.
+    now[0] = 120.0
+    limiter.acquire("p")
+    with pytest.raises(api.TokenError):
+        limiter.acquire("p")
+
+
+def test_a_zero_limit_leaves_no_empty_bucket_behind():
+    limiter = api._MintLimiter(2, 100.0, clock=lambda: 0.0, message="capped")
+    with pytest.raises(api.TokenError):
+        limiter.acquire("p", limit=0)
+    limiter.acquire("other")
+    only = limiter.acquire("p")
+    limiter.release("p", only)
+    limiter.acquire("other")  # an emptied bucket never trips the next acquire
+    limiter.release("p", 12345.0)  # an unknown or aged-out mint is ignored
+
+
+def test_an_unfamiliar_session_id_format_is_accepted(client, api_key, openai):
+    openai.reply.update(answer=json.dumps({"session": {"id": "sess.2026:abc/1"}, "transport": {"type": "webrtc", "sdp": ANSWER}}))
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.status_code == 200 and response.json()["session"] == {"id": "sess.2026:abc/1"}
+
+
+def test_an_invalid_answer_after_a_2xx_keeps_its_daily_slot(client, api_key, openai):
+    api_key.config["voice"]["gpt_live"]["conduit_api_daily_calls"] = 1
+    openai.reply.update(status=200, answer="not json")
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 502
+    openai.reply.update(answer=json.dumps(API_ANSWER))
+    # OpenAI may have started (and billed) that session: the day's one call is used.
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 429
+
+
+def test_the_shared_key_never_goes_to_a_non_standard_port(client, api_key, openai):
+    api_key.config["voice"]["gpt_live"]["base_url"] = "https://api.openai.com:8443/v1"
+    response = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"})
+    assert response.status_code == 503 and "voice.gpt_live.api_key" in response.json()["detail"]
+    api_key.config["voice"]["gpt_live"]["base_url"] = "https://api.openai.com:443/v1"
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 200
+
+
+def test_a_failing_env_lookup_is_a_reason_not_a_500(client, api_key, openai, monkeypatch):
+    def boom(_key):
+        raise RuntimeError("unscoped secret")
+    monkeypatch.setattr(api, "_env_value", boom)
+    status = client.get(f"{BASE}/gpt-live/status")
+    assert status.status_code == 200 and status.json()["api"]["available"] is False
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "billing": "api"}).status_code == 503
