@@ -2192,6 +2192,12 @@ async def _grok_live_relay(ws: WebSocket, refuse: Callable[[int, str], Any], tok
 # the stored model on resume, so typing into a saved call must look exactly
 # like a Conduit chat. Conduit's own labels (voice call / classic voice chat /
 # voice job) live in state_meta, which the agent never reads.
+#
+# A call attached to a chat (started in it, or a Hermes call from it) is part
+# of that chat, not a session of its own (hermes-conduit#556): its turns are
+# kept in state_meta under the call, listed for the chat, and the chat's own
+# messages stay as Hermes wrote them. Its end writes the call to memory under
+# the chat's session; the chat itself isn't ended.
 VOICE_MAX_BODY_BYTES = 1024 * 1024
 VOICE_MAX_TURNS = 500
 VOICE_MAX_INDEX = 100_000
@@ -2214,6 +2220,12 @@ VOICE_CALLS_KEY = "conduit.voice.calls:{session_id}"
 VOICE_CREATED_KEY = "conduit.voice.created"
 VOICE_MAX_CALLS = 500
 VOICE_SUMMARY_KEY = "conduit.voice.summary:{session_id}"
+VOICE_CHAT_CALL_KEY = "conduit.voice.chat_call:{call_id}"
+VOICE_CHAT_CALLS_KEY = "conduit.voice.chat_calls:{chat_id}"
+# A chat call is one meta value rewritten on each save: this bounds it.
+VOICE_MAX_CHAT_CALL_TURNS = 2000
+# Calls kept per chat; past it the oldest goes.
+VOICE_MAX_CHAT_CALLS = 50
 _VOICE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _VOICE_UNSUPPORTED = "This Hermes version can't store voice transcripts; update Hermes"
 
@@ -2450,10 +2462,10 @@ def _discard_new_voice_session(db, session_id: str) -> None:
 
 
 def save_voice_turns(body: Dict[str, Any],
-                     on_end: Optional[Callable[[str, str, list], None]] = None) -> Dict[str, Any]:
+                     on_end: Optional[Callable[..., None]] = None) -> Dict[str, Any]:
     """Create a voice-call session or append to one; turns already written for the call are skipped.
 
-    ``on_end(session_id, engine, messages)`` runs once new turns are stored:
+    ``on_end(session_id, engine, messages, chat_call=False)`` runs once new turns are stored:
     Conduit saves a call only after it has ended, so those turns end it. It runs
     with the store closed but the save lock held, so a session's ends keep the
     order its turns were stored in; it must be quick and must not raise (the
@@ -2467,6 +2479,11 @@ def save_voice_turns(body: Dict[str, Any],
     title = _voice_text(body.get("title"), VOICE_MAX_TITLE_CHARS)
     requested = body.get("session_id")
     session_id = _voice_id(requested, "session_id") if requested else None
+    # A call that already has a row keeps appending to it; chat_id only
+    # decides where a call without one goes. A chat call has no title (one is
+    # only set when a row is created).
+    if body.get("chat_id") is not None and not session_id:
+        return _save_chat_call_turns(_voice_id(body.get("chat_id"), "chat_id"), call_id, engine, turns, on_end)
     with _voice_lock():
         db = _open_voice_db(_VOICE_SAVE, appends=True)
         try:
@@ -2544,6 +2561,125 @@ def save_voice_turns(body: Dict[str, Any],
         if messages and on_end is not None:
             on_end(session_id, engine, messages)
     return result
+
+
+def _chat_call(db, call_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        stored = json.loads(db.get_meta(VOICE_CHAT_CALL_KEY.format(call_id=call_id)) or "null")
+    except ValueError:
+        logger.warning("Conduit voice: chat call %s is unreadable", call_id)
+        return None
+    if not isinstance(stored, dict) or not isinstance(stored.get("chat_id"), str) \
+            or not isinstance(stored.get("turns"), list):
+        return None
+    return stored
+
+
+def _chat_call_ids(db, chat_id: str) -> list:
+    try:
+        ids = json.loads(db.get_meta(VOICE_CHAT_CALLS_KEY.format(chat_id=chat_id)) or "[]")
+    except ValueError:
+        logger.warning("Conduit voice: chat %s's call list is unreadable", chat_id)
+        return []
+    return [i for i in ids if isinstance(i, str) and _VOICE_ID_RE.match(i)] if isinstance(ids, list) else []
+
+
+def _drop_chat_calls(db, chat_id: str) -> None:
+    """A gone chat's calls and list (Hermes has no meta delete)."""
+    ids = _chat_call_ids(db, chat_id)
+    for call_id in ids:
+        call = _chat_call(db, call_id)
+        # A listed call whose body is gone or unreadable goes too.
+        if call is None or call["chat_id"] == chat_id:
+            db.set_meta(VOICE_CHAT_CALL_KEY.format(call_id=call_id), "")
+    if ids:
+        db.set_meta(VOICE_CHAT_CALLS_KEY.format(chat_id=chat_id), "")
+
+
+def _save_chat_call_turns(chat_id: str, call_id: str, engine: str, turns: list,
+                          on_end: Optional[Callable[..., None]]) -> Dict[str, Any]:
+    """Store an attached call's turns with its chat; same index rules as a row.
+
+    No session is made and nothing is added to the chat's messages. The call
+    keeps the chat it was first saved to."""
+    with _voice_lock():
+        db = _open_voice_db(_VOICE_WRITE)
+        try:
+            row = db.get_session(chat_id)
+            if not row:
+                try:
+                    _drop_chat_calls(db, chat_id)
+                except Exception:  # noqa: BLE001 — the 422 must win; the next save retries
+                    logger.warning("Couldn't clear gone chat %s's calls", chat_id, exc_info=True)
+                raise TokenError(422, "That chat no longer exists; save the call on its own")
+            if _is_voice_row(db, chat_id, row):
+                raise TokenError(422, "That is a saved call, not a chat; save the call on its own")
+            call = _chat_call(db, call_id)
+            if call is not None and call["chat_id"] != chat_id:
+                raise TokenError(400, "That call belongs to another chat")
+            stored = call["turns"] if call else []
+            # The call keeps the engine it was first saved with, as a row does.
+            engine = (call or {}).get("engine") or engine
+            last = len(stored) - 1
+            fresh = []
+            for turn in turns:  # sorted by index
+                if turn["index"] <= last:
+                    continue
+                if turn["index"] != last + 1:
+                    raise TokenError(400, f"Turns must continue from index {last + 1} for this call")
+                fresh.append(turn)
+                last = turn["index"]
+            messages = [{k: v for k, v in turn.items() if k != "index" and v is not None} for turn in fresh]
+            if len(stored) + len(messages) > VOICE_MAX_CHAT_CALL_TURNS:
+                raise TokenError(413, f"A call kept with a chat holds at most {VOICE_MAX_CHAT_CALL_TURNS} turns")
+            if messages or call is not None:
+                # The chat's list first, and on every save of a stored call: a
+                # failure between the two writes never hides the call from it.
+                ids = _chat_call_ids(db, chat_id)
+                if call_id not in ids:
+                    ids.append(call_id)
+                    evicted = ids[:-VOICE_MAX_CHAT_CALLS] if len(ids) > VOICE_MAX_CHAT_CALLS else []
+                    ids = ids[len(evicted):]
+                    db.set_meta(VOICE_CHAT_CALLS_KEY.format(chat_id=chat_id), json.dumps(ids, separators=(",", ":")))
+                    # Only once the list no longer names them.
+                    for old in evicted:
+                        db.set_meta(VOICE_CHAT_CALL_KEY.format(call_id=old), "")
+            if messages:
+                db.set_meta(VOICE_CHAT_CALL_KEY.format(call_id=call_id), json.dumps(
+                    {"chat_id": chat_id, "engine": engine, "turns": stored + messages},
+                    separators=(",", ":")))
+            result = {"session_id": None, "chat_id": chat_id, "written": last + 1, "appended": len(messages),
+                      "skipped": len(turns) - len(fresh), "created": False}
+        finally:
+            db.close()
+        if messages and on_end is not None:
+            on_end(chat_id, engine, messages, chat_call=True)
+    return result
+
+
+def voice_chat_calls(chat_id: Any, only: Any = None) -> Dict[str, Any]:
+    """An attached chat's saved calls, oldest first; none once the chat is gone
+    (its calls are cleared on the next save to it). Turns come only with
+    *only*, one call, so a response holds at most one call's turns."""
+    chat_id = _voice_id(chat_id, "chat_id")
+    only = _voice_id(only, "call_id") if only is not None else None
+    db = _open_voice_db(("get_meta", "get_session"))
+    try:
+        calls = []
+        for call_id in _chat_call_ids(db, chat_id) if db.get_session(chat_id) else []:
+            if only is not None and call_id != only:
+                continue
+            call = _chat_call(db, call_id)
+            if call is None or call["chat_id"] != chat_id:
+                continue
+            entry = {"call_id": call_id, "engine": call.get("engine")}
+            if only is not None:
+                entry["turns"] = [{"role": t.get("role"), "text": t.get("content"), "at": t.get("timestamp")}
+                                  for t in call["turns"] if isinstance(t, dict)]
+            calls.append(entry)
+    finally:
+        db.close()
+    return {"chat_id": chat_id, "calls": calls}
 
 
 def set_voice_tag(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -2661,10 +2797,19 @@ async def post_voice_session(request: Request, response: Response, profile: Opti
     _voice_limit(write=True)
     body = await _voice_body(request)
 
-    def ended(session_id: str, engine: str, messages: list) -> None:
-        _queue_voice_call_end(profile, session_id, engine, messages)
+    def ended(session_id: str, engine: str, messages: list, chat_call: bool = False) -> None:
+        _queue_voice_call_end(profile, session_id, engine, messages, chat_call=chat_call)
 
     return {"ok": True, **(await _run_voice(profile, lambda: save_voice_turns(body, on_end=ended), "save"))}
+
+
+@router.get("/voice/chat-calls")
+async def get_voice_chat_calls(response: Response, chat_id: Optional[str] = None,
+                               call_id: Optional[str] = None,
+                               profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    _voice_limit(write=False)
+    return {"ok": True, **(await _run_voice(profile, lambda: voice_chat_calls(chat_id, call_id), "chat calls"))}
 
 
 @router.get("/voice/tags")
@@ -2801,11 +2946,13 @@ def _voice_session_title(session_id: str) -> Dict[str, str]:
         db.close()
 
 
-def _commit_voice_call_memory(session_id: str, messages: list) -> None:
+def _commit_voice_call_memory(session_id: str, messages: list, end_session: bool = True) -> None:
     """Write a finished call to the profile's memory provider the way Hermes
     writes a chat: initialize it for the session, sync_turn each exchange, then
     on_session_end and shutdown. A provider instance of its own: the cached
-    recall one is bound to the conduit-voice session."""
+    recall one is bound to the conduit-voice session. A call kept with a chat
+    passes end_session=False: the chat goes on, and a remote provider keyed by
+    session id would take on_session_end as the chat's own end."""
     name = _configured_memory_provider(_hermes_memory_config())
     if name is None:
         return
@@ -2826,19 +2973,23 @@ def _commit_voice_call_memory(session_id: str, messages: list) -> None:
         flush = getattr(manager, "flush_pending", None)
         if callable(flush):
             flush(timeout=VOICE_END_FLUSH_TIMEOUT_S)
-        manager.on_session_end([{"role": m["role"], "content": m["content"]} for m in messages])
+        if end_session:
+            manager.on_session_end([{"role": m["role"], "content": m["content"]} for m in messages])
     finally:
         manager.shutdown_all()
 
 
-def _end_voice_call(session_id: str, engine: str, messages: list) -> None:
+def _end_voice_call(session_id: str, engine: str, messages: list, chat_call: bool = False) -> None:
     """End a saved call's session in Hermes (inside the profile's scope). Each
-    step runs even if an earlier one failed."""
+    step runs even if an earlier one failed. A call attached to a chat only
+    syncs its turns into memory under the chat's session: the chat goes on, so
+    neither its session nor its memory session is ended."""
     hook = {"session_id": session_id, "platform": VOICE_END_PLATFORM, "reason": VOICE_END_HOOK_REASON}
-    steps = (
+    memory = ("memory write", lambda: _commit_voice_call_memory(session_id, messages, end_session=not chat_call))
+    steps = (memory,) if chat_call else (
         ("on_session_end hook", lambda: _fire_voice_hook(
             "on_session_end", completed=True, interrupted=False, model=engine, **hook)),
-        ("memory write", lambda: _commit_voice_call_memory(session_id, messages)),
+        memory,
         ("on_session_finalize hook", lambda: _fire_voice_hook("on_session_finalize", **hook)),
     )
     for what, step in steps:
@@ -2853,7 +3004,8 @@ def _end_voice_call(session_id: str, engine: str, messages: list) -> None:
             logger.warning("Conduit voice call end: %s failed for %s", what, session_id, exc_info=True)
 
 
-def _run_voice_call_end(profile: Optional[str], session_id: str, engine: str, messages: list) -> None:
+def _run_voice_call_end(profile: Optional[str], session_id: str, engine: str, messages: list,
+                        chat_call: bool = False) -> None:
     """Runs the end on its own thread and waits up to VOICE_END_TIMEOUT_S, so a
     wedged provider costs one abandoned thread, not every later call's end.
 
@@ -2874,7 +3026,7 @@ def _run_voice_call_end(profile: Optional[str], session_id: str, engine: str, me
     def run() -> None:
         try:
             with _profile_scope(profile):
-                _end_voice_call(session_id, engine, messages)
+                _end_voice_call(session_id, engine, messages, chat_call=chat_call)
         except Exception:  # noqa: BLE001 — the scope itself failed; nothing ran
             logger.warning("Conduit voice call end failed for %s", session_id, exc_info=True)
         finally:
@@ -2908,22 +3060,24 @@ def _voice_end_loop() -> None:
             logger.warning("A Conduit voice call end failed", exc_info=True)
 
 
-def _queue_voice_call_end(profile: Optional[str], session_id: str, engine: str, messages: list) -> None:
+def _queue_voice_call_end(profile: Optional[str], session_id: str, engine: str, messages: list,
+                          chat_call: bool = False) -> None:
     """Ends the call's session off the request. Never raises: the turns are
     already stored, and a failed save would make Conduit send them again."""
     try:
-        _enqueue_voice_call_end(profile, session_id, engine, messages)
+        _enqueue_voice_call_end(profile, session_id, engine, messages, chat_call)
     except Exception:  # noqa: BLE001
         logger.warning("Conduit voice session %s ends without hooks: queueing failed", session_id, exc_info=True)
 
 
-def _enqueue_voice_call_end(profile: Optional[str], session_id: str, engine: str, messages: list) -> None:
+def _enqueue_voice_call_end(profile: Optional[str], session_id: str, engine: str, messages: list,
+                            chat_call: bool = False) -> None:
     global _voice_end_pending, _voice_end_worker
 
     def run() -> None:
         global _voice_end_pending
         try:
-            _run_voice_call_end(profile, session_id, engine, messages)
+            _run_voice_call_end(profile, session_id, engine, messages, chat_call)
         finally:
             with _voice_end_guard:
                 _voice_end_pending -= 1
@@ -7869,6 +8023,7 @@ ROUTE_CAPABILITIES = (
     "voice-sessions",
     "voice-tags",
     "voice-summary",
+    "voice-chat-calls",
     "session-takeover",
     "e2e-notifications",
     "watch-tools",

@@ -1,6 +1,7 @@
 import contextlib
 import contextvars
 import importlib.util
+import json
 import pathlib
 import queue
 import sys
@@ -137,7 +138,11 @@ def hermes(monkeypatch, tmp_path):
     # A save that stores new turns ends its call; these tests record that
     # instead of running it (the call-end tests below run it).
     ends = []
-    monkeypatch.setattr(api, "_queue_voice_call_end", lambda *args: ends.append(args))
+
+    def queue_end(*args, chat_call=False):
+        ends.append((*args, "chat") if chat_call else args)
+
+    monkeypatch.setattr(api, "_queue_voice_call_end", queue_end)
 
     def home():
         return tmp_path / (_active_profile.get() or "default")
@@ -530,6 +535,7 @@ def test_reads_work_on_a_store_without_the_write_helpers(client, hermes, monkeyp
     assert client.get(f"{BASE}/voice/tags").status_code == 200
     assert client.get(f"{BASE}/voice/summary", params={"session_id": "s_1"}).status_code == 200
     assert save(client, turns=turns(("user", "a"))).status_code == 501
+    assert client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-1"}).status_code == 501
 
 
 def test_unreadable_tags_start_over(client, hermes):
@@ -561,6 +567,173 @@ def test_summary_for_a_deleted_session_is_422(client, hermes):
 def test_summary_needs_text_and_covers(client, hermes, body):
     session_id = save(client, turns=turns(("user", "a"))).json()["session_id"]
     assert client.post(f"{BASE}/voice/summary", json={"session_id": session_id, **body}).status_code == 400
+
+
+# --- Calls attached to a chat (#556) ---------------------------------------------
+
+
+def chat(hermes, chat_id="chat-1", profile="default"):
+    store = FakeSessionDB.stores.setdefault(profile, FakeStore())
+    store.sessions[chat_id] = {"id": chat_id, "source": "desktop", "end_reason": None}
+    store.messages[chat_id] = [{"role": "user", "content": "daily brief"}]
+    return store
+
+
+def test_an_attached_call_makes_no_session_and_leaves_the_chat_alone(client, hermes):
+    store = chat(hermes)
+    body = save(client, chat_id="chat-1", turns=turns(("user", "hi"), ("assistant", "hello"))).json()
+    assert body["ok"] and body["session_id"] is None and body["chat_id"] == "chat-1" and body["written"] == 2
+    assert set(store.sessions) == {"chat-1"}
+    assert store.messages["chat-1"] == [{"role": "user", "content": "daily brief"}]
+    assert api.VOICE_TAGS_KEY not in store.meta
+    listed = client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-1"}).json()["calls"]
+    assert listed == [{"call_id": "call-1", "engine": "gemini-live"}], "a listing carries no turns"
+    calls = client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-1", "call_id": "call-1"}).json()["calls"]
+    assert calls == [{"call_id": "call-1", "engine": "gemini-live", "turns": [
+        {"role": "user", "text": "hi", "at": 1_780_000_000},
+        {"role": "assistant", "text": "hello", "at": 1_780_000_001}]}]
+
+
+def test_an_attached_call_continues_and_skips_replays(client, hermes):
+    chat(hermes)
+    save(client, chat_id="chat-1", turns=turns(("user", "a"), ("assistant", "b")))
+    body = save(client, chat_id="chat-1", turns=turns(("assistant", "b"), ("user", "c"), start=1)).json()
+    assert body["written"] == 3 and body["appended"] == 1 and body["skipped"] == 1
+    assert save(client, chat_id="chat-1", turns=turns(("user", "gap"), start=5)).status_code == 400
+    save(client, chat_id="chat-1", call_id="call-2", turns=turns(("user", "again")))
+    def said(call_id):
+        calls = client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-1", "call_id": call_id}).json()["calls"]
+        return [t["text"] for t in calls[0]["turns"]]
+    assert said("call-1") == ["a", "b", "c"]
+    assert said("call-2") == ["again"]
+
+
+def test_an_attached_call_ends_only_into_memory_under_the_chat(client, hermes):
+    chat(hermes)
+    save(client, engine="gpt-live", chat_id="chat-1", turns=turns(("user", "hi"), ("assistant", "hello")))
+    save(client, engine="gpt-live", chat_id="chat-1", turns=turns(("user", "hi"), ("assistant", "hello")))
+    assert hermes.ends == [(None, "chat-1", "gpt-live", [
+        {"role": "user", "content": "hi", "timestamp": 1_780_000_000},
+        {"role": "assistant", "content": "hello", "timestamp": 1_780_000_001}], "chat")]
+
+
+def test_a_gone_chat_is_422_and_a_call_keeps_its_chat(client, hermes):
+    assert save(client, chat_id="nope", turns=turns(("user", "a"))).status_code == 422
+    chat(hermes)
+    chat(hermes, "chat-2")
+    save(client, chat_id="chat-1", turns=turns(("user", "a")))
+    assert save(client, chat_id="chat-2", turns=turns(("user", "a"), ("user", "b"))).status_code == 400
+    assert client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-2"}).json()["calls"] == []
+
+
+def test_an_attached_call_with_a_row_appends_to_the_row(client, hermes):
+    chat(hermes)
+    session_id = save(client, turns=turns(("user", "a"))).json()["session_id"]
+    body = save(client, session_id=session_id, chat_id="chat-1", call_id="call-2", turns=turns(("user", "b"))).json()
+    assert body["session_id"] == session_id
+
+
+def test_a_save_that_fails_midway_leaves_the_call_listed_after_the_retry(client, hermes, monkeypatch):
+    store = chat(hermes)
+    original = FakeSessionDB.set_meta
+    failed = []
+
+    def flaky(self, key, value):
+        if key.startswith("conduit.voice.chat_call:") and not failed:
+            failed.append(key)
+            raise RuntimeError("disk full")
+        original(self, key, value)
+
+    monkeypatch.setattr(FakeSessionDB, "set_meta", flaky)
+    assert save(client, chat_id="chat-1", turns=turns(("user", "a"))).status_code >= 500
+    # The list went first; a call it names but that isn't stored yet is skipped.
+    assert client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-1"}).json()["calls"] == []
+    assert save(client, chat_id="chat-1", turns=turns(("user", "a"))).status_code == 200
+    calls = client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-1"}).json()["calls"]
+    assert [c["call_id"] for c in calls] == ["call-1"]
+    assert store.meta["conduit.voice.chat_calls:chat-1"] == '["call-1"]'
+
+
+def test_a_stored_call_missing_from_the_list_is_listed_again(client, hermes):
+    store = chat(hermes)
+    save(client, chat_id="chat-1", turns=turns(("user", "a")))
+    store.meta["conduit.voice.chat_calls:chat-1"] = "[]"
+    save(client, chat_id="chat-1", turns=turns(("user", "a")))
+    assert [c["call_id"] for c in client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-1"}).json()["calls"]] == ["call-1"]
+
+
+def test_a_chat_call_is_bounded(client, hermes, monkeypatch):
+    chat(hermes)
+    monkeypatch.setattr(api, "VOICE_MAX_CHAT_CALL_TURNS", 2)
+    save(client, chat_id="chat-1", turns=turns(("user", "a"), ("assistant", "b")))
+    assert save(client, chat_id="chat-1", turns=turns(("user", "c"), start=2)).status_code == 413
+
+
+def test_a_gone_chats_unreadable_calls_are_dropped_too(client, hermes):
+    store = chat(hermes)
+    save(client, chat_id="chat-1", turns=turns(("user", "a")))
+    store.meta["conduit.voice.chat_call:call-1"] = "{not json"
+    del store.sessions["chat-1"]
+    assert save(client, chat_id="chat-1", call_id="call-2", turns=turns(("user", "b"))).status_code == 422
+    assert store.meta["conduit.voice.chat_call:call-1"] == ""
+
+
+def test_a_chats_calls_can_be_read_one_at_a_time(client, hermes):
+    chat(hermes)
+    save(client, chat_id="chat-1", call_id="call-1", turns=turns(("user", "a")))
+    save(client, chat_id="chat-1", call_id="call-2", turns=turns(("user", "b")))
+    calls = client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-1", "call_id": "call-2"}).json()["calls"]
+    assert [call["call_id"] for call in calls] == ["call-2"]
+
+
+def test_a_chat_call_keeps_its_first_engine(client, hermes):
+    store = chat(hermes)
+    save(client, chat_id="chat-1", engine="gpt-live", turns=turns(("user", "a")))
+    save(client, chat_id="chat-1", engine="gemini-live", turns=turns(("user", "b"), start=1))
+    assert json.loads(store.meta["conduit.voice.chat_call:call-1"])["engine"] == "gpt-live"
+
+
+def test_an_empty_chat_id_is_refused(client, hermes):
+    assert save(client, chat_id="", turns=turns(("user", "a"))).status_code == 400
+
+
+def test_a_saved_call_row_is_not_a_chat(client, hermes):
+    row = save(client, turns=turns(("user", "a"))).json()["session_id"]
+    assert save(client, chat_id=row, call_id="call-2", turns=turns(("user", "b"))).status_code == 422
+
+
+def test_a_gone_chats_calls_are_dropped(client, hermes):
+    store = chat(hermes)
+    save(client, chat_id="chat-1", turns=turns(("user", "a")))
+    del store.sessions["chat-1"]
+    assert save(client, chat_id="chat-1", call_id="call-2", turns=turns(("user", "b"))).status_code == 422
+    assert store.meta["conduit.voice.chat_calls:chat-1"] == ""
+    assert store.meta["conduit.voice.chat_call:call-1"] == ""
+
+
+def test_a_gone_chat_lists_no_calls(client, hermes):
+    store = chat(hermes)
+    save(client, chat_id="chat-1", turns=turns(("user", "a")))
+    del store.sessions["chat-1"]
+    response = client.get(f"{BASE}/voice/chat-calls", params={"chat_id": "chat-1"})
+    assert response.json()["calls"] == []
+
+
+def test_a_full_chat_list_forgets_its_oldest_call(client, hermes, monkeypatch):
+    store = chat(hermes)
+    monkeypatch.setattr(api, "VOICE_MAX_CHAT_CALLS", 2)
+    for call_id in ("call-1", "call-2", "call-3"):
+        save(client, chat_id="chat-1", call_id=call_id, turns=turns(("user", call_id)))
+    assert json.loads(store.meta["conduit.voice.chat_calls:chat-1"]) == ["call-2", "call-3"]
+    assert store.meta["conduit.voice.chat_call:call-1"] == ""
+
+
+def test_an_attached_call_ends_without_ending_the_chat(hermes, lifecycle):
+    api._run_voice_call_end(None, "chat-1", "gpt-live", CALL, chat_call=True)
+    assert [event[0] for event in lifecycle.events] == [
+        "initialize", "sync_turn", "flush_pending", "shutdown"], "the chat's memory session goes on"
+    assert lifecycle.events[0][2] == "chat-1"
+    assert lifecycle.events[1] == ("sync_turn", "remind me to call mum", "Will do.", "chat-1")
 
 
 # --- Call end -------------------------------------------------------------------
