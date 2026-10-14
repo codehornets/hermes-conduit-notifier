@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { ApnsClient } from './apns.mjs';
 import { SWEEP_INTERVAL_MS } from './event-ledger.mjs';
 import { limitsFromEnv } from './limits.mjs';
+import { LIVE_ACTIVITIES_CAPABILITY, LiveActivities, validateRegistration, validateReport, validateToken } from './live-activities.mjs';
 import { MAPS_TOKEN_ROUTE, MAPS_TOKENS_CAPABILITY, mapsTokensFromEnv } from './maps-tokens.mjs';
 import { RING_ROUTE, RING_SESSION_MAX_CHARS, RING_SESSION_ROUTE, RING_SESSION_WAIT_MAX_MS, Rings, ringBearer, validSessionStore, validSettle } from './rings.mjs';
 import { normalizeDashboardId, RelayStore, sanitizeBatchQuestions } from './store.mjs';
@@ -17,9 +18,9 @@ import { WATCH_TOOLS_CAPABILITY, WatchToolGrants, watchToolRoutes } from './watc
 const RELAY_INFO = (() => {
   try {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    return { version: String(pkg.version || 'unknown'), capabilities: ['decisions', 'decision-cards', 'meta', 'e2e-v1', WATCH_TOOLS_CAPABILITY, WATCH_AUDIO_CAPABILITY, 'calls', 'voip-calls', 'watch-calls', 'ring-sessions', 'location-push', 'phone-changes', MAPS_TOKENS_CAPABILITY] };
+    return { version: String(pkg.version || 'unknown'), capabilities: ['decisions', 'decision-cards', 'meta', 'e2e-v1', WATCH_TOOLS_CAPABILITY, WATCH_AUDIO_CAPABILITY, 'calls', 'voip-calls', 'watch-calls', 'ring-sessions', 'location-push', 'phone-changes', MAPS_TOKENS_CAPABILITY, LIVE_ACTIVITIES_CAPABILITY] };
   } catch {
-    return { version: 'unknown', capabilities: ['decisions', 'decision-cards', 'meta', 'e2e-v1', WATCH_TOOLS_CAPABILITY, WATCH_AUDIO_CAPABILITY, 'calls', 'voip-calls', 'watch-calls', 'ring-sessions', 'location-push', 'phone-changes', MAPS_TOKENS_CAPABILITY] };
+    return { version: 'unknown', capabilities: ['decisions', 'decision-cards', 'meta', 'e2e-v1', WATCH_TOOLS_CAPABILITY, WATCH_AUDIO_CAPABILITY, 'calls', 'voip-calls', 'watch-calls', 'ring-sessions', 'location-push', 'phone-changes', MAPS_TOKENS_CAPABILITY, LIVE_ACTIVITIES_CAPABILITY] };
   }
 })();
 
@@ -30,6 +31,7 @@ let limits;
 let apnsSend;
 let watchTools;
 let rings;
+let liveActivities;
 let mapsTokens;
 // Maps tokens a gateway may fetch an hour (each lasts about 30 minutes).
 const MAPS_TOKENS_PER_HOUR = 12;
@@ -185,6 +187,14 @@ function main() {
     apnsSend = (deviceToken, notification) => apns.send(deviceToken, notification);
   }
 
+  liveActivities = new LiveActivities({
+    maxActivities: config.liveActivityLimits.maxActivities,
+    maxPerInstallation: config.liveActivityLimits.maxPerInstallation,
+    send: (token, push) => apnsSend(token, { ...push, topic: `${config.topic}.push-type.liveactivity` }),
+    warn: (message, fields) => console.warn(JSON.stringify({ ...fields, level: 'warn', message })),
+  });
+  setInterval(() => liveActivities.sweep(), 10 * 60_000).unref();
+
   const server = createServer(async (request, response) => {
     const startedAt = Date.now();
     try {
@@ -312,8 +322,49 @@ async function route(request, response) {
     if (!installation) return sendJson(response, 401, { error: 'unauthorized' });
     enforceRevocationBudget();
     store.deactivateInstallation(installation.id);
+    liveActivities.removeInstallation(installation.id);
     response.writeHead(204).end();
     return;
+  }
+
+  // Lock Screen progress (#605, live-activities.mjs): the phone registers
+  // the push token of the Live Activity it started for a chat, and removes
+  // it when the activity ends on the phone.
+  const activityMatch = url.pathname.match(/^\/v1\/installations\/([0-9a-f-]+)\/live-activities$/i);
+  if (activityMatch && (request.method === 'PUT' || request.method === 'DELETE')) {
+    enforceRateLimit(`live-activity-ip:${client}`, 120, 60_000);
+    const installation = authorize(request, activityMatch[1], 'device');
+    if (!installation) return sendJson(response, 401, { error: 'unauthorized' });
+    enforceRateLimit(`live-activity-device:${installation.id}`, 60, 60_000);
+    const body = await readJson(request, 4_096);
+    if (request.method === 'DELETE') {
+      const token = validateToken(body);
+      if (!token) return sendJson(response, 400, { error: 'invalid_live_activity' });
+      liveActivities.unregister(installation.id, token);
+      response.writeHead(204).end();
+      return;
+    }
+    const registration = validateRegistration(body);
+    if (!registration) return sendJson(response, 400, { error: 'invalid_live_activity' });
+    enforceRateLimit('live-activity-registration-global', config.budgets.liveActivityRegistrationsPerMinute, 60_000);
+    liveActivities.register(installation.id, registration.token, registration.sessionIds);
+    return sendJson(response, 200, { registered: true });
+  }
+
+  // The host reports a turn's progress; it goes to the phone only when the
+  // phone registered an activity for that chat. `tracked` tells the host
+  // whether anyone is watching, so it can stop reporting a turn nobody is.
+  if (request.method === 'POST' && url.pathname === '/v1/live-activity') {
+    const gateway = authenticatedGateway(request);
+    if (!gateway) return sendJson(response, 401, { error: 'unauthorized' });
+    enforceRateLimit(`live-activity-host:${gateway.installationId}`, 120, 60_000);
+    const report = validateReport(await readJson(request, 4_096));
+    if (!report) return sendJson(response, 400, { error: 'invalid_live_activity_report' });
+    if (!store.activeInstallation(gateway.installationId)) return sendJson(response, 200, { tracked: false });
+    const watched = liveActivities.find(gateway.installationId, report.sessionId);
+    if (watched) enforceRateLimit('live-activity-update-global', config.budgets.liveActivityUpdatesPerMinute, 60_000);
+    const tracked = liveActivities.report(gateway.installationId, report.sessionId, report.state, report.end);
+    return sendJson(response, 200, { tracked });
   }
 
   // The phone or the Watch answered or declined a call that rings on both
@@ -540,7 +591,7 @@ async function route(request, response) {
         console.error(JSON.stringify({ level: 'error', message: 'apns send threw', error: error instanceof Error ? error.message : String(error) }));
         return sendJson(response, 502, { error: 'apns_unreachable' });
       }
-      if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') store.deactivateInstallation(installation.id);
+      if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') { store.deactivateInstallation(installation.id); liveActivities.removeInstallation(installation.id); }
       if (!result.ok) {
         // The answerable card never reached the device: flip the parked
         // decision to undeliverable so the plugin's next poll falls back to
@@ -575,7 +626,7 @@ async function route(request, response) {
       console.error(JSON.stringify({ level: 'error', message: 'apns send threw', error: error instanceof Error ? error.message : String(error) }));
       return sendJson(response, 502, { error: 'apns_unreachable' });
     }
-    if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') store.deactivateInstallation(installation.id);
+    if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') { store.deactivateInstallation(installation.id); liveActivities.removeInstallation(installation.id); }
     if (!result.ok) return sendJson(response, 502, { error: 'apns_rejected', reason: result.reason, status: result.status });
     return sendJson(response, 202, { accepted: true, delivered: true });
   }
@@ -1047,7 +1098,7 @@ async function sendPhoneBackground(response, installation, event, gateway) {
     console.error(JSON.stringify({ level: 'error', message: 'apns background send threw', error: error instanceof Error ? error.message : String(error) }));
     return sendJson(response, 502, { error: 'apns_unreachable' });
   }
-  if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') store.deactivateInstallation(installation.id);
+  if (result.status === 410 || result.reason === 'BadDeviceToken' || result.reason === 'Unregistered') { store.deactivateInstallation(installation.id); liveActivities.removeInstallation(installation.id); }
   if (!result.ok) return sendJson(response, 502, { error: 'apns_rejected', reason: result.reason, status: result.status });
   return sendJson(response, 202, { accepted: true, delivered: true, background: true });
 }
