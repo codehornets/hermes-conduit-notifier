@@ -4178,16 +4178,25 @@ def _voice_tool_entries() -> Dict[str, Dict[str, Any]]:
         # A store that can't be read (damaged file) hides that tool alone.
         try:
             store = store_class(_calls_home())
-            shared = tool.voice_shared(store)
-        except Exception:
-            logger.warning("Conduit voice tools: %s store unreadable", name, exc_info=True)
-            continue
-        if shared:
+            if not tool.voice_shared(store):
+                continue
             entries[name] = {
                 "key": key,
                 "description": tool.voice_description(),
                 "parameters": tool.voice_parameters(),
             }
+        except Exception:
+            logger.warning("Conduit voice tools: %s store unreadable", name, exc_info=True)
+    # The calendar and phone status, sealed with the phone feature's own key.
+    # A problem there takes only those tools off the list.
+    try:
+        phone = _plugin_package_module("phone_tool")
+        offered = phone.voice_tools(phone.PhoneStore(_calls_home()))
+    except Exception:  # noqa: BLE001
+        logger.warning("Conduit voice tools: the calendar and phone tools couldn't be listed", exc_info=True)
+        offered = {}
+    for name, entry in offered.items():
+        entries[name] = {"key": "phone", **entry}
     return entries
 
 
@@ -4196,6 +4205,10 @@ def voice_tools_list() -> Dict[str, Any]:
 
 
 def voice_tools_call(envelope: Any) -> Dict[str, Any]:
+    # Routed on the unsealed op: each branch opens its own seal, whose AAD
+    # binds the op, so a misrouted envelope fails there.
+    if isinstance(envelope, dict) and envelope.get("op") == "voice":
+        return _phone_voice_call(envelope)
     modules = _voice_tool_modules()
     name = envelope.get("tool") if isinstance(envelope, dict) else None
     if not isinstance(name, str) or name not in modules:
@@ -4213,6 +4226,27 @@ def voice_tools_call(envelope: Any) -> Dict[str, Any]:
     logger.info("Conduit voice read: %s %s for %s", tool.TOOL_NAME,
                 action if isinstance(action, str) and action in tool.VOICE_ACTIONS else "other", provider)
     return {"v": 1, **seal_answer(tool.voice_handle(args, device_id=device_id, store=store, provider=provider))}
+
+
+def _phone_voice_call(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    """A calendar or phone status read, sealed with the device's phone
+    exchange keys (op "voice"); the tool's name is inside the seal."""
+    phone = _plugin_package_module("phone_tool")
+    store = phone.PhoneStore(_calls_home())
+    try:
+        device_id, request, seal_answer = store.open_voice_request(envelope)
+    except phone.PhoneError as exc:
+        raise TokenError(exc.status, str(exc)) from exc
+    name = request.get("tool")
+    if name not in (phone.CALENDAR_TOOL, phone.PHONE_TOOL):
+        raise TokenError(404, "This host has no voice tool by that name")
+    provider = request.get("provider")
+    args = request.get("args")
+    action = args.get("action") if isinstance(args, dict) else None
+    logger.info("Conduit voice read: %s %s for %s", name,
+                action if isinstance(action, str) and action in phone.VOICE_CALENDAR_ACTIONS + ("status",) else "other",
+                provider if isinstance(provider, str) and _VOICE_PROVIDER.fullmatch(provider) else "voice")
+    return {"v": 1, **seal_answer({"result": phone.voice_handle(name, args, device_id=device_id, store=store)})}
 
 
 async def _voice_tools_route(response: Response, profile: Optional[str], fn: Callable[[], Dict[str, Any]],

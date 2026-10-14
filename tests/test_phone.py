@@ -693,8 +693,16 @@ def test_malformed_results_are_refused(store, iphone, results):
 
 def test_an_unknown_op_is_refused(store, iphone):
     with pytest.raises(phone.PhoneError) as error:
-        store.exchange(iphone.exchange_request(op="voice"))
+        store.exchange(iphone.exchange_request(op="other"))
     assert error.value.code == "unknown_op"
+
+
+def test_a_voice_read_is_refused_before_opening(store, iphone, monkeypatch):
+    opened = []
+    monkeypatch.setattr(phone, "open_sealed", lambda *args: opened.append(args))
+    with pytest.raises(phone.PhoneError) as error:
+        store.exchange(iphone.exchange_request(op="voice"))
+    assert error.value.code == "unknown_op" and opened == []
 
 
 # --- The tools ------------------------------------------------------------------
@@ -898,7 +906,7 @@ def test_routes_round_trip(client):
     body = response.json()
     assert body["ok"] is True and body["v"] == 1
     assert [item["id"] for item in handset.open_answer(body)["changes"]] == [change["id"]]
-    assert http.post(f"{BASE}/phone/exchange", json={**handset.exchange_request(), "op": "voice"}).status_code == 400
+    assert http.post(f"{BASE}/phone/exchange", json={**handset.exchange_request(), "op": "other"}).status_code == 400
     assert http.post(f"{BASE}/phone/ingest", json={**handset.seal(batch), "kid": "f" * 32}).status_code == 409
     assert http.post(f"{BASE}/phone/wipe", json={}).status_code == 400
     assert http.post(f"{BASE}/phone/wipe", json={"all": True, "device_id": DEVICE}).status_code == 400
@@ -921,3 +929,137 @@ def test_the_rate_limit_answers_429(client, monkeypatch):
     client.http.post(f"{BASE}/phone/exchange", json=handset.exchange_request())
     response = client.http.post(f"{BASE}/phone/exchange", json=handset.exchange_request())
     assert response.status_code == 429 and response.headers["cache-control"] == "no-store"
+
+
+# --- Live voice reads ---------------------------------------------------------------
+
+
+def _voice_request(handset, tool, args, call_id="voice-00000001"):
+    body = json.dumps({"call_id": call_id, "tool": tool, "args": args, "provider": "gemini-live"}).encode()
+    nonce, ct = phone.seal(handset.keys[phone.INFO_EXCHANGE_REQUEST], body,
+                           phone.exchange_aad("request", "voice", handset.kid, handset.device_id, call_id))
+    return {"v": 1, "device_id": handset.device_id, "kid": handset.kid, "call_id": call_id, "op": "voice",
+            "nonce": nonce, "ct": ct}
+
+
+def _voice_read(client, handset, tool, args, call_id="voice-00000001"):
+    response = client.http.post(f"{BASE}/voice-tools/call", json=_voice_request(handset, tool, args, call_id))
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    return handset.open_answer(response.json(), call_id=call_id, op="voice")["result"]
+
+
+def _route_shared(client, handset=None, **sharing):
+    handset = handset or Phone()
+    handset.accept(client.http.post(f"{BASE}/phone/key", json=handset.key_request()).json())
+    batch = _batch(sent_at=datetime.now(timezone.utc).isoformat(), sharing=_sharing(**sharing))
+    assert client.http.post(f"{BASE}/phone/ingest", json=handset.seal(batch)).status_code == 200
+    return handset
+
+
+def test_voice_lists_calendar_and_phone_reads_only_once_shared(client):
+    assert client.http.get(f"{BASE}/voice-tools").json()["tools"] == []
+    _route_shared(client)
+    tools = {tool["name"]: tool for tool in client.http.get(f"{BASE}/voice-tools").json()["tools"]}
+    assert set(tools) == {"conduit_calendar", "conduit_phone"}
+    assert {tool["key"] for tool in tools.values()} == {"phone"}
+    calendar = tools["conduit_calendar"]["parameters"]
+    assert calendar["properties"]["action"]["enum"] == list(tool.VOICE_CALENDAR_ACTIONS)
+    assert "device" not in calendar["properties"] and "title" not in calendar["properties"]
+    assert "add_event" not in tools["conduit_calendar"]["description"]
+
+
+def test_voice_reads_this_phones_calendar_sealed(client):
+    handset = _route_shared(client)
+    found = _voice_read(client, handset, "conduit_calendar",
+                        {"action": "events", "from": "2026-10-16", "to": "2026-10-16"})
+    assert found["ok"] is True and "e_dentist" in [event["id"] for event in found["events"]]
+    overview = _voice_read(client, handset, "conduit_calendar", {"action": "overview"}, call_id="voice-00000002")
+    assert [device["id"] for device in overview["devices"]] == [DEVICE]
+    status = _voice_read(client, handset, "conduit_phone", {"action": "status"}, call_id="voice-00000003")
+    assert status["ok"] is True
+
+
+def test_voice_offers_no_writes(client):
+    handset = _route_shared(client)
+    refused = _voice_read(client, handset, "conduit_calendar", {"action": "add_event", "title": "Gym",
+                                                                 "start": "2026-10-15T07:00:00+01:00"})
+    assert refused["ok"] is False and refused["error"] == "invalid"
+    assert phone.PhoneStore(client.home).changes(20) == []
+
+
+def test_voice_reads_never_reach_another_device(client):
+    other = _route_shared(client, Phone("phone-installation-2", name="Work iPhone"))
+    handset = _route_shared(client)
+    found = _voice_read(client, handset, "conduit_calendar",
+                        {"action": "events", "from": "2026-10-16", "to": "2026-10-16", "device": other.device_id})
+    assert found["device"] == "Eric's iPhone"
+    overview = _voice_read(client, handset, "conduit_calendar", {"action": "overview"}, call_id="voice-00000002")
+    assert [device["id"] for device in overview["devices"]] == [DEVICE]
+
+
+def test_a_voice_read_needs_the_voice_seal(client):
+    handset = _route_shared(client)
+    # Sealed for the changes exchange: it doesn't open as a voice read.
+    response = client.http.post(f"{BASE}/voice-tools/call", json={**handset.exchange_request(), "op": "voice"})
+    assert response.status_code == 409 and "set up" in response.json()["detail"]
+    # And a voice read doesn't run as an exchange.
+    response = client.http.post(f"{BASE}/phone/exchange",
+                                json=_voice_request(handset, "conduit_calendar", {"action": "overview"}))
+    assert response.status_code == 400
+    response = client.http.post(f"{BASE}/voice-tools/call",
+                                json=_voice_request(handset, "conduit_health", {"action": "overview"}))
+    assert response.status_code == 404
+
+
+def test_voice_follows_what_the_phone_shares(client):
+    handset = _route_shared(client, calendar="write_only", reminders=False, status=False, focus=False)
+    listed = client.http.get(f"{BASE}/voice-tools").json()["tools"]
+    assert [tool["name"] for tool in listed] == ["conduit_calendar"]
+    # Add-only: no event or reminder reads offered, and asking anyway says why.
+    assert listed[0]["parameters"]["properties"]["action"]["enum"] == ["overview", "calendars"]
+    found = _voice_read(client, handset, "conduit_calendar", {"action": "events"})
+    assert found["ok"] is False and found["error"] == "write_only"
+
+
+def test_voice_never_takes_another_device_by_name(client):
+    # A device that registered but never uploaded asks with an id that is
+    # another device's name: it reads nothing of that device.
+    _route_shared(client, Phone("phone-installation-2", name="phone-installation-9"))
+    asker = Phone("phone-installation-9")
+    asker.accept(client.http.post(f"{BASE}/phone/key", json=asker.key_request()).json())
+    found = _voice_read(client, asker, "conduit_calendar", {"action": "events", "from": "2026-10-16", "to": "2026-10-16"})
+    assert found["ok"] is False and "events" not in found
+    status = _voice_read(client, asker, "conduit_phone", {"action": "status"}, call_id="voice-00000002")
+    assert status["ok"] is False and "status" not in status
+
+
+def test_a_broken_calendar_store_leaves_health_listed(client, monkeypatch):
+    _route_shared(client)
+    real = api._plugin_package_module
+    health = real("health_tool")
+    # Some phone shares health, so its tool is listed.
+    monkeypatch.setattr(health.HealthStore, "overview", lambda self: {"devices": [{"id": "phone-installation-3"}]})
+
+    def broken(name):
+        if name == "phone_tool":
+            raise RuntimeError("boom")
+        return real(name)
+
+    monkeypatch.setattr(api, "_plugin_package_module", broken)
+    response = client.http.get(f"{BASE}/voice-tools")
+    assert response.status_code == 200
+    assert [tool["name"] for tool in response.json()["tools"]] == [health.TOOL_NAME]
+
+
+def test_a_broken_health_store_leaves_the_calendar_listed(client, monkeypatch):
+    _route_shared(client)
+    health = api._plugin_package_module("health_tool")
+
+    def broken(self):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(health.HealthStore, "overview", broken)
+    response = client.http.get(f"{BASE}/voice-tools")
+    assert response.status_code == 200
+    assert "conduit_calendar" in [tool["name"] for tool in response.json()["tools"]]
