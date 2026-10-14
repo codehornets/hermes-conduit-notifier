@@ -60,6 +60,9 @@ def test_claim_bases(url):
 
 
 @pytest.mark.parametrize("url", ["http://relay.example", "http://8.8.8.8", "http://100.128.0.1",
+                                 "http://169.254.169.254", "http://100.100.100.200", "http://[fd00:ec2::254]",
+                                 "http://169.254.170.2", "http://[::ffff:169.254.169.254]",
+                                 "http://metadata.google.internal", "http://METADATA.google.internal.",
                                  "https://relay.example?x=1", "https://relay.example/?", "https://u@relay.example"])
 def test_claim_bases_refused(url):
     with pytest.raises(urls.RelayURLError):
@@ -245,3 +248,44 @@ def test_cli_claim_refuses_a_malformed_answer_without_saving(monkeypatch, tmp_pa
     with pytest.raises(ValueError):
         client.claim_pairing("CODE", "https://relay.example", "box")
     assert client.load_state() is None
+
+
+def test_https_is_recognised_in_any_case():
+    assert urls.is_https("HTTPS://relay.example") and urls.is_https("https://relay.example")
+    assert not urls.is_https("http://127.0.0.1:8787")
+
+
+def test_status_warns_about_a_saved_plain_http_relay(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "load_state", lambda: {"credential": "c", "relay_url": "http://192.168.1.10:8787"})
+    monkeypatch.setattr(cli, "e2e_status", lambda state: {"enabled": False, "crypto": True})
+    assert cli.dispatch(types.SimpleNamespace(conduit_push_action="status")) == 0
+    assert "not a usable https://" in capsys.readouterr().out
+
+
+def test_test_prints_one_line_for_a_broken_saved_pairing(monkeypatch, capsys):
+    def broken(event):
+        raise KeyError("relay_url")
+    monkeypatch.setattr(cli, "send_now", broken)
+    assert cli.dispatch(types.SimpleNamespace(conduit_push_action="test", corrupt=False)) == 1
+    assert "did not accept" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("url", ["https://metadata.google.internal", "https://169.254.169.254",
+                                 "https://sub.metadata.google.internal", "http://metadata.google.internal"])
+def test_metadata_addresses_are_refused_over_any_scheme(url):
+    for check in (urls.check_claim_base, urls.check_request_url):
+        with pytest.raises(urls.RelayURLError):
+            check(url)
+
+
+def test_metadata_addresses_still_count_as_private():
+    assert urls.is_private("169.254.169.254") and urls.is_private("metadata.google.internal")
+
+
+def test_status_strips_control_characters(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "load_state", lambda: {"credential": "c", "relay_url": "https://relay.example",
+                                                    "gateway_name": "box\x1b[31m"})
+    monkeypatch.setattr(cli, "e2e_status", lambda state: {"enabled": False, "crypto": True})
+    assert cli.dispatch(types.SimpleNamespace(conduit_push_action="status")) == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "Paired: box[31m" in out and "Warning" not in out
