@@ -162,7 +162,7 @@ _COLOR = re.compile(r"^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?\Z")
 # Line breaks, other control characters and invisible format characters
 # (bidi overrides, zero-width), which could make a title or name read like
 # instructions in the agent's tool result or on the phone's change card.
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f​-‏ -‮⁠-⁯﻿]+")
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+")
 
 _thread_lock = threading.Lock()
 

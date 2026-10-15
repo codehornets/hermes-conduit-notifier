@@ -68,7 +68,7 @@ def _phone(store, **batch):
 
 ROUTE = {"from": {"name": "Shoreditch"}, "to": {"name": "Home"}, "mode": "driving",
          "routes": [{"name": "A10", "duration_s": 1500, "typical_duration_s": 1200, "distance_m": 9000,
-                     "steps": [{"text": "Turn left‮onto High St", "distance_m": 400}]}]}
+                     "steps": [{"text": "Turn left\u202eonto High St", "distance_m": 400}]}]}
 
 
 # --- The store ---------------------------------------------------------------
