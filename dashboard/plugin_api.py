@@ -4090,6 +4090,69 @@ async def put_conduit_settings(request: Request, response: Response, profile: Op
         raise _unexpected("settings", exc, feature="Conduit settings")
 
 
+# --- Confirm prompts Hermes shows on the phone ---------------------------------
+#
+# Before an action the user should OK, conduit_present keeps a confirm prompt
+# (present_store.py) and wakes the phone with phone.changes. Conduit reports
+# what the user answered (tap or voice) and gets back the prompts still
+# waiting, with the same identity fields as /conduit-settings.
+
+PRESENT_EXCHANGE_LIMIT = 60
+PRESENT_EXCHANGE_WINDOW_S = 60.0
+PRESENT_MAX_BODY_BYTES = 512 * 1024  # room for 40 results with 2,000-character edits in any script, even \u-escaped
+
+_present_exchange_limiter = _MintLimiter(PRESENT_EXCHANGE_LIMIT, PRESENT_EXCHANGE_WINDOW_S,
+                                         message="Too many confirm prompt checks; try again shortly")
+_present_store_module: Any = None
+
+
+def _present_store() -> Any:
+    """present_store.py beside this folder, loaded once."""
+    global _present_store_module
+    with _calls_store_lock:
+        if _present_store_module is None:
+            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "present_store.py")
+            spec = importlib.util.spec_from_file_location("conduit_push_dashboard_present_store", path)
+            if spec is None or spec.loader is None or not os.path.exists(path):
+                raise TokenError(501, "This plugin install is missing present_store.py; update the plugin")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _present_store_module = module
+        return _present_store_module
+
+
+def exchange_present(body: Any) -> Dict[str, Any]:
+    """The installation id names a device; it doesn't authenticate one. The
+    dashboard's auth is the boundary, as on every route here."""
+    if _load_pairing_state(_pairing_state_path()) is None:
+        raise TokenError(409, "This Hermes profile isn't paired with Conduit")
+    module = _present_store()
+    try:
+        return module.PresentStore(_calls_home()).exchange(body)
+    except module.PresentError as exc:
+        raise TokenError(400, str(exc))
+    except OSError:
+        # The store couldn't be read or written right now; the phone keeps
+        # its answers and exchanges again.
+        raise TokenError(503, "Confirm prompts are unavailable right now")
+
+
+@router.post("/present/exchange")
+async def post_present_exchange(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    body = await _read_json_body(request, PRESENT_MAX_BODY_BYTES)
+    try:
+        _present_exchange_limiter.acquire(_limiter_key(profile))
+        return {"ok": True, **(await _run_scoped(profile, lambda: exchange_present(body)))}
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected("present", exc, feature="Confirm prompts")
+
+
 # --- Health data (Apple Health shared from Conduit) ---------------------------
 #
 # The user turns on health sharing in Conduit, per category. The phone agrees
@@ -8978,6 +9041,7 @@ ROUTE_CAPABILITIES = (
     "hermes-call-presence",
     "hermes-call-outcomes",
     "conduit-settings",
+    "present-v1",
     "health-sync",
     "voice-tools",
     "phone-sync",

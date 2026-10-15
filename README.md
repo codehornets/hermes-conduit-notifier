@@ -1118,6 +1118,33 @@ what Conduit allows:
 The tool shows only once a Conduit has synced with the profile. Limits: 20
 requested changes per device per hour, 10 per call, 8 devices per profile.
 
+## Hermes asks you to confirm (plugin 0.34+)
+
+Before an action you should OK (sending a message for you, buying, deleting),
+Hermes can ask on your phone with the `conduit_present` tool:
+
+- **Tool.** `confirm` keeps a prompt (title up to 80 characters, a Markdown
+  preview up to 2,000, a button label up to 24, up to 5 `spoken_yes`
+  phrases, `ttl_minutes` 30 by default and at most 1,440) and wakes the phone
+  with a `phone.changes` push (`present:<id>`). `wait_seconds` (up to 120)
+  waits for the answer. `status` returns waiting prompts and answers Hermes
+  hasn't seen yet (or one by `id`); `cancel` takes one back. States:
+  `waiting`, `confirmed`, `declined`, `edit`, `expired`, `cancelled`. Only
+  `confirmed` means go ahead; on `edit` you send the corrected request
+  yourself.
+- **Conduit answers.** It shows a panel over everything, calls included, and
+  you confirm by tap or, in a call, by voice. It reports answers and fetches
+  waiting prompts with
+  `POST /api/plugins/conduit_push/present/exchange?profile=`:
+  `{"installation_id", "device", "app_version", "results": [{"id", "outcome": "confirmed|declined|edit", "edit_text"?, "via": "tap|voice"}]}`
+  answers `{"ok": true, "prompts": [{"id", "title", "preview", "action_label", "spoken_yes", "session_id", "created_at", "expires_at"}]}`.
+  The first answer wins; answers for unknown or finished prompts are ignored.
+
+The tool shows only once a Conduit with `present-v1` has exchanged with the
+profile; subagents can't use it. Prompts live in the profile's
+`conduit-present.json` (answers are kept a week). Limits: 20 prompts an
+hour, 20 waiting at once, 60 exchanges a minute per profile.
+
 ## Health data from Conduit (plugin 0.23+)
 
 Conduit can share Apple Health data with a Hermes profile so the agent can

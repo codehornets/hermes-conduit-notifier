@@ -13,7 +13,7 @@ from typing import Any
 from hermes_constants import get_hermes_home
 
 from . import (call_tool, call_watches, calls, clarify_loop, cron_runs, desktop_selected, health_tool,
-               live_activity, location_tool, maps_tool, phone_tool, settings_tool)
+               live_activity, location_tool, maps_tool, phone_tool, present_tool, settings_tool)
 from .session_titles import title as _session_title, titled as _titled
 from .client import enqueue
 from .events import approval_decision, clarification_text, event_id, is_silent_response, push_event
@@ -52,6 +52,9 @@ def register(ctx: Any) -> None:
     # Hermes configures Conduit: the settings Conduit shares, changed only
     # through requests Conduit checks and the user approves.
     settings_tool.register(ctx, is_child=_is_child)
+    # Hermes asks the user to OK an action on their phone (tap, or voice in
+    # a call) before it does it.
+    present_tool.register(ctx, is_child=_is_child, profile=lambda: _profile)
     # Health data Conduit shares from Apple Health, read-only, with its skill.
     health_tool.register(ctx, is_child=_is_child,
                          skill_path=Path(__file__).resolve().parent / "skills" / health_tool.SKILL_NAME / "SKILL.md")
