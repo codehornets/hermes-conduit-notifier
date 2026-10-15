@@ -3757,6 +3757,84 @@ async def post_pair(request: Request, response: Response, profile: Optional[str]
         raise _unexpected("pairing", exc, feature="Pairing")
 
 
+# --- Cron notifications ------------------------------------------------------
+#
+# The user turns one cron job's notifications off in Conduit's Cron tab. The
+# muted job ids live in the profile's conduit-cron.json, shared with the
+# plugin's turn-end hooks (agent process), which skip the push for that job's
+# runs, through cron_store.py (loaded by path: this module can't import the
+# plugin package). A run that answers [SILENT] never notifies either way.
+
+CRON_LIMIT = 60
+CRON_WINDOW_S = 60.0
+CRON_MAX_BODY_BYTES = 1024
+_cron_limiter = _MintLimiter(CRON_LIMIT, CRON_WINDOW_S, message="Too many cron requests; try again shortly")
+_cron_store_module: Any = None
+_cron_store_lock = threading.Lock()
+
+
+def _cron_store() -> Any:
+    """cron_store.py beside this folder, loaded once."""
+    global _cron_store_module
+    with _cron_store_lock:
+        if _cron_store_module is None:
+            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cron_store.py")
+            spec = importlib.util.spec_from_file_location("conduit_push_dashboard_cron_store", path)
+            if spec is None or spec.loader is None or not os.path.isfile(path):
+                raise TokenError(501, "This plugin install is missing cron_store.py; update the plugin")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _cron_store_module = module
+        return _cron_store_module
+
+
+def _cron_home() -> Any:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home()
+
+
+def cron_notifications() -> Dict[str, Any]:
+    return {"muted": _cron_store().CronStore(_cron_home()).muted()}
+
+
+def update_cron_notifications(body: Any) -> Dict[str, Any]:
+    if not isinstance(body, dict):
+        raise TokenError(400, "Expected a JSON object with job_id and notify")
+    try:
+        muted = _cron_store().CronStore(_cron_home()).set_notify(body.get("job_id"), body.get("notify"))
+    except ValueError as exc:
+        raise TokenError(400, str(exc))
+    return {"muted": muted}
+
+
+async def _cron_route(profile: Optional[str], response: Response, fn: Callable[[], Dict[str, Any]],
+                      route: str) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        _cron_limiter.acquire(_limiter_key(profile))
+        return {"ok": True, **(await _run_scoped(profile, fn))}
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected(route, exc, feature="Cron notifications")
+
+
+@router.get("/cron/notifications")
+async def get_cron_notifications(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    return await _cron_route(profile, response, cron_notifications, "status")
+
+
+@router.put("/cron/notifications")
+async def put_cron_notifications(request: Request, response: Response,
+                                 profile: Optional[str] = None) -> Dict[str, Any]:
+    body = await _read_json_body(request, CRON_MAX_BODY_BYTES)
+    return await _cron_route(profile, response, lambda: update_cron_notifications(body), "settings")
+
+
 # --- Hermes calls you (#449) -------------------------------------------------
 #
 # Conduit asks to be called when a job the user handed to a Live Voice call
@@ -8908,6 +8986,7 @@ ROUTE_CAPABILITIES = (
     "location-sync",
     "pairing",
     "self-restart",
+    "cron-notifications",
 )
 
 

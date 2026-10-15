@@ -67,6 +67,7 @@ def test_every_capability_names_a_served_route_family():
         "phone-contacts": "/phone/",
         "pairing": "/pair",
         "self-restart": "/self/restart",
+        "cron-notifications": "/cron/notifications",
     }
     assert set(prefixes) == set(api.ROUTE_CAPABILITIES)
     for capability, prefix in prefixes.items():

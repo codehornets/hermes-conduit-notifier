@@ -929,3 +929,66 @@ def test_child_and_silent_turns_leave_no_start_time(home, fake, monkeypatch):
     assert plugin._turn_started == {}
     plugin._subagent_stop(child_session_id="child-9", parent_session_id="st-1")
 
+
+
+# --- Cron runs ---------------------------------------------------------------
+
+cron_runs = sys.modules["conduit_push.cron_runs"]
+CronStore = sys.modules["conduit_push.cron_store"].CronStore
+
+
+@pytest.fixture
+def cron_home(home, monkeypatch):
+    monkeypatch.setattr(cron_runs, "get_hermes_home", lambda: home)
+    return home
+
+
+def test_cron_runs_are_told_by_task_id_or_classic_session_id():
+    assert cron_runs.job_id("local-abc", "cron:a1b2c3d4e5f6:exec-1") == "a1b2c3d4e5f6"
+    assert cron_runs.job_id("cron_job-1_20261015_083000", None) == "job-1"
+    assert cron_runs.job_id("20261015_083000_abcd", "task-uuid") is None
+    assert cron_runs.job_id(None, None) is None
+
+
+@pytest.mark.parametrize("response", [
+    "[SILENT]", "[silent]\n", "[SILENT] No changes since the last run.",
+    "Nothing new today.\n[SILENT]", "NO_REPLY",
+])
+def test_a_silent_cron_run_does_not_notify(cron_home, fake, response):
+    plugin._post_llm_call(session_id="local-1", task_id="cron:a1b2c3d4e5f6:x", turn_id="t1",
+                          assistant_response=response)
+    assert fake.enqueued == []
+
+
+def test_a_cron_run_that_mentions_silent_mid_sentence_still_notifies(cron_home, fake):
+    plugin._post_llm_call(session_id="local-1", task_id="cron:a1b2c3d4e5f6:x", turn_id="t1",
+                          assistant_response="The [SILENT] marker showed up in the logs.")
+    assert [event["type"] for event in fake.enqueued] == ["response.ready"]
+
+
+def test_chats_keep_the_exact_silence_rule(cron_home, fake):
+    plugin._post_llm_call(session_id="rt-1", turn_id="t1", assistant_response="[SILENT] No changes")
+    assert [event["type"] for event in fake.enqueued] == ["response.ready"]
+
+
+def test_the_fallback_silence_rule_matches_hermes(monkeypatch):
+    assert cron_runs._fallback_silent("[SILENT] No changes")
+    assert cron_runs._fallback_silent("Report\n\nsilent")
+    assert not cron_runs._fallback_silent("Silent retry succeeded")
+    assert not cron_runs._fallback_silent("")
+
+
+def test_a_muted_job_does_not_notify_when_it_finishes_or_fails(cron_home, fake):
+    CronStore(cron_home).set_notify("a1b2c3d4e5f6", False)
+    plugin._post_llm_call(session_id="cron_a1b2c3d4e5f6_20261015_083000", turn_id="t1",
+                          assistant_response="Here is today's report.")
+    plugin._on_session_end(session_id="cron_a1b2c3d4e5f6_20261015_083000", task_id="cron:a1b2c3d4e5f6:x",
+                           turn_id="t2", completed=False, interrupted=False)
+    assert fake.enqueued == []
+    # Other jobs, and the job once turned back on, notify.
+    plugin._post_llm_call(session_id="local-2", task_id="cron:ffffffffffff:x", turn_id="t3",
+                          assistant_response="Other report.")
+    CronStore(cron_home).set_notify("a1b2c3d4e5f6", True)
+    plugin._on_session_end(session_id="local-1", task_id="cron:a1b2c3d4e5f6:x",
+                           turn_id="t4", completed=False, interrupted=False)
+    assert [event["type"] for event in fake.enqueued] == ["response.ready", "turn.failed"]

@@ -12,8 +12,8 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 
-from . import (call_tool, call_watches, calls, clarify_loop, desktop_selected, health_tool, live_activity,
-               location_tool, maps_tool, phone_tool, settings_tool)
+from . import (call_tool, call_watches, calls, clarify_loop, cron_runs, desktop_selected, health_tool,
+               live_activity, location_tool, maps_tool, phone_tool, settings_tool)
 from .session_titles import title as _session_title, titled as _titled
 from .client import enqueue
 from .events import approval_decision, clarification_text, event_id, is_silent_response, push_event
@@ -133,7 +133,10 @@ def _post_llm_call(**kwargs: Any) -> None:
         return
     _quietly(live_activity.reporter.turn_ended, session_id, "done")
     started = _take_turn_start(kwargs.get("turn_id"))
-    ready = None if is_silent_response(response) else push_event(
+    # A cron run says nothing when the user muted its job or it answered
+    # [SILENT] by Hermes' cron rule ("[SILENT] No changes" too).
+    quiet = is_silent_response(response) or cron_runs.quiet(session_id, kwargs.get("task_id"), response)
+    ready = None if quiet else push_event(
         "response.ready",
         identifier=event_id("response", kwargs.get("turn_id"), session_id),
         session_id=session_id,
@@ -182,6 +185,11 @@ def _on_session_end(**kwargs: Any) -> None:
         return
     if kwargs.get("interrupted"):
         calls.turn_ended(session_id, "stopped", profile=_profile, fallback=None)
+        return
+    if cron_runs.quiet(session_id, kwargs.get("task_id")):
+        # A muted cron job's failed run: no push and no automatic alert call.
+        # A call the user asked for on this job (a watch) still rings.
+        calls.turn_ended(session_id, "failed", profile=_profile, fallback=None)
         return
     failed = push_event(
         "turn.failed",
