@@ -1022,6 +1022,13 @@ and the dashboard routes under one file lock, so they survive restarts:
   late retry of the report arrives after. Nothing rings again. A retried
   report keeps the first; a profile keeps at most 20 waiting, each for a
   day. 409 when the profile isn't paired, 400 for anything malformed.
+- **Conduit first (0.36+):** every turn of a main conversation also gets one
+  line naming what the phone shares with this profile (calendar and
+  reminders, health, location, phone status, contacts) and saying to use
+  the Conduit tool before other tools, skills or CLIs for the same data,
+  such as gog. Each of those tools' descriptions ends the same way. Hermes
+  drops `pre_llm_call` context after the turn, so the line never piles up;
+  what's shared is looked up at most once a minute. Subagents don't get it.
 - The call request carries the job's id, outcome, title and session ids so
   Conduit can open the right chat. With end-to-end encryption they are sealed
   like any other content; with `redact on` the title is dropped.

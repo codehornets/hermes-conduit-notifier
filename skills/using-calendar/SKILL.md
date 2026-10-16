@@ -23,6 +23,14 @@ kind, which calendars and lists, and how far back and ahead.
   emails, birthday). Use it to know who "my wife" or "Sam" is; never send
   their details anywhere or into memory unless the user asks.
 
+Use these first. If the user also set up another way to their calendar
+or contacts (a CLI such as gog, another skill or an API), Conduit's copy
+is on this host, covers every account on the phone and answers at once,
+so reach for the other only when the user asks for it, or for what
+Conduit doesn't have (a calendar the phone doesn't share, someone who
+isn't in `conduit_contacts`, or a change since the last sync that
+matters).
+
 ## What it's for
 
 The user turned sharing on so you can use it, not only answer questions

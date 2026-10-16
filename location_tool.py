@@ -29,6 +29,7 @@ from typing import Any, Callable
 from hermes_constants import get_hermes_home
 
 from . import call_watches, client, session_titles
+from .conduit_first import LOCATION_FIRST
 from .events import push_event
 from .location_store import (
     ANY_PLACE, MAX_RULES, MAX_TASK_CHARS, MAX_WHAT_CHARS, RULE_EVENTS, RULE_REPEATS, WEEKDAYS, LocationError,
@@ -66,7 +67,8 @@ SCHEMA: dict[str, Any] = {
         "places), history (arrivals and departures), distance_to (from the latest fix to a saved place), "
         "rules / set_rule / remove_rule (place rules: run any task when they arrive at or leave a saved place, "
         "or any of them). "
-        f"Before setting up a place rule or a job that uses location, load skill_view(\"conduit_push:{SKILL_NAME}\")."
+        f"Before setting up a place rule or a job that uses location, load skill_view(\"conduit_push:{SKILL_NAME}\"). "
+        f"{LOCATION_FIRST}"
     ),
     "parameters": {
         "type": "object",
