@@ -48,6 +48,13 @@ def _load(name, path):
 
 calls = _load("conduit_push.calls", ROOT / "calls.py")
 plugin = _load("conduit_push.__init__", ROOT / "__init__.py")
+
+
+def _reply(**kwargs):
+    """A finished turn as Hermes reports it: its reply, then its end."""
+    plugin._post_llm_call(**kwargs)
+    plugin._on_session_end(session_id=kwargs.get("session_id"), task_id=kwargs.get("task_id"),
+                           turn_id=kwargs.get("turn_id"), completed=True, failed=False, interrupted=False)
 CallStore = sys.modules["conduit_push.calls_store"].CallStore
 
 
@@ -279,7 +286,7 @@ def test_a_broken_watch_file_never_breaks_the_turn(home, fake, monkeypatch):
 
 
 def test_post_llm_call_keeps_the_ready_push_for_unwatched_sessions(home, fake):
-    plugin._post_llm_call(session_id="rt-1", turn_id="t1", assistant_response="All done.")
+    _reply(session_id="rt-1", turn_id="t1", assistant_response="All done.")
     [event] = fake.enqueued
     assert event["type"] == "response.ready"
     assert event["body"] == "All done."
@@ -287,7 +294,7 @@ def test_post_llm_call_keeps_the_ready_push_for_unwatched_sessions(home, fake):
 
 def test_post_llm_call_on_a_watched_job_calls_instead_of_notifying(home, fake):
     _watch(home, "rt-1")
-    plugin._post_llm_call(session_id="rt-1", turn_id="t1", assistant_response="All done.")
+    _reply(session_id="rt-1", turn_id="t1", assistant_response="All done.")
     assert fake.enqueued == []
     assert fake.sent[0]["type"] == "call.requested"
     # on_session_end for the same finished turn finds the watch gone.
@@ -319,7 +326,7 @@ def test_on_session_end_keeps_the_failure_push_for_unwatched_sessions(home, fake
 
 def test_a_silent_reply_on_a_watched_job_still_calls(home, fake):
     _watch(home, "rt-1")
-    plugin._post_llm_call(session_id="rt-1", turn_id="t1", assistant_response="[Silent]")
+    _reply(session_id="rt-1", turn_id="t1", assistant_response="[Silent]")
     assert fake.sent[0]["type"] == "call.requested"
 
 
@@ -327,7 +334,7 @@ def test_a_subagent_turn_never_fires_a_watch(home, fake):
     _watch(home, "child-1")
     plugin._subagent_start(child_session_id="child-1")
     try:
-        plugin._post_llm_call(session_id="child-1", turn_id="t1", assistant_response="x")
+        _reply(session_id="child-1", turn_id="t1", assistant_response="x")
         plugin._on_session_end(session_id="child-1", turn_id="t1", completed=False, interrupted=False)
     finally:
         plugin._child_sessions.discard("child-1")
@@ -494,7 +501,7 @@ def test_the_tool_calls_when_the_asking_turn_ends_with_its_reason(home, fake, pa
     answer = _tool({"reason": "The deploy finished; two tests failed.", "asked_by_user": True})
     assert answer["ok"] is True and answer["status"] == "call_at_turn_end"
     assert fake.sent == [], "nothing rings before the turn ends"
-    plugin._post_llm_call(session_id="st-1", turn_id="t1", assistant_response="Here's what happened…")
+    _reply(session_id="st-1", turn_id="t1", assistant_response="Here's what happened…")
     [event] = fake.sent
     assert event["type"] == "call.requested"
     assert event["body"] == "The deploy finished; two tests failed."
@@ -751,7 +758,7 @@ def test_nothing_rings_during_a_live_voice_call(home, fake, paired):
     _settings(home)
     _tool({"reason": "Done.", "asked_by_user": True})
     calls._store(home).set_presence(90)
-    plugin._post_llm_call(session_id="st-1", turn_id="t1", assistant_response="Done.")
+    _reply(session_id="st-1", turn_id="t1", assistant_response="Done.")
     assert fake.sent == []
     assert [event["type"] for event in fake.enqueued] == ["response.ready"]
 
@@ -863,11 +870,11 @@ def _desktop_selects(home, monkeypatch, *ids):
 def test_a_quick_reply_in_a_chat_desktop_has_selected_sends_no_ready_push(home, fake, monkeypatch):
     _desktop_selects(home, monkeypatch, "st-1")
     plugin._pre_llm_call(session_id="st-1", turn_id="t1")
-    plugin._post_llm_call(session_id="st-1", turn_id="t1", assistant_response="All done.")
+    _reply(session_id="st-1", turn_id="t1", assistant_response="All done.")
     assert fake.enqueued == []
     # Another chat still notifies.
     plugin._pre_llm_call(session_id="st-2", turn_id="t2")
-    plugin._post_llm_call(session_id="st-2", turn_id="t2", assistant_response="Also done.")
+    _reply(session_id="st-2", turn_id="t2", assistant_response="Also done.")
     assert [event["session_id"] for event in fake.enqueued] == ["st-2"]
 
 
@@ -876,13 +883,13 @@ def test_a_long_turn_in_a_chat_desktop_has_selected_still_pushes(home, fake, mon
     plugin._pre_llm_call(session_id="st-1", turn_id="t1")
     desktop_selected = sys.modules["conduit_push.desktop_selected"]
     plugin._turn_started["t1"] -= desktop_selected.QUICK_TURN_S + 1
-    plugin._post_llm_call(session_id="st-1", turn_id="t1", assistant_response="All done.")
+    _reply(session_id="st-1", turn_id="t1", assistant_response="All done.")
     assert [event["type"] for event in fake.enqueued] == ["response.ready"]
 
 
 def test_a_turn_without_a_start_time_still_pushes(home, fake, monkeypatch):
     _desktop_selects(home, monkeypatch, "st-1")
-    plugin._post_llm_call(session_id="st-1", turn_id="t-unknown", assistant_response="All done.")
+    _reply(session_id="st-1", turn_id="t-unknown", assistant_response="All done.")
     assert [event["type"] for event in fake.enqueued] == ["response.ready"]
 
 
@@ -890,7 +897,7 @@ def test_a_watched_job_in_a_chat_desktop_has_selected_still_calls(home, fake, mo
     _desktop_selects(home, monkeypatch, "rt-1")
     _watch(home, "rt-1")
     plugin._pre_llm_call(session_id="rt-1", turn_id="t1")
-    plugin._post_llm_call(session_id="rt-1", turn_id="t1", assistant_response="All done.")
+    _reply(session_id="rt-1", turn_id="t1", assistant_response="All done.")
     assert fake.sent[0]["type"] == "call.requested"
 
 
@@ -900,7 +907,7 @@ def test_an_unreadable_desktop_selection_never_drops_the_ready_push(home, fake, 
 
     monkeypatch.setattr(sys.modules["conduit_push.desktop_selected"], "selected", broken)
     plugin._pre_llm_call(session_id="rt-1", turn_id="t1")
-    plugin._post_llm_call(session_id="rt-1", turn_id="t1", assistant_response="All done.")
+    _reply(session_id="rt-1", turn_id="t1", assistant_response="All done.")
     assert [event["type"] for event in fake.enqueued] == ["response.ready"]
 
 
@@ -926,7 +933,7 @@ def test_child_and_silent_turns_leave_no_start_time(home, fake, monkeypatch):
     plugin._subagent_start(child_session_id="child-9")
     plugin._pre_llm_call(session_id="child-9", turn_id="c1")
     plugin._pre_llm_call(session_id="st-1", turn_id="s1")
-    plugin._post_llm_call(session_id="st-1", turn_id="s1", assistant_response="[Silent]")
+    _reply(session_id="st-1", turn_id="s1", assistant_response="[Silent]")
     assert plugin._turn_started == {}
     plugin._subagent_stop(child_session_id="child-9", parent_session_id="st-1")
 
@@ -956,19 +963,19 @@ def test_cron_runs_are_told_by_task_id_or_classic_session_id():
     "Nothing new today.\n[SILENT]", "NO_REPLY",
 ])
 def test_a_silent_cron_run_does_not_notify(cron_home, fake, response):
-    plugin._post_llm_call(session_id="local-1", task_id="cron:a1b2c3d4e5f6:x", turn_id="t1",
+    _reply(session_id="local-1", task_id="cron:a1b2c3d4e5f6:x", turn_id="t1",
                           assistant_response=response)
     assert fake.enqueued == []
 
 
 def test_a_cron_run_that_mentions_silent_mid_sentence_still_notifies(cron_home, fake):
-    plugin._post_llm_call(session_id="local-1", task_id="cron:a1b2c3d4e5f6:x", turn_id="t1",
+    _reply(session_id="local-1", task_id="cron:a1b2c3d4e5f6:x", turn_id="t1",
                           assistant_response="The [SILENT] marker showed up in the logs.")
     assert [event["type"] for event in fake.enqueued] == ["response.ready"]
 
 
 def test_chats_keep_the_exact_silence_rule(cron_home, fake):
-    plugin._post_llm_call(session_id="rt-1", turn_id="t1", assistant_response="[SILENT] No changes")
+    _reply(session_id="rt-1", turn_id="t1", assistant_response="[SILENT] No changes")
     assert [event["type"] for event in fake.enqueued] == ["response.ready"]
 
 
@@ -981,13 +988,13 @@ def test_the_fallback_silence_rule_matches_hermes(monkeypatch):
 
 def test_a_muted_job_does_not_notify_when_it_finishes_or_fails(cron_home, fake):
     CronStore(cron_home).set_notify("a1b2c3d4e5f6", False)
-    plugin._post_llm_call(session_id="cron_a1b2c3d4e5f6_20261015_083000", turn_id="t1",
+    _reply(session_id="cron_a1b2c3d4e5f6_20261015_083000", turn_id="t1",
                           assistant_response="Here is today's report.")
     plugin._on_session_end(session_id="cron_a1b2c3d4e5f6_20261015_083000", task_id="cron:a1b2c3d4e5f6:x",
                            turn_id="t2", completed=False, interrupted=False)
     assert fake.enqueued == []
     # Other jobs, and the job once turned back on, notify.
-    plugin._post_llm_call(session_id="local-2", task_id="cron:ffffffffffff:x", turn_id="t3",
+    _reply(session_id="local-2", task_id="cron:ffffffffffff:x", turn_id="t3",
                           assistant_response="Other report.")
     CronStore(cron_home).set_notify("a1b2c3d4e5f6", True)
     plugin._on_session_end(session_id="local-1", task_id="cron:a1b2c3d4e5f6:x",

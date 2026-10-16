@@ -13,10 +13,10 @@ from typing import Any
 from hermes_constants import get_hermes_home
 
 from . import (call_tool, call_watches, calls, clarify_loop, cron_runs, desktop_selected, health_tool,
-               live_activity, location_tool, maps_tool, phone_tool, present_tool, settings_tool)
+               live_activity, location_tool, maps_tool, phone_tool, present_tool, reply_sources, settings_tool)
 from .session_titles import title as _session_title, titled as _titled
 from .client import enqueue
-from .events import approval_decision, clarification_text, event_id, is_silent_response, push_event
+from .events import approval_decision, clarification_text, event_id, is_silent_response, plain_text, push_event
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,19 @@ _clarify_loop_active = False
 _turn_started: dict[str, float] = {}
 _turn_started_lock = threading.Lock()
 MAX_TURN_STARTS = 256
+# (session id, turn_id) -> (its "response ready" event or None, whether it
+# goes out, the grace timer), held from post_llm_call until on_session_end
+# says the turn finished.
+_pending_ready: dict[tuple[str, str], tuple[Any, bool, Any]] = {}
+_pending_lock = threading.Lock()
+# on_session_end follows post_llm_call in the same finalizer, after only the
+# memory sync; the grace is for a Hermes that never reports the end.
+READY_GRACE_S = 120.0
+# Parent session -> (its running turn's id, when it started by
+# time.monotonic()): a subagent that finishes inside it is part of its reply.
+_parent_turns: dict[str, tuple[str, float]] = {}
+_parent_turns_lock = threading.Lock()
+PARENT_TURN_MAX_S = 6 * 3600.0
 
 
 def register(ctx: Any) -> None:
@@ -145,16 +158,75 @@ def _post_llm_call(**kwargs: Any) -> None:
         session_id=session_id,
         profile=_profile,
         title=_session_title(session_id),
-        body=_text(response),
+        body=plain_text(response),
     )
+    # A quick reply in a chat Hermes Desktop has selected: the user most
+    # likely watched it arrive there (#87). A reply to a message sent from a
+    # source the user turned off (Desktop, a messaging app…) arrives there (#115).
+    send = ready is not None and not _desktop_watched(session_id, started) and _source_notifies(kwargs.get("platform"))
+    # Hermes also runs this hook for a turn that failed with text (its error
+    # explanation): on_session_end, right after, says which it was, so the
+    # reply waits for it and a failed turn sends only its failure notice.
+    turn_id = kwargs.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id:
+        _finish_ready(session_id, ready, send)
+        return
+    key = (session_id, turn_id)
+    # A Hermes that never reports the turn's end still gets its reply out.
+    timer = _later(READY_GRACE_S, lambda: _settle_ready(session_id, turn_id, "done"))
+    with _pending_lock:
+        earlier = _pending_ready.pop(key, None)
+        _pending_ready[key] = (ready, send, timer)
+        overflow = []
+        while len(_pending_ready) > MAX_TURN_STARTS:
+            oldest = next(iter(_pending_ready))
+            overflow.append((oldest[0], _pending_ready.pop(oldest)))
+    if earlier is not None:
+        _cancel(earlier[2])  # the same turn reported twice: the last reply wins
+    # Far more turns than ever end at once: the oldest go out now.
+    for old_session, (old_ready, old_send, old_timer) in overflow:
+        _cancel(old_timer)
+        _finish_ready(old_session, old_ready, old_send)
+
+
+def _settle_ready(session_id: str, turn_id: Any, outcome: str) -> bool:
+    """Sends (``done``) or drops the reply held for this turn; False when
+    none was held (already settled, or never held)."""
+    with _pending_lock:
+        if isinstance(turn_id, str) and turn_id:
+            found = [_pending_ready.pop((session_id, turn_id), None)]
+        else:
+            # An end without its turn's id: a chat's turns run one at a
+            # time, so whatever it holds is that turn's.
+            found = [_pending_ready.pop(key) for key in [key for key in _pending_ready if key[0] == session_id]]
+    found = [pending for pending in found if pending is not None]
+    for ready, send, timer in found:
+        _cancel(timer)
+        if outcome == "done":
+            _finish_ready(session_id, ready, send)
+    return bool(found)
+
+
+def _finish_ready(session_id: str, ready: dict[str, Any] | None, send: bool) -> None:
     # A job the user asked to be called about (#449) ends here: the call
     # request takes the place of the ready notification.
     if calls.turn_ended(session_id, "done", profile=_profile, fallback=ready):
         return
-    # A quick reply in a chat Hermes Desktop has selected: the user most
-    # likely watched it arrive there (#87).
-    if ready is not None and not _desktop_watched(session_id, started):
+    if ready is not None and send:
         enqueue(ready)
+
+
+def _later(delay: float, work: Any) -> Any:
+    timer = threading.Timer(delay, work)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _cancel(timer: Any) -> None:
+    cancel = getattr(timer, "cancel", None)
+    if callable(cancel):
+        cancel()
 
 
 def _take_turn_start(turn_id: Any) -> float | None:
@@ -173,19 +245,35 @@ def _desktop_watched(session_id: str, started: float | None) -> bool:
         return False
 
 
+def _source_notifies(platform: Any) -> bool:
+    try:
+        source = reply_sources.turn_source(platform, reply_sources.current_transport())
+        return source is None or reply_sources.ReplySourcesStore(get_hermes_home()).notifies(source)
+    except Exception:  # noqa: BLE001 — can't tell, so the push goes out
+        logger.debug("conduit_push: reply source unreadable", exc_info=True)
+        return True
+
+
 def _on_session_end(**kwargs: Any) -> None:
-    # Fires at the end of every turn, whatever happened (post_llm_call only
-    # after a turn that finished): the one place a watched job's failure or
-    # stop shows up. A finished turn's watch was normally consumed by
-    # post_llm_call already, so this finds nothing then.
+    # Fires at the end of every turn, whatever happened (post_llm_call after
+    # any turn with text, a failed one too): the one place a watched job's
+    # failure or stop shows up, and where a held reply goes out.
     session_id = _text(kwargs.get("session_id"))
     if _is_child(session_id):
         return
+    _end_parent_turn(session_id)
+    # A turn Hermes doesn't call failed but that didn't complete (it hit the
+    # step limit) still answered: its reply goes out, not a failure. A Hermes
+    # that doesn't say counts it failed, as before.
+    answered = (not kwargs.get("interrupted") and kwargs.get("failed") is not True
+                and (kwargs.get("completed") or kwargs.get("failed") is False))
     _quietly(live_activity.reporter.turn_ended, session_id,
-             "done" if kwargs.get("completed") else "stopped" if kwargs.get("interrupted") else "failed")
-    if kwargs.get("completed"):
-        calls.turn_ended(session_id, "done", profile=_profile, fallback=None)
+             "done" if answered else "stopped" if kwargs.get("interrupted") else "failed")
+    if answered:
+        if not _settle_ready(session_id, kwargs.get("turn_id"), "done"):
+            calls.turn_ended(session_id, "done", profile=_profile, fallback=None)
         return
+    _settle_ready(session_id, kwargs.get("turn_id"), "dropped")
     if kwargs.get("interrupted"):
         calls.turn_ended(session_id, "stopped", profile=_profile, fallback=None)
         return
@@ -291,6 +379,12 @@ def _subagent_stop(**kwargs: Any) -> None:
         with _children_lock:
             _child_sessions.discard(child)
     parent = _text(kwargs.get("parent_session_id"))
+    # A subagent that ends inside the turn that started it (delegate_task
+    # waits for it) is part of that turn's reply: only one that outlives it,
+    # a background task, notifies. Nor does a nested one, or a muted cron job's.
+    if (_inside_parent_turn(parent, kwargs.get("parent_turn_id")) or _is_child(parent)
+            or cron_runs.quiet(parent, None)):
+        return
     status = _text(kwargs.get("child_status")) or "finished"
     enqueue(push_event(
         "background_task.finished",
@@ -298,7 +392,7 @@ def _subagent_stop(**kwargs: Any) -> None:
         session_id=parent,
         profile=_profile,
         title=_titled("Task finished", parent),
-        body=_text(kwargs.get("child_summary")) or f"A delegated task {status}.",
+        body=plain_text(kwargs.get("child_summary")) or f"A delegated task {status}.",
     ))
 
 
@@ -342,6 +436,7 @@ def _pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     session_id = _text(kwargs.get("session_id"))
     if not _is_child(session_id):
         _note_turn_start(kwargs.get("turn_id"))
+        _start_parent_turn(session_id, kwargs.get("turn_id"))
         _quietly(live_activity.reporter.turn_started, session_id)
     notes = [
         None if _is_child(session_id) else calls.outcome_note(session_id),
@@ -363,6 +458,35 @@ def _note_turn_start(turn_id: Any) -> None:
         _turn_started[turn_id] = time.monotonic()
         while len(_turn_started) > MAX_TURN_STARTS:
             _turn_started.pop(next(iter(_turn_started)))
+
+
+def _start_parent_turn(session_id: str, turn_id: Any) -> None:
+    if not session_id:
+        return
+    with _parent_turns_lock:
+        _parent_turns.pop(session_id, None)
+        _parent_turns[session_id] = (turn_id if isinstance(turn_id, str) else "", time.monotonic())
+        while len(_parent_turns) > MAX_TURN_STARTS:
+            _parent_turns.pop(next(iter(_parent_turns)))
+
+
+def _end_parent_turn(session_id: str) -> None:
+    with _parent_turns_lock:
+        _parent_turns.pop(session_id, None)
+
+
+def _inside_parent_turn(session_id: str, turn_id: Any) -> bool:
+    """Whether the turn ``turn_id`` of ``session_id`` runs now. Unnamed on
+    either side counts as not (the task notifies); one whose end was never
+    reported stops counting after a while."""
+    if not isinstance(turn_id, str) or not turn_id:
+        return False
+    with _parent_turns_lock:
+        running = _parent_turns.get(session_id)
+        if running is not None and time.monotonic() - running[1] >= PARENT_TURN_MAX_S:
+            _parent_turns.pop(session_id, None)
+            running = None
+    return running is not None and turn_id == running[0]
 
 
 def _voice_persona_note(history: Any) -> str | None:

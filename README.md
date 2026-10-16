@@ -65,13 +65,13 @@ The plugin currently emits notifications for:
 
 - approval needed
 - clarification or other input needed
-- response ready
+- response ready, once the turn has ended: a turn that failed sends only its failure notice, not Hermes' error text as a reply (plugin 0.35+)
 - failed turns
-- completed delegated tasks
+- completed background tasks: a delegated task that ends while the turn that started it is still running is part of that turn's reply and sends nothing of its own (plugin 0.35+)
 - calendar and reminder changes Hermes asks your phone to make (see [Calendar, Reminders, Focus and phone status](#calendar-reminders-focus-and-phone-status-from-conduit-plugin-027)): a notification to approve, or a silent wake for adds you let Hermes make without asking
 - call requests: a job you asked to be called about has ended, Hermes asked to call you, or (alert calls) Hermes has waited a minute on your approval or answer, or a turn failed (see [Hermes calls you](#hermes-calls-you-plugin-013))
 
-An exact `[Silent]` assistant response does not emit a completion notification.
+An exact `[Silent]` assistant response does not emit a completion notification. Reply and task bodies are sent as plain text: Markdown fences, emphasis, headings, link targets and table rules are dropped (plugin 0.35+).
 
 ### Cron runs (plugin 0.33+)
 
@@ -907,6 +907,33 @@ There is nothing to set up.
 - A turn's 2 minutes run from its `pre_llm_call` to its `post_llm_call`. A
   turn with no start time, a file that can't be read, or `plugins.isolation:
   host` (where Desktop views aren't observed) all push as before.
+
+## Reply notifications by source (plugin 0.35+)
+
+If you also talk to Hermes in Desktop, a messaging app or the terminal, you
+already see those replies there. In Conduit's Settings > Notifications you
+choose, per profile, which sources send a "response ready" push: Conduit,
+Hermes Desktop and the web dashboard, messaging apps (Telegram, Discord,
+Slack, plugin platforms…), and the terminal. Everything is on until you turn
+it off. Approvals, questions, failed turns, background tasks, cron runs (they
+have their own switch) and calls don't follow this.
+
+- The source is where the message that started the reply's turn was sent,
+  not where the chat began: a Telegram chat you continue in Conduit is a
+  Conduit reply. Hermes binds each turn to the connection that submitted
+  last before it started, so a message queued meanwhile belongs to the
+  next turn, not to the reply already running.
+- Conduit's socket carries `X-Conduit-Client` (Watch jobs count as Conduit);
+  another browser-engine socket is Desktop or the web dashboard. A turn
+  with no app connection is placed by its Hermes platform: `cli` is the
+  terminal, a Hermes messaging platform is a messaging app.
+- A turn that can't be placed (an app connection run under `plugins.isolation:
+  host`, the stdio TUI, a Hermes that moved these) pushes as before.
+- The choice lives in the profile's `conduit-notifications.json`.
+  `GET /api/plugins/conduit_push/notifications/reply-sources` reads it
+  (`{"ok": true, "sources": {"conduit": true, "desktop": false, …}}`) and
+  `PUT` with `{"source": "desktop", "notify": false}` changes one.
+  Capability `reply-sources`.
 
 ## Hermes calls you (plugin 0.13+)
 

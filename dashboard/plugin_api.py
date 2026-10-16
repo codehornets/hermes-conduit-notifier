@@ -3809,7 +3809,7 @@ def update_cron_notifications(body: Any) -> Dict[str, Any]:
 
 
 async def _cron_route(profile: Optional[str], response: Response, fn: Callable[[], Dict[str, Any]],
-                      route: str) -> Dict[str, Any]:
+                      route: str, feature: str = "Cron notifications") -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     try:
         _cron_limiter.acquire(_limiter_key(profile))
@@ -3820,7 +3820,7 @@ async def _cron_route(profile: Optional[str], response: Response, fn: Callable[[
         exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
         raise
     except Exception as exc:
-        raise _unexpected(route, exc, feature="Cron notifications")
+        raise _unexpected(route, exc, feature=feature)
 
 
 @router.get("/cron/notifications")
@@ -3833,6 +3833,60 @@ async def put_cron_notifications(request: Request, response: Response,
                                  profile: Optional[str] = None) -> Dict[str, Any]:
     body = await _read_json_body(request, CRON_MAX_BODY_BYTES)
     return await _cron_route(profile, response, lambda: update_cron_notifications(body), "settings")
+
+
+# --- Reply notifications by source (#115) ------------------------------------
+#
+# The user picks in Conduit which sources' replies push "reply ready": Conduit,
+# Hermes Desktop and the web dashboard, messaging apps, the terminal. The
+# choice lives in the profile's conduit-notifications.json, read by the
+# plugin's turn-end hook (agent process) through reply_sources.py (loaded by
+# path: this module can't import the plugin package).
+
+_reply_sources_module: Any = None
+_reply_sources_lock = threading.Lock()
+
+
+def _reply_sources() -> Any:
+    """reply_sources.py beside this folder, loaded once."""
+    global _reply_sources_module
+    with _reply_sources_lock:
+        if _reply_sources_module is None:
+            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reply_sources.py")
+            spec = importlib.util.spec_from_file_location("conduit_push_dashboard_reply_sources", path)
+            if spec is None or spec.loader is None or not os.path.isfile(path):
+                raise TokenError(501, "This plugin install is missing reply_sources.py; update the plugin")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _reply_sources_module = module
+        return _reply_sources_module
+
+
+def reply_source_settings() -> Dict[str, Any]:
+    return {"sources": _reply_sources().ReplySourcesStore(_cron_home()).settings()}
+
+
+def update_reply_source_settings(body: Any) -> Dict[str, Any]:
+    if not isinstance(body, dict):
+        raise TokenError(400, "Expected a JSON object with source and notify")
+    try:
+        sources = _reply_sources().ReplySourcesStore(_cron_home()).set_notify(body.get("source"), body.get("notify"))
+    except ValueError as exc:
+        raise TokenError(400, str(exc))
+    return {"sources": sources}
+
+
+@router.get("/notifications/reply-sources")
+async def get_reply_sources(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    return await _cron_route(profile, response, reply_source_settings, "status", feature="Reply notifications")
+
+
+@router.put("/notifications/reply-sources")
+async def put_reply_sources(request: Request, response: Response,
+                            profile: Optional[str] = None) -> Dict[str, Any]:
+    body = await _read_json_body(request, CRON_MAX_BODY_BYTES)
+    return await _cron_route(profile, response, lambda: update_reply_source_settings(body), "settings",
+                             feature="Reply notifications")
 
 
 # --- Hermes calls you (#449) -------------------------------------------------
@@ -6365,6 +6419,9 @@ class _WatchJobTransport:
     """This plugin's end of its jobs' sessions: Hermes writes their responses
     and events here, as it would to the app's WebSocket. ``_closed`` is what
     Hermes' session reaper reads."""
+
+    # A Watch job's reply is a Conduit one (reply_sources.py, #115).
+    conduit_client = "conduit"
 
     def __init__(self, jobs: "_WatchJobs") -> None:
         self._jobs = jobs
@@ -9051,6 +9108,7 @@ ROUTE_CAPABILITIES = (
     "pairing",
     "self-restart",
     "cron-notifications",
+    "reply-sources",
 )
 
 

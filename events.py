@@ -10,7 +10,7 @@ from typing import Any
 
 # Keep in sync with plugin.yaml. Reported on every event so the relay can
 # expose per-gateway compatibility state to the app (Settings > Notifications).
-PLUGIN_VERSION = "0.34.1"
+PLUGIN_VERSION = "0.35.0"
 PLUGIN_CAPABILITIES = [
     "approval-decisions",
     "clarify-loop",
@@ -528,6 +528,49 @@ def clarification_text(args: Any) -> str:
 def is_silent_response(value: Any) -> bool:
     """Return true only for Hermes' exact no-notification response sentinel."""
     return isinstance(value, str) and " ".join(value.split()).casefold() == "[silent]"
+
+
+_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
+_QUOTE = re.compile(r"^\s{0,3}>\s?")
+_BULLET = re.compile(r"^(\s*)[-*+]\s+(?:\[[ xX]\]\s+)?")
+_RULE = re.compile(r"^\s{0,3}([-*_])(\s*\1){2,}\s*\Z")
+_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*\Z")
+_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_STRONG = re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1")
+_EMPHASIS = re.compile(r"(?<![\w*])\*(?=\S)([^*]+?)(?<=\S)\*(?![\w*])")
+_UNDERSCORE_EMPHASIS = re.compile(r"(?<![\w_])_(?=\S)([^_]+?)(?<=\S)_(?![\w_])")
+_STRIKE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
+
+
+def plain_text(value: Any) -> str:
+    """A Markdown reply as a notification shows it: the words without the
+    markup (fences, emphasis, headings, link targets, table rules). Code
+    inside a fence stays, it is the content."""
+    if not isinstance(value, str):
+        return ""
+    lines: list[str] = []
+    fenced = False
+    for line in value.splitlines():
+        if _FENCE.match(line):
+            fenced = not fenced
+            continue
+        if fenced:
+            lines.append(line)
+            continue
+        line = _QUOTE.sub("", line)
+        if _RULE.match(line) or _TABLE_RULE.match(line):
+            continue
+        line = _HEADING.sub("", line)
+        line = _BULLET.sub(r"\1• ", line)
+        if line.lstrip().startswith("|"):
+            line = " · ".join(cell.strip() for cell in line.strip().strip("|").split("|") if cell.strip())
+        line = _LINK.sub(r"\1", _IMAGE.sub(r"\1", line))
+        line = _STRONG.sub(r"\2", line)
+        line = _STRIKE.sub(r"\1", _UNDERSCORE_EMPHASIS.sub(r"\1", _EMPHASIS.sub(r"\1", line)))
+        lines.append(line.replace("`", ""))
+    return "\n".join(lines).strip()
 
 
 def _clean(value: str, maximum: int) -> str:

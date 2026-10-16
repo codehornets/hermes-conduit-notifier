@@ -48,6 +48,13 @@ def _load(name, path):
 
 
 plugin = _load("conduit_push.__init__", ROOT / "__init__.py")
+
+
+def _reply(**kwargs):
+    """A finished turn as Hermes reports it: its reply, then its end."""
+    plugin._post_llm_call(**kwargs)
+    plugin._on_session_end(session_id=kwargs.get("session_id"), task_id=kwargs.get("task_id"),
+                           turn_id=kwargs.get("turn_id"), completed=True, failed=False, interrupted=False)
 titles = _load("conduit_push.session_titles", ROOT / "session_titles.py")
 loop = _load("conduit_push.clarify_loop", ROOT / "clarify_loop.py")
 
@@ -85,7 +92,7 @@ def sent(monkeypatch):
 
 
 def test_a_ready_push_is_titled_with_the_session(sent):
-    plugin._post_llm_call(session_id="s1", turn_id="t1", assistant_response="Deployed.")
+    _reply(session_id="s1", turn_id="t1", assistant_response="Deployed.")
     assert [e.get("title") for e in sent] == ["Infra"]
     assert all(db.closed for db in FakeSessionDB.opened)
 
@@ -96,7 +103,7 @@ def test_an_approval_finds_its_session_by_gateway_key(sent):
 
 
 def test_an_untitled_session_keeps_the_relay_copy(sent):
-    plugin._post_llm_call(session_id="unknown", turn_id="t3", assistant_response="Hi.")
+    _reply(session_id="unknown", turn_id="t3", assistant_response="Hi.")
     assert "title" not in sent[0]
 
 
@@ -114,8 +121,8 @@ def test_a_clarify_question_is_titled_on_the_middleware_path(sent, monkeypatch):
 
 
 def test_events_in_one_turn_share_one_session_store_read(sent):
-    plugin._post_llm_call(session_id="s1", turn_id="t5", assistant_response="Deployed.")
-    plugin._post_llm_call(session_id="s1", turn_id="t6", assistant_response="Again.")
+    _reply(session_id="s1", turn_id="t5", assistant_response="Deployed.")
+    _reply(session_id="s1", turn_id="t6", assistant_response="Again.")
     assert [e["title"] for e in sent] == ["Infra", "Infra"]
     assert len(FakeSessionDB.opened) == 1
 
@@ -125,7 +132,7 @@ def test_a_failing_close_does_not_escape(sent, monkeypatch):
         raise RuntimeError("already closed")
 
     monkeypatch.setattr(FakeSessionDB, "close", broken_close)
-    plugin._post_llm_call(session_id="s1", turn_id="t7", assistant_response="Deployed.")
+    _reply(session_id="s1", turn_id="t7", assistant_response="Deployed.")
     assert sent[0]["title"] == "Infra"
 
 
@@ -134,7 +141,7 @@ def test_no_session_store_keeps_the_relay_copy(monkeypatch):
     events = []
     monkeypatch.setitem(sys.modules, "hermes_state", None)
     monkeypatch.setattr(plugin, "enqueue", events.append)
-    plugin._post_llm_call(session_id="s1", turn_id="t4", assistant_response="Hi.")
+    _reply(session_id="s1", turn_id="t4", assistant_response="Hi.")
     assert "title" not in events[0]
 
 
@@ -144,16 +151,16 @@ def test_a_failed_read_is_retried_on_the_next_event(sent, monkeypatch):
 
     with monkeypatch.context() as patch:
         patch.setattr(FakeSessionDB, "get_session_title", locked)
-        plugin._post_llm_call(session_id="s1", turn_id="t8", assistant_response="Deployed.")
-    plugin._post_llm_call(session_id="s1", turn_id="t9", assistant_response="Again.")
+        _reply(session_id="s1", turn_id="t8", assistant_response="Deployed.")
+    _reply(session_id="s1", turn_id="t9", assistant_response="Again.")
     assert "title" not in sent[0]
     assert sent[1]["title"] == "Infra"
 
 
 def test_a_session_titled_after_its_first_reply_shows_the_title_next_time(sent, monkeypatch):
-    plugin._post_llm_call(session_id="s2", turn_id="t10", assistant_response="Hi.")
+    _reply(session_id="s2", turn_id="t10", assistant_response="Hi.")
     monkeypatch.setitem(FakeSessionDB.titles, "s2", "Groceries")
-    plugin._post_llm_call(session_id="s2", turn_id="t11", assistant_response="Again.")
+    _reply(session_id="s2", turn_id="t11", assistant_response="Again.")
     assert "title" not in sent[0]
     assert sent[1]["title"] == "Groceries"
 
