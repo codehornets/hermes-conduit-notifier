@@ -59,6 +59,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -9648,6 +9649,298 @@ async def post_room_file(request: Request, response: Response, profile: Optional
     return {"ok": True, **stored}
 
 
+# --- Room pictures -------------------------------------------------------------
+#
+# Hermes' gateway-hosted rooms (groups.*) carry no picture, so Conduit keeps a
+# room's custom picture here, under <hermes home>/conduit/room-images/: per
+# room, a small `<hash>.json` record (room id, revision, type) and the
+# picture's bytes in `<hash>.img`, named by a hash of the room id. GET
+# /room-images lists each room's revision from the records alone, so Conduit
+# fetches only pictures it hasn't cached; GET /room-images/{room_id} returns
+# one; PUT sets it and DELETE clears it. Conduit sends a downscaled JPEG or
+# PNG. Anyone who can reach these routes is signed in to the dashboard, the
+# same trust every other route here assumes.
+
+ROOM_IMAGE_MAX_BYTES = 512 * 1024
+ROOM_IMAGE_MAX_BODY_BYTES = ROOM_IMAGE_MAX_BYTES * 4 // 3 + 16 * 1024
+# Records beyond this many are never listed; the oldest go first on a write.
+ROOM_IMAGE_MAX_ROOMS = 500
+# A record is a few hundred bytes; anything larger isn't one.
+ROOM_IMAGE_RECORD_MAX_BYTES = 4096
+# Temp files a crashed write left behind go after this long.
+ROOM_IMAGE_STALE_TEMP_S = 3600.0
+ROOM_IMAGE_LIMIT = 60
+ROOM_IMAGE_WINDOW_S = 600.0
+_room_image_limiter = _MintLimiter(ROOM_IMAGE_LIMIT, ROOM_IMAGE_WINDOW_S,
+                                   message="Too many picture changes; try again shortly")
+_ROOM_IMAGE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+_room_image_lock = threading.Lock()
+# Writes wait on one another (the lock above), so they get their own threads
+# rather than the default pool other routes share.
+_room_image_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conduit-room-images")
+
+
+def _room_images_root() -> str:
+    from hermes_constants import get_hermes_home
+
+    return os.path.join(str(get_hermes_home()), "conduit", "room-images")
+
+
+def _room_image_id(raw: Any) -> str:
+    if not isinstance(raw, str) or not _ROOM_IMAGE_ID.match(raw):
+        raise HTTPException(status_code=400, detail="Invalid room id", headers={"Cache-Control": "no-store"})
+    return raw
+
+
+def _room_image_stem(root: str, room_id: str) -> str:
+    return os.path.join(root, hashlib.sha256(room_id.encode("utf-8")).hexdigest())
+
+
+def _room_image_mime(data: bytes) -> Optional[str]:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    return None
+
+
+def _read_no_follow(path: str, limit: int) -> Optional[bytes]:
+    """A regular file's bytes up to ``limit``, never through a symlink
+    (where the platform has O_NOFOLLOW); None when missing, larger, or not
+    a plain file."""
+    try:
+        # Non-blocking, so a FIFO planted in its place can't hang the read.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        try:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+        except OSError:
+            return None
+        data = handle.read(limit + 1)
+    return data if len(data) <= limit else None
+
+
+def _read_room_record(path: str) -> Optional[Dict[str, Any]]:
+    raw = _read_no_follow(path, ROOM_IMAGE_RECORD_MAX_BYTES)
+    if raw is None:
+        return None
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict) or not isinstance(record.get("room_id"), str) \
+            or not isinstance(record.get("rev"), str) \
+            or record.get("mime", "image/jpeg") not in ("image/jpeg", "image/png"):
+        return None
+    return record
+
+
+def _write_atomic(root: str, path: str, data: bytes) -> None:
+    # A fresh, exclusively created 0600 name, so nothing planted in the
+    # folder can redirect the write.
+    fd, temp = tempfile.mkstemp(dir=root, prefix=".room-image.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
+
+
+def list_room_images(root: str) -> Dict[str, str]:
+    """Each stored room's picture revision, keyed by room id."""
+    try:
+        with os.scandir(root) as it:
+            names = sorted(entry.path for entry in it
+                           if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False))
+    except OSError:
+        return {}
+    revisions: Dict[str, str] = {}
+    for path in names[:ROOM_IMAGE_MAX_ROOMS]:
+        record = _read_room_record(path)
+        if record is not None:
+            revisions[record["room_id"]] = record["rev"]
+    return revisions
+
+
+def read_room_image(root: str, room_id: str) -> Optional[Dict[str, Any]]:
+    stem = _room_image_stem(root, room_id)
+    # Under the write lock, so a record and its bytes are read as a pair.
+    with _room_image_lock:
+        record = _read_room_record(stem + ".json")
+        if record is None or record["room_id"] != room_id:
+            return None
+        data = _read_no_follow(stem + ".img", ROOM_IMAGE_MAX_BYTES)
+    if not data:
+        return None
+    return {"room_id": room_id, "rev": record["rev"], "mime": record.get("mime") or "image/jpeg",
+            "data_base64": base64.b64encode(data).decode("ascii")}
+
+
+def _remove_room_image_files(stem: str) -> None:
+    for suffix in (".json", ".img"):
+        with contextlib.suppress(OSError):
+            os.unlink(stem + suffix)
+
+
+def _prune_room_images(root: str, keep: str, now: float) -> None:
+    """Drops the oldest rooms past the room cap (never ``keep``), and temp
+    files a crashed write left behind."""
+    records = []
+    try:
+        with os.scandir(root) as it:
+            entries = list(it)
+    except OSError:
+        return
+    names = {entry.name for entry in entries}
+    for entry in entries:
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            mtime = entry.stat(follow_symlinks=False).st_mtime
+        except OSError:
+            continue
+        # Leftovers of a crashed write: a temp file, or bytes whose record
+        # was never written.
+        leftover = (entry.name.startswith(".room-image.") and entry.name.endswith(".tmp")) \
+            or (entry.name.endswith(".img") and entry.name[:-len(".img")] + ".json" not in names)
+        if leftover:
+            if now - mtime > ROOM_IMAGE_STALE_TEMP_S:
+                with contextlib.suppress(OSError):
+                    os.unlink(entry.path)
+        elif entry.name.endswith(".json"):
+            records.append((mtime, entry.path[:-len(".json")]))
+    excess = len(records) - ROOM_IMAGE_MAX_ROOMS
+    for _, stem in sorted(records):
+        if excess <= 0:
+            break
+        if stem == keep:
+            continue
+        _remove_room_image_files(stem)
+        excess -= 1
+
+
+def store_room_image(root: str, room_id: str, body: Any, now: Optional[float] = None) -> Dict[str, Any]:
+    """Sets ``room_id``'s picture from ``body["data_base64"]``; returns its revision."""
+    no_store = {"Cache-Control": "no-store"}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object", headers=no_store)
+    encoded = body.get("data_base64")
+    if not isinstance(encoded, str) or not encoded:
+        raise HTTPException(status_code=400, detail="data_base64 is required", headers=no_store)
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="data_base64 is not base64", headers=no_store)
+    if len(data) > ROOM_IMAGE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="The picture is too large", headers=no_store)
+    mime = _room_image_mime(data)
+    if mime is None:
+        raise HTTPException(status_code=415, detail="The picture must be a JPEG or PNG", headers=no_store)
+    now = time.time() if now is None else now
+    rev = f"{int(now * 1000)}-{hashlib.sha256(data).hexdigest()[:12]}"
+    record = json.dumps({"version": 1, "room_id": room_id, "rev": rev, "mime": mime},
+                        separators=(",", ":")).encode("utf-8")
+    stem = _room_image_stem(root, room_id)
+    with _room_image_lock:
+        try:
+            os.makedirs(root, mode=0o700, exist_ok=True)
+            with contextlib.suppress(OSError):
+                # makedirs leaves an existing folder's mode alone.
+                os.chmod(root, 0o700)
+            # Bytes first: a record always names a picture that's there.
+            _write_atomic(root, stem + ".img", data)
+            try:
+                _write_atomic(root, stem + ".json", record)
+            except OSError:
+                # The old record would now label the new bytes with its
+                # revision: drop the room instead, so clients refetch.
+                _remove_room_image_files(stem)
+                raise
+        except OSError as exc:
+            if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                raise HTTPException(status_code=507, detail="The host is low on disk space", headers=no_store)
+            raise
+        _prune_room_images(root, stem, now)
+    return {"room_id": room_id, "rev": rev, "mime": mime}
+
+
+def clear_room_image(root: str, room_id: str) -> bool:
+    stem = _room_image_stem(root, room_id)
+    with _room_image_lock:
+        record = _read_room_record(stem + ".json")
+        if record is None or record["room_id"] != room_id:
+            return False
+        _remove_room_image_files(stem)
+    return True
+
+
+@router.get("/room-images")
+async def get_room_images(response: Response) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        revisions = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: list_room_images(_room_images_root()))
+    except Exception as exc:
+        raise _unexpected("list", exc, feature="Room pictures")
+    return {"ok": True, "revisions": revisions}
+
+
+@router.get("/room-images/{room_id}")
+async def get_room_image(room_id: str, response: Response) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    room_id = _room_image_id(room_id)
+    try:
+        record = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: read_room_image(_room_images_root(), room_id))
+    except Exception as exc:
+        raise _unexpected("read", exc, feature="Room pictures")
+    if record is None:
+        raise HTTPException(status_code=404, detail="No picture for this room", headers={"Cache-Control": "no-store"})
+    return {"ok": True, **record}
+
+
+@router.put("/room-images/{room_id}")
+async def put_room_image(room_id: str, request: Request, response: Response) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    room_id = _room_image_id(room_id)
+    # Pictures belong to the host, not a profile: one window for everyone.
+    try:
+        mint = _room_image_limiter.acquire("")
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    try:
+        body = await _read_json_body(request, ROOM_IMAGE_MAX_BODY_BYTES)
+        stored = await asyncio.get_running_loop().run_in_executor(
+            _room_image_executor, lambda: store_room_image(_room_images_root(), room_id, body))
+    except HTTPException as exc:
+        if exc.status_code < 500 or exc.status_code == 507:
+            _room_image_limiter.release("", mint)
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        _room_image_limiter.release("", mint)
+        raise _unexpected("save", exc, feature="Room pictures")
+    return {"ok": True, **stored}
+
+
+@router.delete("/room-images/{room_id}")
+async def delete_room_image(room_id: str, response: Response) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    room_id = _room_image_id(room_id)
+    try:
+        removed = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: clear_room_image(_room_images_root(), room_id))
+    except Exception as exc:
+        raise _unexpected("clear", exc, feature="Room pictures")
+    return {"ok": True, "removed": removed}
+
+
 # --- Artifacts ---------------------------------------------------------------
 #
 # GET /artifacts lists what a profile's chats produced (artifacts_index.py
@@ -9808,6 +10101,7 @@ ROUTE_CAPABILITIES = (
     "cron-notifications",
     "reply-sources",
     "room-files",
+    "room-images",
     "speech-server",
     "artifacts",
 )

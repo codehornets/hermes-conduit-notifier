@@ -991,6 +991,19 @@ sooner, oldest first, once they pass 2 GB together (checked hourly). An
 upload that would leave under 1 GB free on the host is refused (507).
 Capability `room-files`.
 
+## Group pictures (plugin 0.41+)
+
+Hermes' gateway-hosted group rooms carry no picture, so Conduit keeps a
+room's custom picture here. `GET /api/plugins/conduit_push/room-images`
+returns each room's revision (`{"ok": true, "revisions": {"<room id>":
+"<rev>"}}`), so Conduit fetches only pictures it hasn't cached with
+`GET /room-images/<room id>` (`{"rev": "…", "mime": "image/jpeg",
+"data_base64": "…"}`). `PUT /room-images/<room id>` with `{"data_base64":
+"…"}` sets a JPEG or PNG of up to 512 KB; `DELETE` clears it. Records live in
+`<hermes home>/conduit/room-images/` (a small record plus the picture per
+room, so listing never reads picture bytes), up to 500 rooms (the
+oldest go first). Capability `room-images`.
+
 ## Artifacts (plugin 0.40+)
 
 Conduit's Artifacts screens list what a profile's chats produced:
