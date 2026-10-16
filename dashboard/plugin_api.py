@@ -41,6 +41,7 @@ import asyncio
 import atexit
 import base64
 import contextvars
+import errno
 import functools
 import hashlib
 import http.client
@@ -61,6 +62,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import traceback
 import types
 import urllib.error
@@ -493,6 +495,9 @@ async def _read_json_body(request: Request, max_bytes: int = SEARCH_MAX_BODY_BYT
         if len(raw) > max_bytes:
             raise HTTPException(status_code=413, detail="Request body is too large", headers=no_store)
     try:
+        if len(raw) > 1_000_000:
+            # A file upload's body: parse it off the event loop.
+            return await asyncio.to_thread(json.loads, bytes(raw))
         return json.loads(bytes(raw) or b"{}")
     except (ValueError, RecursionError):
         raise HTTPException(status_code=400, detail="Request body is not JSON", headers=no_store)
@@ -9067,6 +9072,206 @@ async def get_desktop_views(response: Response, profile: Optional[str] = None,
     return {"ok": True, "observing": observing, "reason": reason, "views": views}
 
 
+# --- Room files ----------------------------------------------------------------
+#
+# A group chat room isn't a session, so Hermes' attach RPCs (file.attach and
+# friends), which stage into a session's workspace, can't take a file for it.
+# Conduit uploads the file here instead and puts an `@file:` reference to the
+# stored path in the room message; the room's members run on this host and read
+# it from there. Files live under <hermes home>/conduit/room-files/<id>/ and are
+# swept a month after their upload.
+
+ROOM_FILE_MAX_BYTES = 50 * 1024 * 1024
+# base64 grows a file by a third; the rest is the JSON around it.
+ROOM_FILE_MAX_BODY_BYTES = ROOM_FILE_MAX_BYTES * 4 // 3 + 64 * 1024
+ROOM_FILE_RETENTION_S = 30 * 24 * 3600
+# All uploads together; the oldest go first past it.
+ROOM_FILE_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+# Never fill the disk: an upload leaves at least this much free.
+ROOM_FILE_FREE_FLOOR_BYTES = 1024 * 1024 * 1024
+ROOM_FILE_SWEEP_INTERVAL_S = 3600.0
+ROOM_FILE_LIMIT = 60
+ROOM_FILE_WINDOW_S = 600.0
+_room_file_limiter = _MintLimiter(ROOM_FILE_LIMIT, ROOM_FILE_WINDOW_S,
+                                  message="Too many file uploads; try again shortly")
+_ROOM_FILE_UNSAFE = re.compile(r"[\\/\x00-\x1f\x7f\x85\u2028\u2029:*?\"'`<>|\u200b-\u200f\u202a-\u202e\u2066-\u2069]+")
+# Filesystems cap one path component at 255 bytes; leave room for UTF-8.
+ROOM_FILE_NAME_MAX_BYTES = 180
+
+
+def _room_file_name(raw: Any) -> str:
+    """The upload's own name, made safe to use as one path component."""
+    # Only the first part of an absurd name is worth looking at.
+    raw = raw if isinstance(raw, str) else ""
+    # Lone surrogates (valid JSON escapes) can't be encoded: drop them.
+    raw = raw[:1024].encode("utf-8", "ignore").decode("utf-8")
+    name = _ROOM_FILE_UNSAFE.sub("_", raw.strip()).strip(" .")
+    if not name:
+        return "file"
+    if len(name.encode("utf-8")) <= ROOM_FILE_NAME_MAX_BYTES:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not (dot and stem and 0 < len(ext.encode("utf-8")) <= 16):
+        stem, ext = name, ""
+    suffix = "." + ext if ext else ""
+    budget = ROOM_FILE_NAME_MAX_BYTES - len(suffix.encode("utf-8"))
+    # Cut whole characters, never a UTF-8 sequence in half.
+    stem = stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+    return stem + suffix
+
+
+def _room_files_root() -> str:
+    from hermes_constants import get_hermes_home
+
+    return os.path.join(str(get_hermes_home()), "conduit", "room-files")
+
+
+_room_file_last_sweep: Dict[str, float] = {}
+# Uploads wait on one another (the lock below), so they get their own
+# threads rather than the default pool other routes share.
+_room_file_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conduit-room-files")
+# Sweeps, the free-space check and the write run one at a time, so two
+# uploads can't both pass the check and then fill the disk together.
+_room_file_lock = threading.Lock()
+
+
+def _sweep_room_files(root: str, now: float, incoming: int = 0) -> None:
+    """Deletes uploads past retention, then the oldest until the rest and
+    ``incoming`` fit the total cap. Runs at most hourly per root, and again
+    whenever the free-disk floor would be passed, so the cap can be overrun
+    for up to an hour; the floor guards the disk at all times."""
+    try:
+        with os.scandir(root) as it:
+            entries = [entry for entry in it if entry.is_dir(follow_symlinks=False)]
+    except OSError:
+        return
+    folders = []
+    for entry in entries:
+        try:
+            mtime = entry.stat(follow_symlinks=False).st_mtime
+            if now - mtime > ROOM_FILE_RETENTION_S:
+                shutil.rmtree(entry.path, ignore_errors=True)
+                continue
+            with os.scandir(entry.path) as files:
+                size = sum(f.stat(follow_symlinks=False).st_size for f in files
+                           if f.is_file(follow_symlinks=False))
+            folders.append((mtime, size, entry.path))
+        except OSError:
+            continue
+    total = sum(size for _, size, _ in folders) + incoming
+    for _, size, path in sorted(folders):
+        if total <= ROOM_FILE_TOTAL_BYTES:
+            break
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.lexists(path):
+            total -= size
+    _room_file_last_sweep[root] = now
+
+
+def _room_file_free(root: str) -> int:
+    """Free bytes on the room-files disk; an unreadable disk counts as full."""
+    try:
+        return shutil.disk_usage(root).free
+    except OSError:
+        return 0
+
+
+def store_room_file(root: str, body: Any, now: Optional[float] = None) -> Dict[str, Any]:
+    """Writes one uploaded file under ``root``; returns where it went and the
+    `@file:` reference Hermes reads."""
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object", headers={"Cache-Control": "no-store"})
+    encoded = body.get("data_base64")
+    if not isinstance(encoded, str) or not encoded:
+        raise HTTPException(status_code=400, detail="data_base64 is required", headers={"Cache-Control": "no-store"})
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="data_base64 is not base64", headers={"Cache-Control": "no-store"})
+    if len(data) > ROOM_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="The file is too large", headers={"Cache-Control": "no-store"})
+    now = time.time() if now is None else now
+    name = _room_file_name(body.get("name"))
+    with _room_file_lock:
+        if now - _room_file_last_sweep.get(root, float("-inf")) >= ROOM_FILE_SWEEP_INTERVAL_S:
+            _sweep_room_files(root, now, len(data))
+        try:
+            os.makedirs(root, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                raise HTTPException(status_code=507, detail="The host is low on disk space",
+                                    headers={"Cache-Control": "no-store"})
+            raise
+        try:
+            # makedirs leaves an existing folder's mode alone.
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+        if _room_file_free(root) - len(data) < ROOM_FILE_FREE_FLOOR_BYTES:
+            # The cap may be what's full: make room once more before
+            # refusing, unless the hourly sweep just did.
+            if _room_file_last_sweep.get(root) != now:
+                _sweep_room_files(root, now, len(data))
+            if _room_file_free(root) - len(data) < ROOM_FILE_FREE_FLOOR_BYTES:
+                raise HTTPException(status_code=507, detail="The host is low on disk space",
+                                    headers={"Cache-Control": "no-store"})
+        folder = os.path.join(root, time.strftime("%Y%m%d", time.gmtime(now)) + "-" + uuid.uuid4().hex)
+        path = os.path.join(folder, name)
+        try:
+            os.makedirs(folder, mode=0o700, exist_ok=False)
+            # Readable by the host's own user only, whatever the umask.
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
+                handle.write(data)
+        except OSError as exc:
+            # A folder that was already there is another upload's: keep it.
+            if exc.errno != errno.EEXIST:
+                shutil.rmtree(folder, ignore_errors=True)
+            if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+                raise HTTPException(status_code=507, detail="The host is low on disk space",
+                                    headers={"Cache-Control": "no-store"})
+            raise
+    return {"path": path, "name": name, "size": len(data), "ref_text": "@file:" + _room_file_reference(path)}
+
+
+def _room_file_reference(path: str) -> str:
+    """Quotes a path holding whitespace, brackets or quotes, as Hermes'
+    format_reference_value does, so the reference reads back whole."""
+    if not re.search(r"[\s\[\](){}'\"`]", path):
+        return path
+    for quote in ("`", '"', "'"):
+        if quote not in path:
+            return quote + path + quote
+    return path
+
+
+@router.post("/room-files")
+async def post_room_file(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    key = _limiter_key(profile)
+    try:
+        mint = _room_file_limiter.acquire(key)
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    try:
+        body = await _read_json_body(request, ROOM_FILE_MAX_BODY_BYTES)
+        stored = await _run_scoped(profile, lambda: store_room_file(_room_files_root(), body), _room_file_executor)
+    except TokenError as exc:
+        # The profile couldn't be scoped; nothing was stored.
+        _room_file_limiter.release(key, mint)
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        # Refused before anything was stored (507 included): no slot spent.
+        if exc.status_code < 500 or exc.status_code == 507:
+            _room_file_limiter.release(key, mint)
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        # Nothing was stored: a failed upload costs no slot.
+        _room_file_limiter.release(key, mint)
+        raise _unexpected("upload", exc, feature="Room files")
+    return {"ok": True, **stored}
+
+
 # --- Capabilities ------------------------------------------------------------
 #
 # Conduit reads this once per connection to tell which of its features this
@@ -9109,6 +9314,7 @@ ROUTE_CAPABILITIES = (
     "self-restart",
     "cron-notifications",
     "reply-sources",
+    "room-files",
 )
 
 
