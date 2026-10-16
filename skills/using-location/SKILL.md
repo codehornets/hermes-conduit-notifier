@@ -113,6 +113,10 @@ looked up on the user's iPhone, with real routes and traffic.
   duration, traffic delay, `leave_by`, steps. `from` defaults to `"me"`.
 - `travel_times` for "which is quickest" (up to 10 destinations).
 - `search` / `lookup` for places, `reverse_geocode` for "what's here".
+- `navigate` with `to` (and `mode`) when the user wants to go there
+  ("take me there", "open it in Maps"): Conduit opens Apple Maps with
+  directions on their iPhone, at once when they're in the chat, otherwise
+  behind a Go button. Only when they ask; never from a scheduled job.
 - Places can be `"me"`, a saved place's name, an address or a name,
   `place_id:<id>` from an earlier answer, or `lat,lon`.
 - Say "about" and the mode, mention traffic when it adds a delay, and

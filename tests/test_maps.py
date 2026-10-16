@@ -561,3 +561,115 @@ def test_a_late_answer_is_refused_and_old_lookups_go_on_upload(store):
 def test_a_phone_error_that_isnt_text_reads_as_failed():
     answer = maps._shaped({"ok": False, "error": {"x": 1}, "note": ["y"]}, {"action": "search"})
     assert answer == {"ok": False, "error": "failed", "note": "The lookup failed."}
+
+
+# --- Navigate ----------------------------------------------------------------
+
+
+class Enqueued:
+    def __init__(self):
+        self.events = []
+
+    def enqueue(self, event):
+        self.events.append(event)
+
+
+def _present(home, features=("maps-navigate",)):
+    present = maps.PresentStore(home)
+    present.exchange({"installation_id": "phone-installation-1", "device": "iPhone", "app_version": "2.0",
+                      "features": list(features)})
+    return present
+
+
+def test_navigate_sends_a_go_prompt_carrying_where_to(home, monkeypatch):
+    store, _ = _shared(home, fix=fix("significant"))
+    present = _present(home)
+    queue = Enqueued()
+    monkeypatch.setattr(maps, "client", queue)
+    answer = _call({"action": "navigate", "to": "Heathrow Terminal 5", "mode": "transit"}, profile="work",
+                   session_id="session-1")
+    assert answer["ok"] is True and answer["status"] == "sent" and answer["to"] == "Heathrow Terminal 5"
+    assert answer["link"] == "https://maps.apple.com/?daddr=Heathrow+Terminal+5&dirflg=r"
+    waiting = present.exchange({"installation_id": "phone-installation-1", "features": ["maps-navigate"]})["prompts"]
+    assert waiting[0]["id"] == answer["prompt_id"] and waiting[0]["action_label"] == "Go"
+    assert waiting[0]["maps"] == {"to": "Heathrow Terminal 5", "mode": "transit"}
+    assert waiting[0]["session_id"] == "session-1" and "go" in waiting[0]["spoken_yes"]
+    event = queue.events[0]
+    assert event["type"] == "phone.changes" and event["event_id"] == f"present:{answer['prompt_id']}"
+    assert event["mode"] == "alert" and event["profile"] == "work"
+    assert store.reads()[0]["action"] == "maps navigate"
+
+
+def test_navigate_to_a_saved_place_names_it_and_gives_no_link(home, monkeypatch):
+    _shared(home, fix=fix("significant"))
+    present = _present(home)
+    monkeypatch.setattr(maps, "client", Enqueued())
+    answer = _call({"action": "navigate", "to": "work"})
+    assert answer["ok"] is True and "link" not in answer
+    prompt = present.exchange({"installation_id": "phone-installation-1", "features": ["maps-navigate"]})["prompts"][0]
+    assert prompt["maps"] == {"to": "Work", "mode": "driving"} and prompt["title"] == "Directions to Work?"
+
+
+@pytest.mark.parametrize("args, error", [
+    ({"action": "navigate"}, "invalid"),
+    ({"action": "navigate", "to": "me"}, "invalid"),
+    ({"action": "navigate", "to": ["A", "B"]}, "invalid"),
+    ({"action": "navigate", "to": "A", "mode": "rocket"}, "invalid"),
+])
+def test_navigate_refuses_what_it_cant_open(home, monkeypatch, args, error):
+    _present(home)
+    monkeypatch.setattr(maps, "client", Enqueued())
+    assert _call(args)["error"] == error
+
+
+def test_navigate_without_a_conduit_that_opens_maps_gives_the_link(home, monkeypatch):
+    _present(home, features=())
+    queue = Enqueued()
+    monkeypatch.setattr(maps, "client", queue)
+    answer = _call({"action": "navigate", "to": "51.5, -0.12", "mode": "cycling"})
+    assert answer["ok"] is False and answer["error"] == "not_set_up"
+    assert answer["link"] == "https://maps.apple.com/?daddr=51.5%2C-0.12" and not queue.events
+
+
+def test_a_subagent_cant_navigate(home):
+    _present(home)
+    assert _call({"action": "navigate", "to": "Paris"}, is_child=lambda _: True)["error"] == "subagent"
+
+
+def test_the_phone_reports_navigate_opened_by_itself(home):
+    present = _present(home)
+    prompt = present.confirm("Directions to Paris?", "Opens Apple Maps.", "Go", maps={"to": "Paris", "mode": "walking"})
+    present.exchange({"installation_id": "phone-installation-1", "features": ["maps-navigate"],
+                      "results": [{"id": prompt["id"], "outcome": "confirmed", "via": "auto"}]})
+    assert present.status(prompt["id"])[0]["status"] == "confirmed"
+    assert present.status(prompt["id"])[0]["via"] == "auto"
+    other = present.confirm("Directions to Rome?", "Opens Apple Maps.", "Go", maps={"to": "Rome"})
+    present.exchange({"installation_id": "phone-installation-1",
+                      "results": [{"id": other["id"], "outcome": "declined", "via": "auto"}]})
+    assert present.status(other["id"])[0]["status"] == "waiting", "auto is only ever a yes"
+    plain = present.confirm("Send to Mei?", "Hi", "Send")
+    present.exchange({"installation_id": "phone-installation-1",
+                      "results": [{"id": plain["id"], "outcome": "confirmed", "via": "auto"}]})
+    assert present.status(plain["id"])[0]["status"] == "waiting", "auto answers only a Go prompt"
+
+
+def test_the_preview_shows_the_place_without_markdown_of_its_own(home, monkeypatch):
+    present = _present(home)
+    monkeypatch.setattr(maps, "client", Enqueued())
+    _call({"action": "navigate", "to": "**Paris** [x](y)"})
+    prompt = present.exchange({"installation_id": "phone-installation-1"})["prompts"][0]
+    assert prompt["preview"] == "Opens Apple Maps with driving directions to **Paris x(y)** from where you are."
+    assert prompt["maps"]["to"] == "**Paris** [x](y)"
+
+
+def test_a_malformed_maps_target_is_refused_and_dropped_from_disk(home):
+    present = _present(home)
+    with pytest.raises(maps.PresentError):
+        present.confirm("Go?", "x", "Go", maps={"to": "Paris", "mode": "teleport"})
+    prompt = present.confirm("Go?", "x", "Go", maps={"to": "Paris"})
+    state = json.loads(present.path.read_text())
+    state["prompts"][0]["maps"] = {"to": 7}
+    present.path.write_text(json.dumps(state))
+    waiting = present.exchange({"installation_id": "phone-installation-1"})["prompts"]
+    assert waiting[0]["id"] == prompt["id"] and "maps" not in waiting[0]
+    assert present.has_feature("maps-navigate") is False, "the exchange without features replaced the old one"

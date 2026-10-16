@@ -47,7 +47,14 @@ VERSION = 1
 STATES = ("waiting", "confirmed", "declined", "edit", "expired", "cancelled")
 # What a phone reports for a prompt the user answered, and how.
 OUTCOMES = ("confirmed", "declined", "edit")
-VIAS = ("tap", "voice")
+# "auto": Conduit opened Apple Maps for a navigate prompt itself, because the
+# user was in that chat with Conduit open.
+VIAS = ("tap", "voice", "auto")
+# What a navigate prompt (conduit_maps navigate) carries: where to and how.
+# Conduit opens Apple Maps with these when the user says go.
+MAPS_MODES = ("driving", "walking", "transit", "cycling")
+MAX_MAPS_TO_CHARS = 200
+MAX_FEATURES = 16
 
 MAX_TITLE_CHARS = 80
 MAX_PREVIEW_CHARS = 2000
@@ -116,6 +123,7 @@ class PresentStore:
             device = {
                 "name": _line(body.get("device"), MAX_DEVICE_NAME_CHARS) or "Conduit",
                 "app_version": _line(body.get("app_version"), 40),
+                "features": _features(body.get("features")),
                 "seen_at": now,
             }
             # A phone polls often: an unchanged device is only re-stamped once
@@ -123,6 +131,7 @@ class PresentStore:
             known = state["devices"].get(installation)
             if (isinstance(known, dict) and known.get("name") == device["name"]
                     and known.get("app_version") == device["app_version"]
+                    and known.get("features", []) == device["features"]
                     and isinstance(known.get("seen_at"), (int, float))
                     and 0 <= now - known["seen_at"] < SEEN_REFRESH_S):
                 device["seen_at"] = known["seen_at"]
@@ -141,8 +150,13 @@ class PresentStore:
         profile."""
         return bool(self._load()["devices"])
 
+    def has_feature(self, feature: str) -> bool:
+        """Whether a Conduit that exchanged with this profile says it can
+        do ``feature`` (like "maps-navigate")."""
+        return any(feature in device.get("features", []) for device in self._load()["devices"].values())
+
     def confirm(self, title: Any, preview: Any, action_label: Any = None, *, spoken_yes: Any = None,
-                session_id: Any = None, ttl_minutes: Any = None) -> dict[str, Any]:
+                session_id: Any = None, ttl_minutes: Any = None, maps: Any = None) -> dict[str, Any]:
         """Keeps a confirm prompt for the phone. Raises PresentError when it
         won't."""
         clean_title = _line(title, MAX_TITLE_CHARS + 1)
@@ -167,6 +181,11 @@ class PresentStore:
                 or not 1 <= ttl_minutes <= MAX_TTL_MINUTES:
             raise PresentError("invalid", f"ttl_minutes is 1 to {MAX_TTL_MINUTES}.")
         session = _line(session_id, 180)
+        navigate = None
+        if maps is not None:
+            navigate = _maps(maps)
+            if navigate is None:
+                raise PresentError("invalid", "maps is {to, mode} with a place and a travel mode.")
         with self._locked() as state:
             now = self.clock()
             if not state["devices"]:
@@ -184,6 +203,8 @@ class PresentStore:
                 "created_at": created, "expires_at": created + int(ttl_minutes * 60),
                 "status": "waiting", "reported": False,
             }
+            if navigate is not None:
+                prompt["maps"] = navigate
             state["prompts"].append(prompt)
             _trim_prompts(state)
             state["asked"] = (recent + [now])[-PER_HOUR:]
@@ -327,7 +348,29 @@ def _find(state: dict[str, Any], prompt_id: Any) -> dict[str, Any] | None:
 
 def _public(prompt: dict[str, Any]) -> dict[str, Any]:
     """A waiting prompt as the phone shows it."""
-    return {key: prompt[key] for key in _PUBLIC}
+    public = {key: prompt[key] for key in _PUBLIC}
+    if prompt.get("maps"):
+        public["maps"] = prompt["maps"]
+    return public
+
+
+def _maps(value: Any) -> dict[str, str] | None:
+    """Where a navigate prompt goes, cleaned, or None when it's malformed."""
+    if not isinstance(value, dict):
+        return None
+    to = _line(value.get("to"), MAX_MAPS_TO_CHARS + 1)
+    mode = value.get("mode", "driving")
+    if not to or len(to) > MAX_MAPS_TO_CHARS or mode not in MAPS_MODES:
+        return None
+    return {"to": to, "mode": mode}
+
+
+def _features(value: Any) -> list[str]:
+    """What a phone says it can do: short plain names, sorted."""
+    if not isinstance(value, list):
+        return []
+    names = {_line(item, 40) for item in value[:MAX_FEATURES] if isinstance(item, str)}
+    return sorted(name for name in names if name)
 
 
 def _shown(prompt: dict[str, Any]) -> dict[str, Any]:
@@ -351,6 +394,9 @@ def _take_result(state: dict[str, Any], installation: str, result: Any, now: flo
         return
     prompt = _find(state, prompt_id)
     if prompt is None or prompt["status"] != "waiting":
+        return
+    # Conduit opens Maps by itself, and only as a yes to a Go prompt.
+    if via == "auto" and (outcome != "confirmed" or not prompt.get("maps")):
         return
     prompt.update(status=outcome, via=via, device=installation, finished_at=int(now), reported=False)
     if outcome == "edit":
@@ -401,6 +447,10 @@ def _prompt(raw: Any, now: float) -> dict[str, Any] | None:
         "session_id": _line(raw.get("session_id"), 180),
         "created_at": created, "expires_at": expires, "status": status, "reported": raw.get("reported") is True,
     }
+    if raw.get("maps") is not None:
+        navigate = _maps(raw.get("maps"))
+        if navigate is not None:
+            prompt["maps"] = navigate
     if raw.get("via") in VIAS:
         prompt["via"] = raw["via"]
     edit_text = _text(raw.get("edit_text"), MAX_EDIT_TEXT_CHARS)
@@ -435,6 +485,7 @@ def _normalized(raw: Any, now: float) -> dict[str, Any]:
             continue
         state["devices"][installation] = {"name": _line(device.get("name"), MAX_DEVICE_NAME_CHARS) or "Conduit",
                                           "app_version": _line(device.get("app_version"), 40),
+                                          "features": _features(device.get("features")),
                                           "seen_at": float(seen)}
     prompts = raw.get("prompts")
     seen_ids: set[str] = set()

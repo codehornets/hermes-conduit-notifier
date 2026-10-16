@@ -1344,6 +1344,14 @@ place's name, an address or a name, `place_id:<id>` from an earlier answer,
 or `lat,lon`. It's a building block like location: crons, place rules and
 skills can use it.
 
+`navigate` (plugin 0.37+) opens Apple Maps on the iPhone with directions to
+a place. It's a confirm prompt (`conduit_present`'s store and exchange)
+carrying `maps: {to, mode}`: Conduit opens Maps at once when the user is in
+that chat with Conduit open, and otherwise shows a Go button and a
+notification, answered by tap or by saying "go" in a call. Conduit says it
+can do this with `features: ["maps-navigate"]` in its present exchange;
+without it the tool returns an Apple Maps link for a text chat.
+
 The host has no map, so the user's iPhone answers. The tool stores the
 lookup sealed for that one phone (location's key, its own HKDF labels) and
 wakes it with the same location push as `locate`; the relay sees only a
