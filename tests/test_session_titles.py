@@ -186,3 +186,11 @@ def test_profiles_do_not_share_cached_titles(sent, monkeypatch):
     monkeypatch.setattr(sys.modules["hermes_state"], "SessionDB", PerProfileDB)
     assert titles.title("s1") == "Work"
     assert titles.title("s1") == "Home"
+
+
+def test_a_bot_chat_push_is_titled_with_its_bot(sent, monkeypatch):
+    monkeypatch.setitem(FakeSessionDB.titles, "bot", "Bot Chat")
+    homes = iter([pathlib.Path("/h/.hermes/profiles/scout"), pathlib.Path("/h/.hermes")])
+    monkeypatch.setattr(sys.modules["hermes_constants"], "get_hermes_home", lambda: next(homes))
+    assert titles.title("bot") == "scout"
+    assert titles.title("bot") == "default"

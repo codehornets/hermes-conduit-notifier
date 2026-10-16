@@ -22,6 +22,11 @@ CACHE_SECONDS = 30.0
 MAX_CACHED = 256
 
 _cache: dict[tuple[str, str], tuple[float, str]] = {}
+
+# Conduit's Bot Mode finds each bot's one chat by this exact title, so every
+# bot's chat carries it and can't be renamed. A push from one is titled with
+# the bot's profile instead, so it says which bot replied (#650).
+BOT_CHAT_TITLE = "Bot Chat"
 _cache_lock = threading.Lock()
 
 
@@ -42,6 +47,8 @@ def title(key: Any) -> str:
         if hit:
             del _cache[entry]
     value = _read(home, key)
+    if value == BOT_CHAT_TITLE:
+        value = _profile_of(home)
     if value:
         with _cache_lock:
             _cache.pop(entry, None)
@@ -54,6 +61,17 @@ def title(key: Any) -> str:
 def titled(prefix: str, key: Any) -> str:
     value = title(key)
     return f"{prefix} · {value}" if value else prefix
+
+
+def _profile_of(home: Any) -> str:
+    """The profile a Hermes home belongs to: profiles/<name>, else the default."""
+    try:
+        name = str(home.name).strip()
+        if home.parent.name == "profiles" and name:
+            return name
+    except Exception:  # noqa: BLE001 - a title must never break the turn
+        logger.debug("Couldn't read the profile of %s", home, exc_info=True)
+    return "default"
 
 
 def _home() -> Any:
