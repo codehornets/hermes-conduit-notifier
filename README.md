@@ -991,6 +991,26 @@ sooner, oldest first, once they pass 2 GB together (checked hourly). An
 upload that would leave under 1 GB free on the host is refused (507).
 Capability `room-files`.
 
+## Artifacts (plugin 0.40+)
+
+Conduit's Artifacts screens list what a profile's chats produced:
+`GET /api/plugins/conduit_push/artifacts` reads the profile's `state.db`
+(read only) newest message first and returns
+`{"ok": true, "items": [...], "next_before": 1234}`. Each item has a `kind`
+(`image`, `video`, `audio`, `page`, `document`, `file` or `link`), a `source`
+(`delivered` for a `MEDIA:` file, `preview` for a `::preview` page, `written`
+for a document or media file a tool wrote, `attached` for a file the user sent
+with `@file:`, `link` for a web link in a reply), a `name`, the chat's
+`session_id` and `session_title`, the `message_id` it came from and its
+`timestamp`; a file has its `path`, whether it still `exists` and its `size`,
+a link its `url` and `host`. Within a page one path or URL is listed once, at
+its newest mention (a later page can list it again at an older one). Query: `session_id` (one chat; repeat it for each id the chat is
+known by, and the sessions it continues from or spawned are read too), `kind` (`images`, `pages`, `files` or
+`links`), `q` (words in the name, chat title, path or URL), `limit` (up to
+200) and `before` (the previous page's `next_before`; `null` once the history
+is read to its start). A request reads a bounded window of rows, so a page can
+come back short with a `next_before` to keep going. Capability `artifacts`.
+
 ## Hermes calls you (plugin 0.13+)
 
 In a Live Voice call you can hand Hermes a long job and say "call me when

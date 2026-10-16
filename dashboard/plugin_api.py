@@ -80,7 +80,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
-from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
+from fastapi import APIRouter, HTTPException, Query, Request, Response, WebSocket
 
 logger = logging.getLogger(__name__)
 
@@ -9648,6 +9648,123 @@ async def post_room_file(request: Request, response: Response, profile: Optional
     return {"ok": True, **stored}
 
 
+# --- Artifacts ---------------------------------------------------------------
+#
+# GET /artifacts lists what a profile's chats produced (artifacts_index.py
+# beside this folder): files Hermes sent or wrote, the HTML pages it drew,
+# files the user attached and links, newest first. Conduit's Artifacts screen
+# reads every chat (no session_id) and a chat's own sheet reads one (each id
+# it's known by as a session_id, with the sessions it continues). Paged by
+# message id: pass the previous page's next_before as before.
+
+ARTIFACTS_LIMIT = 60
+ARTIFACTS_WINDOW_S = 60.0
+# The ids one chat is known by (its runtime and stored ids).
+ARTIFACTS_MAX_SESSIONS = 16
+ARTIFACTS_MAX_ID_LENGTH = 200
+# Each read is bounded (rows scanned, sqlite's busy wait); this backstops it.
+ARTIFACTS_TIMEOUT_S = 25.0
+_artifacts_limiter = _MintLimiter(ARTIFACTS_LIMIT, ARTIFACTS_WINDOW_S,
+                                  message="Too many artifact requests; try again shortly")
+_artifacts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conduit-artifacts")
+# A timed-out read keeps its worker until it ends, so a request finding both
+# busy is turned away rather than queued behind them.
+_artifacts_slots = threading.BoundedSemaphore(2)
+_artifacts_module: Any = None
+_artifacts_module_lock = threading.Lock()
+
+
+def _artifacts_index() -> Any:
+    """artifacts_index.py beside this folder, loaded once."""
+    global _artifacts_module
+    with _artifacts_module_lock:
+        if _artifacts_module is None:
+            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "artifacts_index.py")
+            spec = importlib.util.spec_from_file_location("conduit_push_dashboard_artifacts_index", path)
+            if spec is None or spec.loader is None or not os.path.isfile(path):
+                raise TokenError(501, "This plugin install is missing artifacts_index.py; update the plugin")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _artifacts_module = module
+        return _artifacts_module
+
+
+def list_artifacts(before: Optional[int] = None, session_ids: Optional[List[str]] = None,
+                   kind: Optional[str] = None, q: str = "", limit: Optional[int] = None) -> Dict[str, Any]:
+    """One page of the profile's artifacts (called inside the profile scope)."""
+    from hermes_constants import get_hermes_home
+
+    index = _artifacts_index()
+    if kind and kind not in index.GROUPS:
+        raise TokenError(400, "kind must be images, pages, files or links")
+    try:
+        conn = index.open_db(get_hermes_home())
+    except FileNotFoundError:
+        return {"items": [], "next_before": None}
+    try:
+        ids = [sid.strip() for sid in session_ids or []
+               if sid and sid.strip() and len(sid) <= ARTIFACTS_MAX_ID_LENGTH][:ARTIFACTS_MAX_SESSIONS]
+        if session_ids and not ids:
+            # A chat asked for by ids none of which can name one: never
+            # every chat instead.
+            return {"items": [], "next_before": None}
+        return index.list_artifacts(conn, before=before, session_ids=ids, group=kind or None,
+                                    query=q or "", limit=index.DEFAULT_LIMIT if limit is None else limit)
+    finally:
+        conn.close()
+
+
+@router.get("/artifacts")
+async def get_artifacts(response: Response, profile: Optional[str] = None, before: Optional[int] = None,
+                        session_id: Optional[List[str]] = Query(None), kind: Optional[str] = None,
+                        q: Optional[str] = None, limit: Optional[int] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    # The slot is freed exactly once: by the read when it ran, else by this
+    # request (a read it gave up on before it started never runs).
+    state = {"started": False, "abandoned": False}
+    state_lock = threading.Lock()
+
+    def job() -> Dict[str, Any]:
+        with state_lock:
+            if state["abandoned"]:
+                return {"items": [], "next_before": None}
+            state["started"] = True
+        try:
+            return list_artifacts(before, session_id, kind, q or "", limit)
+        finally:
+            _artifacts_slots.release()
+
+    try:
+        _artifacts_limiter.acquire(_limiter_key(profile))
+        if not _artifacts_slots.acquire(blocking=False):
+            raise HTTPException(status_code=503, detail="Hermes is still reading artifacts; try again shortly",
+                                headers={"Cache-Control": "no-store"})
+        try:
+            page = await asyncio.wait_for(_run_scoped(profile, job, _artifacts_executor),
+                                          timeout=ARTIFACTS_TIMEOUT_S)
+        except BaseException:
+            with state_lock:
+                if not state["started"]:
+                    state["abandoned"] = True
+                    _artifacts_slots.release()
+            raise
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        logger.warning("Conduit artifacts list timed out after %ss", ARTIFACTS_TIMEOUT_S)
+        raise HTTPException(status_code=504, detail="Listing artifacts took too long; try again",
+                            headers={"Cache-Control": "no-store"})
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except sqlite3.Error as exc:
+        logger.warning("Conduit artifacts couldn't read the session store: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Hermes' session store is busy; try again shortly",
+                            headers={"Cache-Control": "no-store"})
+    except Exception as exc:
+        raise _unexpected("list", exc, feature="Artifacts")
+    return {"ok": True, **page}
+
+
 # --- Capabilities ------------------------------------------------------------
 #
 # Conduit reads this once per connection to tell which of its features this
@@ -9692,6 +9809,7 @@ ROUTE_CAPABILITIES = (
     "reply-sources",
     "room-files",
     "speech-server",
+    "artifacts",
 )
 
 
