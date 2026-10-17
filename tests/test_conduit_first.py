@@ -116,6 +116,9 @@ def test_voice_calls_get_no_routing_sentence():
     assert texts
     for sentence in (first.CALENDAR_FIRST, first.CONTACTS_FIRST, first.PHONE_FIRST):
         assert all(sentence not in text for text in texts)
+    # Deleting is the phone's own tool too, so a call doesn't ask Hermes.
+    calendar = phone.voice_tools(_SharingStore())[phone.CALENDAR_TOOL]["description"]
+    assert "add or delete an event or reminder, use the phone's own add or remove tool" in calendar
 
 
 class _SharingStore:

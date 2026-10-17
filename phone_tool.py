@@ -643,9 +643,9 @@ def _contacts(args: dict[str, Any], store: PhoneStore | None = None, exact: bool
 # Gemini Live, Grok Live and GPT-Live can't call Hermes' tools, so Conduit
 # offers them the read actions here through the sealed /voice-tools route,
 # for the asking device only, when the user lets that voice mode read them
-# (Conduit's Settings > Calendar & phone). Writes in a call, alarms and
-# timers included, are the phone's own (it applies them with spoken
-# confirmation), so none are offered.
+# (Conduit's Settings > Calendar & phone). Writes in a call (adding and
+# deleting events and reminders, alarms and timers) are the phone's own (it
+# applies them with spoken confirmation), so none are offered.
 
 VOICE_CALENDAR_ACTIONS = ("overview", "calendars", "events", "free_busy", "next", "reminders")
 VOICE_PHONE_ACTIONS = ("status", "alarms")
@@ -668,8 +668,8 @@ VOICE_CONTACTS_DESCRIPTION = (
     "birthday. Action people; query narrows by name, nickname, relation or organization. Use it to know who "
     "someone is. Never read out numbers or emails unless the user asks.")
 VOICE_NOTE = ("On a voice call: answer by ear in a sentence or two, times the way people say them, and leave ids and "
-              "links out. To add an event or reminder, use the phone's own add tool when there is one; to change or "
-              "delete one, send the request to Hermes.")
+              "links out when speaking. To add or delete an event or reminder, use the phone's own add or remove tool "
+              "when there is one (deleting takes the id from this read); to change one, send the request to Hermes.")
 
 
 def voice_tools(store: PhoneStore | None = None) -> dict[str, dict[str, Any]]:

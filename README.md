@@ -1408,9 +1408,9 @@ next, reminders) and `conduit_phone` (status) join the list with `key:
 "voice"` (`{v: 1, device_id, kid, call_id, op: "voice", nonce, ct}`, the
 tool's name inside the seal: `{call_id, tool, args, provider}` in, `{call_id,
 result}` out), answered for the asking phone only. Conduit asks for this per
-voice mode in Settings > Calendar & phone. Adding an event or reminder in a
-call is the phone's own tool, with spoken confirmation, so no write is offered
-here. With plugin 0.30, `conduit_phone` also offers `alarms` (the alarms and
+voice mode in Settings > Calendar & phone. Adding or deleting an event or
+reminder in a call is the phone's own tool, with spoken confirmation (deleting
+takes the item's id from these reads), so no write is offered here. With plugin 0.30, `conduit_phone` also offers `alarms` (the alarms and
 timers Hermes set) and `conduit_contacts` (`people`) joins the list, each once
 a phone shares it; setting an alarm or timer in a call is the phone's own tool
 too.
