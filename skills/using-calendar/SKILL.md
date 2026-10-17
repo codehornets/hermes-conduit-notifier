@@ -96,8 +96,10 @@ hours ago says little about now.
 ## Changing things: the phone does it, the user decides
 
 You can't write to the calendar directly. `add_event`, `update_event`,
-`delete_event`, `add_reminder`, `update_reminder` and `complete_reminder`
-queue a change; the phone applies it.
+`delete_event`, `add_reminder`, `update_reminder`, `complete_reminder` and
+`delete_reminder` queue a change; the phone applies it. Mark a reminder done
+with `complete_reminder` when the user did it; use `delete_reminder` only
+when they want it gone.
 
 - By default the user approves each change on their phone (a card with
   Add / Edit / Dismiss). The result says "waiting for the user to approve".

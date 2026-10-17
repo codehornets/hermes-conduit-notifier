@@ -1577,7 +1577,10 @@ whether notes and attendees are included (off by default).
   everything with `{"all": true}`).
 - **Tools.** `conduit_calendar` (reads `overview`, `calendars`, `events`,
   `free_busy`, `next`, `reminders`; writes `add_event`, `update_event`,
-  `delete_event`, `add_reminder`, `update_reminder`, `complete_reminder`;
+  `delete_event`, `add_reminder`, `update_reminder`, `complete_reminder`,
+  `delete_reminder` (Conduit builds before it leave that one waiting until
+  it expires; deletes and completions carry the item's title and time so
+  the phone's card names it);
   `pending` for how changes went) and `conduit_phone` (`status`), with the
   skill `conduit_push:using-calendar`. Each shows only once a phone shares
   what it reads; subagents can't use them. Reads say how fresh the copy is

@@ -622,6 +622,7 @@ def test_auto_applies_only_to_adds_on_unshared_calendars_when_allowed(store, iph
     assert store.add_change("add_reminder", {"title": "Milk", "list_id": "l_groceries"})["auto"] is False
     assert store.add_change("update_event", {"title": "Dentist!"}, {"event_id": "e_dentist"})["auto"] is False
     assert store.add_change("complete_reminder", {}, {"reminder_id": "r_milk"})["auto"] is False
+    assert store.add_change("delete_reminder", {}, {"reminder_id": "r_milk"})["auto"] is False
 
 
 @pytest.mark.parametrize("kind, fields, target, code", [
@@ -648,6 +649,9 @@ def test_auto_applies_only_to_adds_on_unshared_calendars_when_allowed(store, iph
     ("add_reminder", {"title": "Milk", "priority": 10}, None, "malformed"),
     ("add_reminder", {"title": "Milk"}, {"reminder_id": "r_milk"}, "malformed"),
     ("complete_reminder", {}, {"reminder_id": "r_nope"}, "unknown_reminder"),
+    ("delete_reminder", {}, {"reminder_id": "r_nope"}, "unknown_reminder"),
+    ("delete_reminder", {"title": "X"}, {"reminder_id": "r_milk"}, "malformed"),
+    ("delete_reminder", {}, None, "malformed"),
     ("add_reminder", {"title": "Milk", "location_alarm": {"name": "Home"}}, None, "malformed"),
 ])
 def test_bad_changes_are_refused(store, iphone, kind, fields, target, code):
@@ -675,8 +679,16 @@ def test_change_fields_follow_the_contract(store, iphone):
                                   "priority": 1, "notes": None, "url": None,
                                   "location_alarm": {"name": "Home", "proximity": "leave"}}
     done = store.add_change("complete_reminder", None, {"reminder_id": "r_milk"})
-    assert done["fields"] == {"completed": True} and done["target"] == {"reminder_id": "r_milk"}
+    # Title and due ride along for the phone's card; only completed applies.
+    assert done["fields"] == {"title": "Buy milk", "due": "2026-10-15T09:00:00+01:00", "completed": True}
+    assert done["target"] == {"reminder_id": "r_milk"}
     assert done["summary"] == "Buy milk · Thu 15 Oct 09:00"
+    gone = store.add_change("delete_reminder", None, {"reminder_id": "r_milk"})
+    assert gone["fields"] == {"title": "Buy milk", "due": "2026-10-15T09:00:00+01:00"}
+    assert gone["target"] == {"reminder_id": "r_milk"}
+    assert gone["summary"] == "Buy milk · Thu 15 Oct 09:00"
+    removed = store.add_change("delete_event", None, {"event_id": "e_dentist"})
+    assert removed["fields"]["title"] == "Dentist" and removed["fields"]["start"]
 
 
 @pytest.mark.parametrize("results", [
@@ -802,6 +814,14 @@ def test_a_write_queues_a_change_and_nudges_the_phone(home):
     assert home.sent[-1]["title"] == "Hermes has a calendar change"
     pending = _cal({"action": "pending"})["changes"]
     assert [item["state"] for item in pending] == ["waiting", "edited"]
+
+
+def test_a_reminder_can_be_deleted(home):
+    _shared(home)
+    gone = _cal({"action": "delete_reminder", "reminder_id": "r_milk", "completed": True, "title": "ignored"})
+    assert gone["status"] == "waiting_for_approval" and "always need" in gone["note"]
+    assert home.sent[-1]["title"] == "Hermes wants to remove a reminder"
+    assert _cal({"action": "pending"})["changes"][0]["kind"] == "delete_reminder"
 
 
 def test_a_refused_write_leaves_earlier_outcomes_for_later(home):

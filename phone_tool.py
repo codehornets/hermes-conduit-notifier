@@ -71,7 +71,7 @@ CALENDAR_SCHEMA: dict[str, Any] = {
         "people can read, and don't write attendee emails into memory unless the user asks. "
         "Reads: overview (what's shared, calendars, freshness), calendars, events, free_busy, next, reminders. "
         "Writes queue a change the phone applies: add_event, update_event, delete_event, add_reminder, "
-        "update_reminder, complete_reminder; the user approves each on the phone unless they let Hermes add "
+        "update_reminder, complete_reminder, delete_reminder; the user approves each on the phone unless they let Hermes add "
         "without asking (updates and deletes always ask), so never say a change is done until pending shows it "
         "applied. pending: recent changes and how they went. Read results are as of the phone's last sync. "
         f"Before setting up a scheduled job or standing rule around the calendar, load "
@@ -101,8 +101,8 @@ CALENDAR_SCHEMA: dict[str, Any] = {
             "span": {"type": "string", "enum": ["this", "future"],
                      "description": "update_event, delete_event on a recurring event: this occurrence (default) or "
                                     "this and all future ones."},
-            "reminder_id": {"type": "string", "description": "update_reminder, complete_reminder: the reminder's id "
-                                                             "from reminders."},
+            "reminder_id": {"type": "string", "description": "update_reminder, complete_reminder, delete_reminder: the "
+                                                             "reminder's id from reminders."},
             "title": {"type": "string", "description": "add_event, add_reminder (required), updates."},
             "start": {"type": "string", "description": "add_event (required): ISO time with offset, or a date for "
                                                        "all-day."},
@@ -433,6 +433,7 @@ _TITLES = {
     "add_reminder": "Hermes wants to add a reminder",
     "update_reminder": "Hermes wants to change a reminder",
     "complete_reminder": "Hermes wants to complete a reminder",
+    "delete_reminder": "Hermes wants to remove a reminder",
     "set_alarm": "Hermes wants to set an alarm",
     "set_timer": "Hermes wants to start a timer",
     "cancel_alarm": "Hermes wants to cancel an alarm",
@@ -478,10 +479,12 @@ def _write(store: PhoneStore, kind: str, args: dict[str, Any], session_id: Any, 
         target = {"event_id": args.get("event_id"), "span": args.get("span") or "this"}
         if kind == "delete_event":
             fields = {}
-    elif kind in ("update_reminder", "complete_reminder"):
+    elif kind in ("update_reminder", "complete_reminder", "delete_reminder"):
         target = {"reminder_id": args.get("reminder_id")}
         if kind == "complete_reminder":
             fields = {} if args.get("completed") is None else {"completed": args.get("completed")}
+        elif kind == "delete_reminder":
+            fields = {}
     session = session_id.strip() if isinstance(session_id, str) else ""
     change = store.add_change(kind, fields, target or None, reason=args.get("reason"),
                               session_title=session_titles.title(session) if session else None,
