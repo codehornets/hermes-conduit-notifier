@@ -211,7 +211,7 @@ def test_first_save_creates_a_desktop_session_without_a_model(client, hermes):
     assert store.titles[body["session_id"]] == "Voice call"
 
 
-@pytest.mark.parametrize("engine", ["gpt-live", "grok-live"])
+@pytest.mark.parametrize("engine", ["gpt-live", "grok-live", "local-live"])
 def test_first_save_tags_the_session_as_a_call(client, hermes, engine):
     session_id = save(client, engine=engine, turns=turns(("user", "hi"))).json()["session_id"]
     tags = client.get(f"{BASE}/voice/tags").json()["tags"]

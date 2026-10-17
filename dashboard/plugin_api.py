@@ -3357,7 +3357,8 @@ VOICE_MAX_TIMESTAMP = 32_503_680_000  # year 3000
 VOICE_SESSION_SOURCE = "desktop"
 VOICE_END_REASON = "conduit_voice"
 VOICE_TAG_KINDS = frozenset({"call", "classic", "job"})
-VOICE_ENGINES = frozenset({"gemini-live", "gpt-live", "grok-live", "classic"})
+# Local Live calls (the user's own speech server) save like the others.
+VOICE_ENGINES = frozenset({"gemini-live", "gpt-live", "grok-live", "local-live", "classic"})
 VOICE_TAGS_KEY = "conduit.voice.tags"
 VOICE_CALLS_KEY = "conduit.voice.calls:{session_id}"
 VOICE_CREATED_KEY = "conduit.voice.created"
