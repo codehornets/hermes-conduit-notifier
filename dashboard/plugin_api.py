@@ -40,10 +40,12 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+import collections
 import contextvars
 import errno
 import functools
 import hashlib
+import hmac
 import http.client
 import ipaddress
 import importlib
@@ -56,6 +58,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -2444,6 +2447,11 @@ async def post_speech_server_test(response: Response, profile: Optional[str] = N
 
 @router.websocket("/speech-server/socket")
 async def speech_server_socket(ws: WebSocket) -> None:
+    await _speech_server_socket(ws, lambda refuse, url, key, profile: _speech_server_relay(ws, refuse, url, key))
+
+
+async def _speech_server_socket(ws: WebSocket, relay: Callable[..., Any]) -> None:
+    """A relay socket to the profile's speech server: auth, settings, slot, then ``relay``."""
     authorized = await _ws_authorized(ws)
     if not authorized:
         try:
@@ -2487,7 +2495,7 @@ async def speech_server_socket(ws: WebSocket) -> None:
         return
     _speech_server_open[open_key] = _speech_server_open.get(open_key, 0) + 1
     try:
-        await _speech_server_relay(ws, refuse, url, key)
+        await relay(refuse, url, key, profile)
     finally:
         remaining = _speech_server_open.get(open_key, 1) - 1
         if remaining > 0:
@@ -2496,8 +2504,17 @@ async def speech_server_socket(ws: WebSocket) -> None:
             _speech_server_open.pop(open_key, None)
 
 
-async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any], url: str, key: str) -> None:
-    """One utterance's relay, from dialing the speech server to forwarding its close."""
+async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any], url: str, key: str,
+                               intercept: Optional[Callable[[str], Any]] = None,
+                               send_lock: Optional[asyncio.Lock] = None) -> None:
+    """One utterance's relay, from dialing the speech server to forwarding its close.
+
+    ``intercept`` sees each text frame from Conduit first and returns True for
+    one meant for the plugin, which then isn't forwarded (Local Live's turn
+    frames). ``send_lock`` is held for each frame sent to Conduit, when
+    something else sends on the same socket.
+    """
+    send_lock = send_lock or asyncio.Lock()
     try:
         upstream = await _connect_speech_server(url, _speech_server_headers(key))
     except RealtimeUpstreamRefused as exc:
@@ -2519,16 +2536,19 @@ async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any],
             if size > SPEECH_SERVER_MAX_CLIENT_FRAME_BYTES:
                 raise ValueError("frame too large")
             if text is not None:
+                if intercept is not None and await intercept(text):
+                    continue
                 await upstream.send(text)
             elif data is not None:
                 await upstream.send(data)
 
     async def server_to_client() -> None:
         async for frame in upstream:
-            if isinstance(frame, str):
-                await ws.send_text(frame)
-            else:
-                await ws.send_bytes(bytes(frame))
+            async with send_lock:
+                if isinstance(frame, str):
+                    await ws.send_text(frame)
+                else:
+                    await ws.send_bytes(bytes(frame))
 
     try:
         from websockets.exceptions import ConnectionClosed
@@ -2564,6 +2584,702 @@ async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any],
         await refuse(SPEECH_SERVER_CLOSE_UNREACHABLE, "The connection to the speech server was lost")
     else:
         await refuse(code, reason)
+
+
+# --- Local Live: a live call through the user's own voice server -----------
+#
+# The speech server above can also run whole live calls: Hugging Face
+# speech-to-speech (Hermes Live Voice's local mode) listens, decides when the
+# user has finished, and speaks the reply, asking an OpenAI-compatible "model
+# address" for the words. For Local Live that model address is this plugin:
+#
+#   phone -> /local-live/socket -> the speech server   (call audio, relayed
+#                                                       as for Classic voice)
+#   speech server -> /local-live/v1/chat/completions    (each turn)
+#   plugin -> phone: conduit.turn {turn_id, text}       (on the call's socket)
+#   phone runs the turn in the call's chat, streams conduit.turn.delta back
+#   plugin -> speech server: the reply as chat-completions SSE
+#
+# So Hermes answers in the chat the call belongs to, with that chat's profile,
+# tools and memory, and the turn shows live in Conduit like any other. The
+# request's model name is ignored.
+#
+# The speech server can't sign in to the dashboard, so the two model routes
+# take a key instead: the plugin's own, one per profile, shown in Conduit's
+# settings to paste into the server (--responses_api_api_key). That uses
+# Hermes' token-route seam (hermes_cli.dashboard_auth.token_auth), which only
+# ever affects the registered paths. A Hermes without the seam reports Local
+# Live unavailable.
+#
+# One live call per profile at a time: a speech-to-speech server runs one
+# pipeline by default, and a turn goes to the profile's newest call.
+#
+# The same socket with ?mode=speak is Classic voice's reply voice: Conduit
+# sends each reply sentence as a user item plus response.create, and the
+# model route reads that text back unchanged, so the server speaks it in its
+# own voice. Classic then needs one address for listening and speaking.
+
+LOCAL_LIVE_MOUNT = "/api/plugins/conduit_push"
+LOCAL_LIVE_MODEL_PATH = "/local-live/v1"
+LOCAL_LIVE_TOKEN_PATHS = (LOCAL_LIVE_MOUNT + LOCAL_LIVE_MODEL_PATH + "/chat/completions",
+                          LOCAL_LIVE_MOUNT + LOCAL_LIVE_MODEL_PATH + "/models")
+LOCAL_LIVE_FILE = "conduit-local-live.json"
+LOCAL_LIVE_KEY_PREFIX = "cll1"
+LOCAL_LIVE_PROVIDER_NAME = "conduit-local-live"
+LOCAL_LIVE_MODEL_ID = "conduit"
+# Between frames of a turn from the phone. A Hermes turn with tools can be
+# slow; the phone sends a short "one moment" first when it is.
+LOCAL_LIVE_TURN_IDLE_S = 90.0
+LOCAL_LIVE_TURN_MAX_S = 600.0
+LOCAL_LIVE_MAX_BODY_BYTES = 512 * 1024
+LOCAL_LIVE_MAX_TURN_CHARS = 4_000
+LOCAL_LIVE_MAX_DELTA_CHARS = 8_000
+# A turn's whole reply: the phone's deltas past this are dropped.
+LOCAL_LIVE_MAX_REPLY_CHARS = 32_000
+# How long the auth seam waits for the dashboard to start serving.
+LOCAL_LIVE_AUTH_WAIT_S = 600.0
+LOCAL_LIVE_NO_CALL_REPLY = "Conduit isn't in a Local Live call right now."
+LOCAL_LIVE_UNAVAILABLE = ("This Hermes can't take the voice server's key (no dashboard token routes). "
+                          "Update Hermes to use Local Live.")
+_LOCAL_LIVE_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+_local_live_auth_state: Dict[str, Any] = {"ready": False, "reason": "Local Live is starting", "started": False}
+_local_live_auth_lock = threading.Lock()
+_local_live_key_lock = threading.Lock()
+
+
+def _local_live_key_path() -> Path:
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / LOCAL_LIVE_FILE
+
+
+def _local_live_profile_part(profile: Optional[str]) -> str:
+    # Unfolded: the key is verified in this exact profile's scope, which is
+    # case-sensitive.
+    name = _local_live_profile_key(profile)
+    return base64.urlsafe_b64encode(name.encode("utf-8")).decode("ascii").rstrip("=") or "-"
+
+
+def _local_live_profile_from_part(part: str) -> Optional[str]:
+    """The profile a key names, "" for the dashboard's own; None when malformed."""
+    if part == "-":
+        return ""
+    try:
+        name = base64.b64decode(part + "=" * (-len(part) % 4), altchars=b"-_", validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return name if _LOCAL_LIVE_PROFILE_NAME.fullmatch(name) else None
+
+
+def _local_live_read_key() -> str:
+    """This profile's key (inside its scope), or "" when none was made."""
+    try:
+        data = json.loads(_local_live_key_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    key = data.get("api_key") if isinstance(data, dict) else None
+    return key if isinstance(key, str) and key.startswith(LOCAL_LIVE_KEY_PREFIX + ".") else ""
+
+
+def local_live_key(profile: Optional[str], rotate: bool = False) -> str:
+    """This profile's key, made on first use or when ``rotate`` (inside its scope)."""
+    with _local_live_key_lock:
+        key = "" if rotate else _local_live_read_key()
+        if key:
+            return key
+        key = ".".join((LOCAL_LIVE_KEY_PREFIX, _local_live_profile_part(profile), secrets.token_urlsafe(32)))
+        path = _local_live_key_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".conduit-local-live-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"version": 1, "api_key": key, "created_at": int(time.time())}, handle)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        # After the replace, so a verify that read the old file can't cache it
+        # again (the generation it started under is gone).
+        global _local_live_key_generation
+        _local_live_key_generation += 1
+        named = _local_live_profile_key(profile)
+        for token in [t for t, (p, _) in _local_live_verified.items() if _local_live_profile_key(p) == named]:
+            del _local_live_verified[token]
+        return key
+
+
+# Keys verified lately, so a call's turns don't each reread the key file
+# and the profile's config on the event loop (verify_token is synchronous).
+# A profile's entries go whenever its key is made or rotated.
+_local_live_verified: Dict[str, Tuple[str, float]] = {}
+_local_live_key_generation = 0
+LOCAL_LIVE_VERIFIED_TTL_S = 30.0
+# Keys checked against the files a minute (wrong ones included): past this,
+# an unknown key is refused without reading anything, so a flood of wrong
+# keys can't keep the event loop reading files. Keys verified lately still work.
+LOCAL_LIVE_KEY_CHECK_LIMIT = 60
+_local_live_key_check_limiter = _MintLimiter(LOCAL_LIVE_KEY_CHECK_LIMIT, 60.0, message="Too many Local Live key checks")
+
+
+def local_live_profile_for_key(token: str) -> Optional[str]:
+    """The profile whose key ``token`` is ("" for the dashboard's own), else None."""
+    now = time.monotonic()
+    with _local_live_key_lock:
+        cached = _local_live_verified.get(token)
+    if cached is not None and now < cached[1]:
+        return cached[0]
+    try:
+        mint = _local_live_key_check_limiter.acquire("")
+    except TokenError:
+        return None
+    with _local_live_key_lock:
+        generation = _local_live_key_generation
+    profile = _local_live_check_key(token)
+    if profile is not None:
+        # A right key doesn't spend the budget wrong ones share.
+        _local_live_key_check_limiter.release("", mint)
+        with _local_live_key_lock:
+            if generation == _local_live_key_generation:
+                for stale in [k for k, (_, expiry) in _local_live_verified.items() if expiry <= now]:
+                    del _local_live_verified[stale]
+                _local_live_verified[token] = (profile, now + LOCAL_LIVE_VERIFIED_TTL_S)
+    return profile
+
+
+def _local_live_check_key(token: str) -> Optional[str]:
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != LOCAL_LIVE_KEY_PREFIX or not parts[2]:
+        return None
+    profile = _local_live_profile_from_part(parts[1])
+    if profile is None:
+        return None
+    try:
+        with _profile_scope(profile or None):
+            stored = _local_live_read_key()
+    except Exception as exc:  # noqa: BLE001 — a bad profile is a wrong key, never a crash in auth
+        logger.warning("Local Live could not read a profile's key: %s", type(exc).__name__)
+        return None
+    if stored and hmac.compare_digest(stored.encode("utf-8"), token.encode("utf-8")):
+        return profile
+    return None
+
+
+def _local_live_provider() -> Any:
+    from hermes_cli.dashboard_auth.base import DashboardAuthProvider, TokenPrincipal
+
+    class LocalLiveKeyProvider(DashboardAuthProvider):
+        """The voice server's key for Local Live's model routes; nothing else."""
+
+        name = LOCAL_LIVE_PROVIDER_NAME
+        display_name = "Conduit Local Live (voice server key)"
+        supports_token = True
+        supports_session = False
+
+        def verify_token(self, *, token: str) -> Any:
+            profile = local_live_profile_for_key(token or "")
+            if profile is None:
+                return None
+            return TokenPrincipal(principal=f"local-live:{profile}", provider=self.name, scopes=("local-live",))
+
+        def start_login(self, *, redirect_uri: str) -> Any:
+            raise NotImplementedError("Local Live's key is for the voice server, not for signing in")
+
+        def complete_login(self, *args: Any, **kwargs: Any) -> Any:
+            raise NotImplementedError("Local Live's key is for the voice server, not for signing in")
+
+        def verify_session(self, *args: Any, **kwargs: Any) -> Any:
+            return None
+
+        def refresh_session(self, *args: Any, **kwargs: Any) -> Any:
+            raise NotImplementedError("Local Live's key is for the voice server, not for signing in")
+
+        def revoke_session(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    return LocalLiveKeyProvider()
+
+
+def _local_live_register_auth() -> None:
+    """Registers the key provider and the model routes once the dashboard serves.
+
+    Waits for start_server to decide its auth gate: registered before that, a
+    token-only provider would count as the "auth provider" a public bind must
+    have. With the gate on and nothing else to sign in with, it stays off.
+    """
+    try:
+        from hermes_cli.dashboard_auth import token_auth
+        from hermes_cli.dashboard_auth import registry
+    except ImportError:
+        _local_live_auth_state.update(ready=False, reason=LOCAL_LIVE_UNAVAILABLE)
+        return
+    web_server = sys.modules.get("hermes_cli.web_server")
+    if web_server is None:
+        # Gone since the starter looked (a failed import): no gate to wait for.
+        _local_live_auth_state.update(ready=False, reason="Local Live runs in the Hermes dashboard")
+        _local_live_retry_auth()
+        return
+    app = getattr(web_server, "app", None)
+    deadline = time.monotonic() + LOCAL_LIVE_AUTH_WAIT_S
+    # Mid-import the dashboard may not have its app yet: wait for that too.
+    while app is None or getattr(app.state, "auth_required", None) is None:
+        if time.monotonic() > deadline:
+            _local_live_auth_state.update(ready=False, reason="The dashboard hasn't started serving")
+            _local_live_retry_auth()
+            return
+        time.sleep(0.5)
+        app = getattr(web_server, "app", None)
+    if app is not None and getattr(app.state, "auth_required", False):
+        others = [p for p in registry.list_providers() if p.name != LOCAL_LIVE_PROVIDER_NAME]
+        if not others:
+            _local_live_auth_state.update(ready=False, reason="The dashboard has no sign-in provider")
+            return
+    try:
+        if registry.get_provider(LOCAL_LIVE_PROVIDER_NAME) is None:
+            registry.register_provider(_local_live_provider())
+        for path in LOCAL_LIVE_TOKEN_PATHS:
+            token_auth.register_token_route(path)
+    except Exception as exc:  # noqa: BLE001 — Local Live off, never the dashboard
+        logger.warning("Local Live could not register its key: %s", exc)
+        _local_live_auth_state.update(ready=False, reason=f"Hermes refused Local Live's key ({type(exc).__name__})")
+        _local_live_retry_auth()
+        return
+    _local_live_auth_state.update(ready=True, reason=None)
+
+
+def _local_live_retry_auth() -> None:
+    """After a failure that may pass (a slow start, a refused registration),
+    the next status or socket call tries again, once this attempt's thread
+    has returned."""
+    _local_live_auth_state["retry"] = True
+
+
+def _local_live_register_auth_thread() -> None:
+    _local_live_auth_state["retry"] = False
+    try:
+        _local_live_register_auth()
+    finally:
+        if _local_live_auth_state.get("retry"):
+            with _local_live_auth_lock:
+                _local_live_auth_state["started"] = False
+
+
+def _local_live_start_auth() -> None:
+    with _local_live_auth_lock:
+        if _local_live_auth_state["started"]:
+            return
+        if "hermes_cli.web_server" not in sys.modules:
+            # Not the dashboard yet (tests, a plugin host process, or imported
+            # before it): a later status or socket call tries again.
+            _local_live_auth_state.update(ready=False, reason="Local Live runs in the Hermes dashboard")
+            return
+        _local_live_auth_state["started"] = True
+    try:
+        threading.Thread(target=_local_live_register_auth_thread, name="conduit-local-live-auth", daemon=True).start()
+    except RuntimeError as exc:  # no thread to spare: try again on the next call
+        logger.warning("Local Live could not start its key registration: %s", exc)
+        _local_live_auth_state.update(ready=False, reason="Local Live couldn't start; it will try again")
+        with _local_live_auth_lock:
+            _local_live_auth_state["started"] = False
+
+
+# The voice server's warmup asks for a turn as soon as it starts, maybe
+# before Conduit has opened anything: the key works from the dashboard's start.
+_local_live_start_auth()
+
+
+class _LocalLiveTurn:
+    def __init__(self, turn_id: str) -> None:
+        self.turn_id = turn_id
+        self.frames: "asyncio.Queue[Tuple[str, str]]" = asyncio.Queue()
+        # Characters queued so far; bounds the queue with the reply.
+        self.chars = 0
+
+
+class _LocalLiveCall:
+    """A live call's relay socket: the phone end, where turns are sent."""
+
+    def __init__(self, ws: WebSocket, profile: str, speaks: bool = False) -> None:
+        self.ws = ws
+        self.profile = profile
+        # Classic voice's reply voice (?mode=speak): Conduit already has the
+        # words, sends them as the user item, and the server reads them back.
+        self.speaks = speaks
+        # On a speak socket, the words Conduit sent that the server hasn't
+        # asked to have read back yet: how its requests are told from a
+        # live call's on the same profile.
+        self.to_read: "collections.deque[str]" = collections.deque(maxlen=64)
+        # Words read back lately, with when: a server retrying a request whose
+        # answer it lost still gets the read-back, not a live turn.
+        self.read_lately: "collections.deque[Tuple[str, float]]" = collections.deque(maxlen=16)
+        self.send_lock = asyncio.Lock()
+        # Held across cancel-old, make-new and send, so turns never overlap.
+        self.turn_lock = asyncio.Lock()
+        self.turns: Dict[str, _LocalLiveTurn] = {}
+        self.numbers = itertools.count(1)
+        self.closed = False
+
+    async def send(self, payload: Dict[str, Any]) -> bool:
+        if self.closed:
+            return False
+        try:
+            async with self.send_lock:
+                await self.ws.send_text(json.dumps(payload))
+            return True
+        except Exception:  # noqa: BLE001 — a gone phone ends the turn, not the request
+            return False
+
+    async def start_turn(self, text: str) -> Optional[_LocalLiveTurn]:
+        # One turn at a time: the server has moved on from any earlier one.
+        async with self.turn_lock:
+            for old in list(self.turns.values()):
+                await self.cancel_turn(old)
+            turn = _LocalLiveTurn(f"t{next(self.numbers)}")
+            self.turns[turn.turn_id] = turn
+            if not await self.send({"type": "conduit.turn", "turn_id": turn.turn_id, "text": text}):
+                self.turns.pop(turn.turn_id, None)
+                return None
+            return turn
+
+    async def cancel_turn(self, turn: _LocalLiveTurn) -> None:
+        if self.turns.pop(turn.turn_id, None) is not None:
+            turn.frames.put_nowait(("done", ""))
+            await self.send({"type": "conduit.turn.cancel", "turn_id": turn.turn_id})
+
+    async def intercept(self, text: str) -> bool:
+        """A frame from the phone: True for turn frames, which stay here."""
+        if self.speaks and '"conversation.item.create"' in text:
+            self._note_words(text)
+        if '"conduit.' not in text:
+            return False
+        try:
+            frame = json.loads(text)
+        except ValueError:
+            return False
+        kind = frame.get("type") if isinstance(frame, dict) else None
+        if not isinstance(kind, str) or not kind.startswith("conduit."):
+            return False
+        turn = self.turns.get(str(frame.get("turn_id") or ""))
+        if turn is None:
+            return True
+        if kind == "conduit.turn.delta":
+            delta = frame.get("text")
+            if isinstance(delta, str) and delta and turn.chars < LOCAL_LIVE_MAX_REPLY_CHARS:
+                delta = delta[:min(LOCAL_LIVE_MAX_DELTA_CHARS, LOCAL_LIVE_MAX_REPLY_CHARS - turn.chars)]
+                turn.chars += len(delta)
+                turn.frames.put_nowait(("delta", delta))
+        elif kind in ("conduit.turn.done", "conduit.turn.error"):
+            self.turns.pop(turn.turn_id, None)
+            turn.frames.put_nowait(("done", ""))
+        return True
+
+    def _note_words(self, text: str) -> None:
+        try:
+            frame = json.loads(text)
+        except ValueError:
+            return
+        item = frame.get("item") if isinstance(frame, dict) and frame.get("type") == "conversation.item.create" else None
+        content = item.get("content") if isinstance(item, dict) else None
+        # Joined the way _local_live_user_text joins a request's parts.
+        parts = [part["text"] for part in content if isinstance(part, dict)
+                 and part.get("type") in ("text", "input_text")
+                 and isinstance(part.get("text"), str)] if isinstance(content, list) else []
+        words = " ".join(" ".join(parts).split())[:LOCAL_LIVE_MAX_TURN_CHARS]
+        if words:
+            self.to_read.append(words)
+
+    def take_words(self, text: str) -> bool:
+        """Whether ``text`` is words this speak socket sent (now read back)."""
+        # Spaced the way _local_live_user_text gives the request's words.
+        wanted = " ".join(text.split())
+        now = time.monotonic()
+        if wanted in self.to_read:
+            self.to_read.remove(wanted)
+            self.read_lately.append((wanted, now))
+            return True
+        return any(words == wanted and now - at < LOCAL_LIVE_RETRY_WINDOW_S for words, at in self.read_lately)
+
+    def close(self) -> None:
+        self.closed = True
+        for turn in list(self.turns.values()):
+            turn.frames.put_nowait(("done", ""))
+        self.turns.clear()
+
+
+_local_live_calls: Dict[str, List[_LocalLiveCall]] = {}
+# How long a read-back sentence can be asked for again (a server's retry).
+LOCAL_LIVE_RETRY_WINDOW_S = 30.0
+# Requests per profile a minute: a speak socket asks once a sentence, a
+# call once a turn, so this only stops a runaway client.
+LOCAL_LIVE_REQUEST_LIMIT = 120
+_local_live_limiter = _MintLimiter(LOCAL_LIVE_REQUEST_LIMIT, 60.0,
+                                   message="Too many Local Live requests; try again shortly")
+# When each profile's voice server last asked for a turn: Conduit's setup
+# shows whether the server is pointed at this plugin.
+_local_live_last_request: Dict[str, float] = {}
+
+
+_local_live_tasks: set = set()
+
+
+def _local_live_spawn(coroutine: Any) -> None:
+    task = asyncio.ensure_future(coroutine)
+    _local_live_tasks.add(task)
+    task.add_done_callback(_local_live_tasks.discard)
+
+
+def _local_live_profile_key(profile: Optional[str]) -> str:
+    """The call registry's key: the profile as its Local Live key names it
+    (unfolded, so Work and work are two profiles)."""
+    name = (profile or "").strip()
+    return "" if name.lower() in ("", "current") else name
+
+
+def _local_live_open_calls(profile: str) -> List[_LocalLiveCall]:
+    return [call for call in _local_live_calls.get(_local_live_profile_key(profile), []) if not call.closed]
+
+
+def _local_live_active_call(profile: str) -> Optional[_LocalLiveCall]:
+    """The newest live call (not a speak socket), where turns go."""
+    calls = [call for call in _local_live_open_calls(profile) if not call.speaks]
+    return calls[-1] if calls else None
+
+
+def _local_live_route(profile: str, text: str) -> Tuple[Optional[_LocalLiveCall], bool]:
+    """Who answers a request: (call, read back). Words a speak socket sent are
+    read back; anything else is a live call's turn. With no live call but a
+    speak socket open, the request is read back too."""
+    calls = _local_live_open_calls(profile)
+    for call in reversed(calls):
+        if call.speaks and text and call.take_words(text):
+            return call, True
+    live = _local_live_active_call(profile)
+    if live is not None:
+        return live, False
+    speaking = [call for call in calls if call.speaks]
+    return (speaking[-1], True) if speaking else (None, False)
+
+
+LOCAL_LIVE_PROFILE_NAME_REASON = "Local Live needs a profile name of letters, digits, dots, dashes or underscores"
+
+
+def _local_live_profile_can_carry_key(profile: Optional[str]) -> bool:
+    """Whether a key can name this profile: letters, digits, . _ - only, up to 64."""
+    name = (profile or "").strip()
+    return name.lower() in ("", "current") or bool(_LOCAL_LIVE_PROFILE_NAME.fullmatch(name))
+
+
+def local_live_status(
+    profile: Optional[str], in_call: Optional[bool] = None, last_request_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Inside the profile's scope: what Conduit shows in Local Live's settings.
+
+    The route reads ``in_call`` and ``last_request_at`` on the event loop,
+    which owns the call registry, and passes them in."""
+    server = speech_server_status()
+    auth_ready = bool(_local_live_auth_state.get("ready"))
+    reason = None if auth_ready else str(_local_live_auth_state.get("reason") or LOCAL_LIVE_UNAVAILABLE)
+    if auth_ready and not _local_live_profile_can_carry_key(profile):
+        auth_ready = False
+        reason = LOCAL_LIVE_PROFILE_NAME_REASON
+    if reason is None and not server.get("available"):
+        reason = server.get("reason")
+    return {
+        "available": auth_ready and bool(server.get("available")),
+        "reason": reason,
+        "model_path": LOCAL_LIVE_MOUNT + LOCAL_LIVE_MODEL_PATH,
+        "model_name": LOCAL_LIVE_MODEL_ID,
+        "api_key": local_live_key(profile) if auth_ready else None,
+        "speech_server": server,
+        "in_call": (_local_live_active_call(profile or "") is not None) if in_call is None else in_call,
+        "last_request_at": (_local_live_last_request.get(_local_live_profile_key(profile))
+                            if last_request_at is None else last_request_at),
+    }
+
+
+@router.get("/local-live/status")
+async def get_local_live_status(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    _local_live_start_auth()
+    in_call = _local_live_active_call(profile or "") is not None
+    last_request_at = _local_live_last_request.get(_local_live_profile_key(profile))
+    try:
+        return {"ok": True, **(await asyncio.wait_for(
+            _run_scoped(profile, lambda: local_live_status(profile, in_call, last_request_at), _speech_server_executor),
+            timeout=SPEECH_SERVER_SETUP_TIMEOUT_S))}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Local Live status timed out", headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected("status", exc, feature="Local Live")
+
+
+@router.post("/local-live/key")
+async def post_local_live_key(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    """A new key for the voice server. This process drops the old one at once;
+    other dashboard processes accept it for up to 30 s (their verified cache)."""
+    response.headers["Cache-Control"] = "no-store"
+    _local_live_start_auth()
+    if not _local_live_auth_state.get("ready"):
+        raise HTTPException(status_code=503, detail=str(_local_live_auth_state.get("reason") or LOCAL_LIVE_UNAVAILABLE),
+                            headers={"Cache-Control": "no-store"})
+    if not _local_live_profile_can_carry_key(profile):
+        raise HTTPException(status_code=400, detail=LOCAL_LIVE_PROFILE_NAME_REASON, headers={"Cache-Control": "no-store"})
+    try:
+        key = await _run_scoped(profile, lambda: local_live_key(profile, rotate=True), _speech_server_executor)
+    except Exception as exc:
+        raise _unexpected("key", exc, feature="Local Live")
+    return {"ok": True, "api_key": key}
+
+
+@router.websocket("/local-live/socket")
+async def local_live_socket(ws: WebSocket) -> None:
+    """A Local Live call: relayed to the speech server like Classic voice, plus its turns."""
+
+    async def relay(refuse: Callable[[int, str], Any], url: str, key: str, profile: Optional[str]) -> None:
+        call = _LocalLiveCall(ws, _local_live_profile_key(profile), speaks=ws.query_params.get("mode") == "speak")
+        calls = _local_live_calls.setdefault(call.profile, [])
+        calls.append(call)
+        try:
+            await _speech_server_relay(ws, refuse, url, key, intercept=call.intercept, send_lock=call.send_lock)
+        finally:
+            call.close()
+            with contextlib.suppress(ValueError):
+                calls.remove(call)
+            if not calls:
+                _local_live_calls.pop(call.profile, None)
+
+    _local_live_start_auth()
+    await _speech_server_socket(ws, relay)
+
+
+def _local_live_request_profile(request: Request) -> str:
+    principal = getattr(request.state, "token_principal", None)
+    name = str(getattr(principal, "principal", "") or "")
+    if getattr(principal, "provider", None) != LOCAL_LIVE_PROVIDER_NAME or not name.startswith("local-live:"):
+        raise HTTPException(status_code=401, detail="The voice server's Local Live key is required",
+                            headers={"Cache-Control": "no-store"})
+    return name[len("local-live:"):]
+
+
+def _local_live_acquire(profile: str) -> None:
+    """Spends one of the profile's requests this minute, or answers 429."""
+    try:
+        _local_live_limiter.acquire(_local_live_profile_key(profile))
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+
+
+def _local_live_user_text(body: Any) -> str:
+    """The newest user message's text: the turn. Hermes keeps the history."""
+    messages = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'messages' field",
+                            headers={"Cache-Control": "no-store"})
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content = " ".join(part["text"] for part in content
+                               if isinstance(part, dict) and part.get("type") in ("text", "input_text")
+                               and isinstance(part.get("text"), str))
+        if not isinstance(content, str):
+            return ""
+        return " ".join(content.split())[:LOCAL_LIVE_MAX_TURN_CHARS]
+    return ""
+
+
+def _local_live_chunk(completion_id: str, created: int, delta: Dict[str, Any], finish: Optional[str] = None) -> str:
+    chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": LOCAL_LIVE_MODEL_ID,
+             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+@router.get("/local-live/v1/models")
+async def get_local_live_models(request: Request, response: Response) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    _local_live_start_auth()
+    profile = _local_live_request_profile(request)
+    _local_live_acquire(profile)
+    return {"object": "list", "data": [{"id": LOCAL_LIVE_MODEL_ID, "object": "model", "owned_by": "conduit"}]}
+
+
+@router.post("/local-live/v1/chat/completions")
+async def post_local_live_chat_completions(request: Request) -> Any:
+    """One turn of a Local Live call, asked by the user's voice server."""
+    from fastapi.responses import JSONResponse, StreamingResponse
+
+    _local_live_start_auth()
+    profile = _local_live_request_profile(request)
+    body = await _read_json_body(request, LOCAL_LIVE_MAX_BODY_BYTES)
+    text = _local_live_user_text(body)
+    # After validation, so a malformed request doesn't spend the budget.
+    _local_live_acquire(profile)
+    _local_live_last_request[_local_live_profile_key(profile)] = time.time()
+    stream = isinstance(body, dict) and body.get("stream") is True
+    completion_id = f"chatcmpl-conduit-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    call, speaks = _local_live_route(profile, text)
+    turn = await call.start_turn(text) if call is not None and text and not speaks else None
+
+    async def words() -> Any:
+        """The reply's text as the phone streams it; a fixed line with no call."""
+        if speaks:
+            # Read back word for word: the words are the reply already.
+            if text:
+                yield text
+            return
+        if turn is None:
+            # With a call open, an empty request (a warmup mid-call) gets
+            # nothing to say, not the no-call line.
+            if call is None:
+                yield LOCAL_LIVE_NO_CALL_REPLY
+            return
+        deadline = time.monotonic() + LOCAL_LIVE_TURN_MAX_S
+        try:
+            while True:
+                remaining = min(LOCAL_LIVE_TURN_IDLE_S, deadline - time.monotonic())
+                if remaining <= 0:
+                    return
+                try:
+                    kind, delta = await asyncio.wait_for(turn.frames.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return
+                if kind == "done":
+                    return
+                yield delta
+        finally:
+            # The server stopped listening (the user talked over the reply)
+            # or the reply ended: either way the phone hears it's over.
+            # Never awaited here: a closing generator can't suspend.
+            if call is not None and turn is not None:
+                _local_live_spawn(call.cancel_turn(turn))
+
+    if not stream:
+        reply = "".join([delta async for delta in words()])
+        return JSONResponse({
+            "id": completion_id, "object": "chat.completion", "created": created, "model": LOCAL_LIVE_MODEL_ID,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": reply}, "finish_reason": "stop"}],
+        }, headers={"Cache-Control": "no-store"})
+
+    async def events() -> Any:
+        try:
+            yield _local_live_chunk(completion_id, created, {"role": "assistant"})
+            async for delta in words():
+                yield _local_live_chunk(completion_id, created, {"content": delta})
+            yield _local_live_chunk(completion_id, created, {}, finish="stop")
+            yield "data: [DONE]\n\n"
+        finally:
+            # A dropped stream ends the phone's turn now, not when words() is
+            # finalized. Cancelling a finished turn does nothing.
+            if call is not None and turn is not None:
+                _local_live_spawn(call.cancel_turn(turn))
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
 
 
 # --- Voice transcripts -------------------------------------------------------
@@ -10104,6 +10820,7 @@ ROUTE_CAPABILITIES = (
     "room-images",
     "speech-server",
     "artifacts",
+    "local-live",
 )
 
 
