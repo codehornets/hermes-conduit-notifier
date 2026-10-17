@@ -2716,11 +2716,17 @@ def local_live_key(profile: Optional[str], rotate: bool = False) -> str:
 _local_live_verified: Dict[str, Tuple[str, float]] = {}
 _local_live_key_generation = 0
 LOCAL_LIVE_VERIFIED_TTL_S = 30.0
-# Keys checked against the files a minute (wrong ones included): past this,
-# an unknown key is refused without reading anything, so a flood of wrong
-# keys can't keep the event loop reading files. Keys verified lately still work.
+# Well-formed keys checked against the files a minute, per profile the key
+# names and in all: past this, an unknown key is refused without reading
+# anything, so a flood of wrong keys can't keep the event loop reading files.
+# Malformed keys never count, and keys verified lately still work.
+# Per profile as many as the one shared budget allowed before, so junk keys
+# naming one profile cost no less than they did.
 LOCAL_LIVE_KEY_CHECK_LIMIT = 60
+LOCAL_LIVE_KEY_CHECK_TOTAL_LIMIT = 300
 _local_live_key_check_limiter = _MintLimiter(LOCAL_LIVE_KEY_CHECK_LIMIT, 60.0, message="Too many Local Live key checks")
+_local_live_key_check_total_limiter = _MintLimiter(LOCAL_LIVE_KEY_CHECK_TOTAL_LIMIT, 60.0,
+                                                   message="Too many Local Live key checks")
 
 
 def local_live_profile_for_key(token: str) -> Optional[str]:
@@ -2730,16 +2736,26 @@ def local_live_profile_for_key(token: str) -> Optional[str]:
         cached = _local_live_verified.get(token)
     if cached is not None and now < cached[1]:
         return cached[0]
+    named = _local_live_key_profile(token)
+    if named is None:
+        return None
+    bucket = _local_live_profile_key(named)
     try:
-        mint = _local_live_key_check_limiter.acquire("")
+        mint = _local_live_key_check_limiter.acquire(bucket)
     except TokenError:
+        return None
+    try:
+        total = _local_live_key_check_total_limiter.acquire("")
+    except TokenError:
+        _local_live_key_check_limiter.release(bucket, mint)
         return None
     with _local_live_key_lock:
         generation = _local_live_key_generation
     profile = _local_live_check_key(token)
     if profile is not None:
         # A right key doesn't spend the budget wrong ones share.
-        _local_live_key_check_limiter.release("", mint)
+        _local_live_key_check_limiter.release(bucket, mint)
+        _local_live_key_check_total_limiter.release("", total)
         with _local_live_key_lock:
             if generation == _local_live_key_generation:
                 for stale in [k for k, (_, expiry) in _local_live_verified.items() if expiry <= now]:
@@ -2748,11 +2764,18 @@ def local_live_profile_for_key(token: str) -> Optional[str]:
     return profile
 
 
-def _local_live_check_key(token: str) -> Optional[str]:
+def _local_live_key_profile(token: str) -> Optional[str]:
+    """The profile a well-formed key names, without reading anything; else None."""
+    if not isinstance(token, str):
+        return None
     parts = token.split(".")
     if len(parts) != 3 or parts[0] != LOCAL_LIVE_KEY_PREFIX or not parts[2]:
         return None
-    profile = _local_live_profile_from_part(parts[1])
+    return _local_live_profile_from_part(parts[1])
+
+
+def _local_live_check_key(token: str) -> Optional[str]:
+    profile = _local_live_key_profile(token)
     if profile is None:
         return None
     try:
@@ -2859,6 +2882,12 @@ def _local_live_register_auth_thread() -> None:
     _local_live_auth_state["retry"] = False
     try:
         _local_live_register_auth()
+    except Exception as exc:  # noqa: BLE001 — Local Live off, never the dashboard
+        # Anything unforeseen (a provider registry that raises) gets a true
+        # reason and another try, not "starting" for good.
+        logger.warning("Local Live could not start its key check: %s", exc)
+        _local_live_auth_state.update(ready=False, reason=f"Local Live couldn't start ({type(exc).__name__})")
+        _local_live_retry_auth()
     finally:
         if _local_live_auth_state.get("retry"):
             with _local_live_auth_lock:
@@ -3026,7 +3055,14 @@ _local_live_tasks: set = set()
 def _local_live_spawn(coroutine: Any) -> None:
     task = asyncio.ensure_future(coroutine)
     _local_live_tasks.add(task)
-    task.add_done_callback(_local_live_tasks.discard)
+    task.add_done_callback(_local_live_task_done)
+
+
+def _local_live_task_done(task: "asyncio.Task[Any]") -> None:
+    _local_live_tasks.discard(task)
+    error = None if task.cancelled() else task.exception()
+    if error is not None:
+        logger.warning("Local Live background task failed: %r", error, exc_info=error)
 
 
 def _local_live_profile_key(profile: Optional[str]) -> str:
@@ -3113,6 +3149,9 @@ async def get_local_live_status(response: Response, profile: Optional[str] = Non
     except HTTPException as exc:
         exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
         raise
+    except TokenError as exc:
+        # A profile that can't be scoped: its own status, not a host failure.
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     except Exception as exc:
         raise _unexpected("status", exc, feature="Local Live")
 
@@ -3130,6 +3169,8 @@ async def post_local_live_key(response: Response, profile: Optional[str] = None)
         raise HTTPException(status_code=400, detail=LOCAL_LIVE_PROFILE_NAME_REASON, headers={"Cache-Control": "no-store"})
     try:
         key = await _run_scoped(profile, lambda: local_live_key(profile, rotate=True), _speech_server_executor)
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     except Exception as exc:
         raise _unexpected("key", exc, feature="Local Live")
     return {"ok": True, "api_key": key}
