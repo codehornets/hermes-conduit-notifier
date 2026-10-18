@@ -871,6 +871,22 @@ the server speaks Classic's replies in its own voice. Classic then uses one
 server for listening and speaking. While the reply plays, Classic may open
 its listening socket too, so start the server with `--num_pipelines 2`.
 
+### Local Live on the Apple Watch (plugin 0.48+)
+
+A Watch call on Local Live uses the same server, key and model address. The
+Watch runs the phone's Local Live session through the call grant's audio
+bridge (engine `local_live`, capability `watch-local-live`), and this host
+relays its audio and events to the speech server. When the server asks the
+model address for a reply, the turn goes to the Watch's call, and this host
+runs it as a spoken turn in a chat of the call's own ("Watch call"), since a
+Watch can't run a Hermes turn. Only the readiness check's ask goes to the
+Watch, which answers it with its greeting. A Watch that rejoins on the same
+grant sends `resume_session_id` (from `started.session_id`) and carries on in
+that chat. The grant's end closes the chat; it stays in Hermes' history.
+`GET /watch-audio/status?profile=` reports `engines.local_live`, and a grant
+lists `local_live` once Local Live is available for the profile and the
+dashboard serves Hermes' chats.
+
 ## Voice call transcripts
 
 Gemini Live, GPT-Live and Grok Live calls never run a Hermes turn, so nothing records

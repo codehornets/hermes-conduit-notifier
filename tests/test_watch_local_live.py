@@ -1,0 +1,625 @@
+"""Local Live on the Watch: the local_live engine of the Watch audio bridge.
+
+The Watch runs the phone's Local Live session over the bridge: its events
+and audio are relayed to the profile's speech server, the server's ask for
+each reply (the model address) reaches the Watch's call, and this host runs
+it in the call's own Hermes chat. Here with a stand-in speech server, a
+stand-in Hermes session API and a stand-in relay socket.
+"""
+
+import asyncio
+import base64
+import importlib.util
+import json
+import os
+import pathlib
+import threading
+import time
+import types
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _load_plugin_api():
+    spec = importlib.util.spec_from_file_location("conduit_plugin_api_watch_local_live",
+                                                  ROOT / "dashboard" / "plugin_api.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+api = _load_plugin_api()
+
+GRANT_ID = "G" * 22
+SECRET = bytes(range(32))
+UP = "watch-to-host"
+DOWN = "host-to-watch"
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+async def _until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out")
+        await asyncio.sleep(0.01)
+
+
+async def _frames(turn, timeout=5.0):
+    """A turn's words until its end, as the model address reads them."""
+    words = []
+    while True:
+        kind, text = await asyncio.wait_for(turn.frames.get(), timeout)
+        if kind == "done":
+            return "".join(words)
+        words.append(text)
+
+
+class FakeRelaySocket:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, message):
+        self.sent.append(message)
+
+
+class Watch:
+    def __init__(self):
+        self.sid = os.urandom(16)
+        keys = api.watch_audio_keys(SECRET, self.sid)
+        self.up, self.down = keys[UP], keys[DOWN]
+        self.counter = 0
+
+    def hello(self):
+        return bytes([4]) + self.sid + bytes([1])
+
+    def seal(self, kind, plain):
+        message = api.seal_watch_audio(self.up, UP, GRANT_ID, self.sid, kind, self.counter, plain)
+        self.counter += 1
+        return message
+
+    def control(self, payload):
+        return self.seal(3, json.dumps(payload).encode())
+
+    def event(self, payload):
+        return self.seal(2, json.dumps(payload).encode())
+
+    def received(self, socket):
+        out = []
+        for message in socket.sent:
+            try:
+                kind, _, plain = api.open_watch_audio(self.down, DOWN, GRANT_ID, self.sid, message)
+            except api.WatchAudioError:
+                continue
+            out.append((kind, json.loads(plain) if kind in (2, 3) else plain))
+        return out
+
+    def events(self, socket, kind=None):
+        found = [value for k, value in self.received(socket) if k in (2, 3)]
+        return [value for value in found if kind is None or value.get("type") == kind]
+
+
+class SpeechServer:
+    def __init__(self):
+        self.connects = []
+        self.sockets = []
+
+    async def connect(self, url, headers):
+        socket = SpeechSocket()
+        self.connects.append((url, headers))
+        self.sockets.append(socket)
+        return socket
+
+
+class SpeechSocket:
+    def __init__(self):
+        self.incoming = asyncio.Queue()
+        self.received = []
+        self.close_code = None
+        self.close_reason = ""
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        message = await self.incoming.get()
+        if message is None:
+            raise StopAsyncIteration
+        return message
+
+    def push(self, event):
+        self.incoming.put_nowait(json.dumps(event))
+
+    async def send(self, message):
+        if self.closed:
+            raise ConnectionError("closed")
+        self.received.append(json.loads(message))
+
+    async def close(self):
+        if not self.closed:
+            self.closed = True
+            self.close_code = 1000
+            self.incoming.put_nowait(None)
+
+
+class Hermes:
+    """Hermes' session API as the plugin calls it."""
+
+    def __init__(self):
+        self.calls = []
+        self.transport = None
+        self.sessions = 0
+        self.redirect_status = "redirected"
+        self.submit_status = ""
+
+    def dispatch(self, request, transport=None):
+        self.transport = transport
+        method, params = request["method"], request["params"]
+        self.calls.append((method, dict(params)))
+        if method == "session.create":
+            self.sessions += 1
+            return {"id": request["id"], "result": {"session_id": f"s{self.sessions}",
+                                                    "stored_session_id": f"stored{self.sessions}"}}
+        if method == "session.redirect":
+            return {"id": request["id"], "result": {"status": self.redirect_status}}
+        if method == "prompt.submit":
+            return {"id": request["id"], "result": {"status": self.submit_status}}
+        return {"id": request["id"], "result": {}}
+
+    def emit(self, kind, payload, sid="s1"):
+        self.transport.write({"jsonrpc": "2.0", "method": "event",
+                              "params": {"type": kind, "session_id": sid, "payload": payload}})
+
+    def prompts(self):
+        return [params for method, params in self.calls if method == "prompt.submit"]
+
+    def redirects(self):
+        return [params for method, params in self.calls if method == "session.redirect"]
+
+
+@pytest.fixture()
+def call(monkeypatch):
+    speech = SpeechServer()
+    hermes = Hermes()
+    monkeypatch.setattr(api, "_connect_speech_server", speech.connect)
+    monkeypatch.setattr(api, "speech_server_target", lambda settings=None: ("ws://10.0.0.5:8765/v1/realtime", "tok"))
+    monkeypatch.setattr(api, "local_live_watch_status",
+                        lambda profile: {"runtime": "ready", "source": "local_live", "reason": None})
+    monkeypatch.setattr(api, "_watch_chat_session_api", lambda: hermes)
+    monkeypatch.setattr(api, "_speech_server_limiter", api._MintLimiter(100, 60.0))
+    monkeypatch.setattr(api, "_speech_server_open", {})
+    monkeypatch.setattr(api, "_local_live_calls", {})
+    return types.SimpleNamespace(speech=speech, hermes=hermes)
+
+
+def _bridge(profile=None):
+    grant = types.SimpleNamespace(grant_id=GRANT_ID, profile=profile, relay_url="https://relay.example",
+                                  credential="c", expires_at=time.monotonic() + 600,
+                                  closed=types.SimpleNamespace(is_set=lambda: False))
+    return api._WatchAudioBridge(grant, SECRET, slots=api._WatchAudioSlots(4))
+
+
+async def _attach(bridge):
+    socket = FakeRelaySocket()
+    bridge.loop = asyncio.get_running_loop()
+    bridge.wake = asyncio.Event()
+    bridge.send_lock = asyncio.Lock()
+    bridge.socket = socket
+    return socket
+
+
+async def _start(bridge, socket, watch, **extra):
+    await bridge._handle(watch.hello())
+    await bridge._handle(watch.control({"type": "start", "engine": "local_live", **extra}))
+    await _until(lambda: watch.events(socket, "started") or watch.events(socket, "error"))
+    return (watch.events(socket, "started") or watch.events(socket, "error"))[-1]
+
+
+# --- Readiness ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("live,sessions,ready", [(False, True, False), (True, False, False), (True, True, True)])
+def test_the_engine_is_ready_with_local_live_and_hermes_chats(monkeypatch, live, sessions, ready):
+    monkeypatch.setattr(api, "_local_live_auth_state", {"ready": True, "reason": None, "started": True})
+    monkeypatch.setattr(api, "speech_server_status", lambda: {"available": live,
+                                                              "reason": None if live else "No speech server"})
+    monkeypatch.setattr(api, "local_live_key", lambda *args, **kwargs: pytest.fail("a status check makes no key"))
+    monkeypatch.setattr(api, "_hermes_session_api", lambda: object() if sessions else None)
+    monkeypatch.setattr(api, "_watch_chats_can_load", lambda: False)
+    monkeypatch.setattr(api, "_watch_chat_session_api", lambda: pytest.fail("a status check never imports"))
+    state = api.local_live_watch_status(None)
+    assert (state["runtime"] == "ready") is ready
+    if not ready:
+        assert state["reason"]
+    runtime = types.SimpleNamespace(python=lambda: None, status=lambda: {"runtime": "missing"})
+    engines = api._watch_audio_grant_engines(runtime, None)
+    assert engines == (["grok", "local_live"] if ready else ["grok"])
+    assert api.watch_audio_status(runtime)["engines"]["local_live"] == state
+
+
+def test_the_engine_says_why_local_live_is_off(monkeypatch):
+    monkeypatch.setattr(api, "_local_live_auth_state", {"ready": False, "reason": "No token routes", "started": True})
+    assert api.local_live_watch_status(None)["reason"] == "No token routes"
+    monkeypatch.setattr(api, "_local_live_auth_state", {"ready": True, "reason": None, "started": True})
+    assert api.local_live_watch_status("bad name!")["reason"] == api.LOCAL_LIVE_PROFILE_NAME_REASON
+
+
+def test_capability_is_advertised():
+    assert "watch-local-live" in api.ROUTE_CAPABILITIES
+
+
+# --- The call -------------------------------------------------------------------
+
+
+def test_the_watch_runs_its_local_live_session_through_the_bridge(call):
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        watch = Watch()
+        started = await _start(bridge, socket, watch)
+        assert started == {"type": "started", "engine": "local_live", "voice": None, "input_rate": 24000,
+                           "output_rate": 24000, "session_id": "stored1", "resumed": False}
+        assert call.speech.connects == [("ws://10.0.0.5:8765/v1/realtime", {"Authorization": "Bearer tok"})]
+        [created] = [params for method, params in call.hermes.calls if method == "session.create"]
+        assert created["title"] == "Watch call" and created["source"] == "desktop"
+        upstream = call.speech.sockets[0]
+
+        # The Watch's own session.update goes to the server unchanged, its
+        # keepalive stays here, and its microphone is appended.
+        update = {"type": "session.update", "session": {"type": "realtime"}}
+        await bridge._handle(watch.event(update))
+        await bridge._handle(watch.event({"type": "conduit.ping"}))
+        await bridge._handle(watch.seal(1, b"\x01\x00\x02\x00"))
+        await _until(lambda: len(upstream.received) == 2)
+        assert upstream.received[0] == update
+        assert upstream.received[1] == {"type": "input_audio_buffer.append",
+                                        "audio": base64.b64encode(b"\x01\x00\x02\x00").decode()}
+
+        # The server's events reach the Watch, its audio as audio.
+        upstream.push({"type": "session.updated"})
+        upstream.push({"type": "response.output_audio.delta", "delta": base64.b64encode(b"\x10\x27" * 240).decode()})
+        await _until(lambda: watch.events(socket, "session.updated") and any(k == 1 for k, _ in watch.received(socket)))
+        assert b"".join(v for k, v in watch.received(socket) if k == 1) == b"\x10\x27" * 240
+
+        # The call answers the model address.
+        assert api._local_live_active_call("") is bridge.session.call
+
+        await bridge._handle(watch.control({"type": "end"}))
+        await _until(lambda: watch.events(socket, "ended"))
+        assert watch.events(socket, "ended") == [{"type": "ended", "engine": "local_live", "reason": "ended"}]
+        assert upstream.closed and api._speech_server_open == {} and bridge.slots.used == 0
+        assert api._local_live_calls == {}
+        # The chat outlives the stream, for a rejoin; the grant's end closes it.
+        assert list(bridge.call_chats) == ["stored1"]
+
+    _run(scenario())
+
+
+def test_the_readiness_check_goes_to_the_watch_and_its_greeting_back(call):
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        watch = Watch()
+        await _start(bridge, socket, watch)
+        marker = "conduit-ready-0f1e"
+        live, read_back = api._local_live_route("", marker)
+        assert live is bridge.session.call and read_back is False
+        turn = await live.start_turn(marker)
+        await _until(lambda: watch.events(socket, "conduit.turn"))
+        [ask] = watch.events(socket, "conduit.turn")
+        assert ask == {"type": "conduit.turn", "turn_id": turn.turn_id, "text": marker}
+        await bridge._handle(watch.event({"type": "conduit.turn.delta", "turn_id": turn.turn_id, "text": "Hi there."}))
+        await bridge._handle(watch.event({"type": "conduit.turn.done", "turn_id": turn.turn_id}))
+        assert await _frames(turn) == "Hi there."
+        # Never Hermes', and never the server's.
+        assert call.hermes.prompts() == []
+        assert not any(event["type"].startswith("conduit.") for event in call.speech.sockets[0].received)
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_turn_runs_in_the_calls_chat_and_its_reply_streams_back_spoken(call):
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        await _start(bridge, socket, Watch())
+        live = bridge.session.call
+        turn = await live.start_turn("  What's the   weather? ")
+        await _until(lambda: call.hermes.prompts())
+        [prompt] = call.hermes.prompts()
+        assert prompt == {"session_id": "s1", "text": "What's the weather?", "surface": "voice-live",
+                          "voice_turn": True}
+        call.hermes.emit("message.start", {})
+        call.hermes.emit("message.delta", {"text": "Sunny. "})
+        call.hermes.emit("message.delta", {"text": "**It is** 20 degrees, see [the forecast](https://x.example).\n"})
+        call.hermes.emit("message.delta", {"text": "```\nweather --now\n```\n"})
+        # Another chat's events aren't this call's.
+        call.hermes.emit("message.delta", {"text": "Not mine."}, sid="s9")
+        call.hermes.emit("message.complete", {"text": "whole reply", "status": "complete"})
+        assert await _frames(turn) == ("Sunny. It is 20 degrees, see the forecast. "
+                                       f"{api.LOCAL_LIVE_WATCH_CODE_NOTE} ")
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_reply_that_comes_whole_is_spoken_whole(call):
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        await _start(bridge, socket, Watch())
+        turn = await bridge.session.call.start_turn("Hello")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("message.complete", {"text": "Hello! How can I help?"})
+        assert await _frames(turn) == "Hello! How can I help?"
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_words_spoken_over_a_running_reply_correct_it(call):
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        await _start(bridge, socket, Watch())
+        live = bridge.session.call
+        first = await live.start_turn("Book a table for two")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("message.delta", {"text": "Sure, booking for two. "})
+        assert (await asyncio.wait_for(first.frames.get(), 5)) == ("delta", "Sure, booking for two. ")
+        # The server let the first turn go (the user talked over it) and asks again.
+        second = await live.start_turn("Make it three")
+        assert (await asyncio.wait_for(first.frames.get(), 5)) == ("done", "")
+        await _until(lambda: call.hermes.redirects())
+        assert call.hermes.redirects() == [{"session_id": "s1", "text": "Make it three"}]
+        assert len(call.hermes.prompts()) == 1
+        await _until(lambda: not bridge.session.runner.reply.correcting)
+        # The cut-off reply's notice isn't the answer; what follows is.
+        call.hermes.emit("message.interrupted", {})
+        call.hermes.emit("message.delta", {"text": "Okay, three people."})
+        call.hermes.emit("message.complete", {"text": "Okay, three people."})
+        assert await _frames(second) == "Okay, three people."
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_correction_with_nothing_running_is_a_turn_of_its_own(call):
+    call.hermes.redirect_status = "rejected"
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        await _start(bridge, socket, Watch())
+        live = bridge.session.call
+        first = await live.start_turn("One")
+        await _until(lambda: call.hermes.prompts())
+        second = await live.start_turn("Two")
+        await _until(lambda: len(call.hermes.prompts()) == 2)
+        assert call.hermes.prompts()[1]["text"] == "Two" and len(call.hermes.redirects()) == 1
+        call.hermes.emit("message.complete", {"text": "Two it is."})
+        assert await _frames(second) == "Two it is."
+        assert await _frames(first) == ""
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_cancelled_turn_stops_being_spoken_and_its_reply_goes_on_in_the_chat(call):
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        await _start(bridge, socket, Watch())
+        live = bridge.session.call
+        turn = await live.start_turn("Tell me a story")
+        await _until(lambda: call.hermes.prompts())
+        await live.cancel_turn(turn)
+        call.hermes.emit("message.delta", {"text": "Once upon a time. "})
+        assert await _frames(turn) == ""
+        assert bridge.session.runner.turn is None and bridge.session.runner.reply is not None
+        assert not any(method == "session.interrupt" for method, _ in call.hermes.calls)
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("event,line", [("approval.request", api.LOCAL_LIVE_WATCH_NEEDS_INPUT_LINE),
+                                        ("error", api.LOCAL_LIVE_WATCH_ERROR_LINE)])
+def test_a_question_or_error_from_hermes_is_said_instead(call, event, line):
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        await _start(bridge, socket, Watch())
+        turn = await bridge.session.call.start_turn("Delete my files")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit(event, {"message": "x"})
+        assert await _frames(turn) == line
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_words_hermes_steers_into_a_typed_turn_are_said_so(call):
+    call.hermes.submit_status = "queued"
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        await _start(bridge, socket, Watch())
+        turn = await bridge.session.call.start_turn("And then?")
+        assert await _frames(turn) == api.LOCAL_LIVE_WATCH_QUEUED_LINE
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_rejoining_watch_carries_on_in_the_same_chat_and_the_grants_end_closes_it(call):
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        await _start(bridge, socket, Watch())
+        await bridge._handle(bytes([0, 2]))  # the Watch's socket went
+        assert api._local_live_calls == {}
+        again = Watch()
+        started = await _start(bridge, socket, again, resume_session_id="stored1")
+        assert started["session_id"] == "stored1" and started["resumed"] is True
+        assert call.hermes.sessions == 1
+        await bridge._end_session("test")
+        fresh = Watch()
+        started = await _start(bridge, socket, fresh)
+        assert started["session_id"] == "stored2" and started["resumed"] is False
+        await bridge._end_session("test")
+        return bridge
+
+    bridge = _run(scenario())
+    chats = dict(bridge.call_chats)
+    bridge.stop_requested.set()
+    bridge._run()
+    assert bridge.call_chats == {}
+    # Closed in the background, so the bridge's end doesn't wait on Hermes.
+    deadline = time.monotonic() + 5
+    while not all(chat.closed for chat in chats.values()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert all(chat.closed for chat in chats.values())
+    assert ("session.close", {"session_id": "s1"}) in call.hermes.calls
+
+
+def test_a_watch_call_waits_while_another_local_live_call_runs_on_the_profile(call):
+    class PhoneCall:
+        speaks = False
+        closed = False
+        profile = ""
+
+    phone = PhoneCall()
+    api._local_live_register(phone)
+    try:
+        async def scenario():
+            bridge = _bridge()
+            socket = await _attach(bridge)
+            error = await _start(bridge, socket, Watch())
+            assert error["type"] == "error" and error["code"] == "busy"
+            # Refused before it dialled the server or opened a chat.
+            assert call.speech.connects == [] and call.hermes.sessions == 0
+
+        _run(scenario())
+    finally:
+        api._local_live_unregister(phone)
+
+
+def test_a_profile_call_is_filed_under_its_profile(call, monkeypatch):
+    monkeypatch.setattr(api, "_profile_scope", lambda profile: api.nullcontext())
+
+    async def scenario():
+        bridge = _bridge(profile="Work")
+        socket = await _attach(bridge)
+        await _start(bridge, socket, Watch())
+        assert api._local_live_active_call("Work") is bridge.session.call
+        assert api._local_live_active_call("") is None
+        [created] = [params for method, params in call.hermes.calls if method == "session.create"]
+        assert created["profile"] == "Work"
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_server_that_cant_be_reached_is_told_to_the_watch(call, monkeypatch):
+    async def refuse(url, headers):
+        raise api.RealtimeUpstreamRefused(403)
+
+    monkeypatch.setattr(api, "_connect_speech_server", refuse)
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        error = await _start(bridge, socket, Watch())
+        assert error["type"] == "error" and error["code"] == "refused"
+        await _until(lambda: bridge.session is None)
+        assert api._speech_server_open == {} and api._local_live_calls == {}
+        # No chat for a call that never reached its server.
+        assert bridge.call_chats == {} and call.hermes.sessions == 0
+
+    _run(scenario())
+
+
+def test_local_live_off_for_the_profile_refuses_the_start(call, monkeypatch):
+    monkeypatch.setattr(api, "local_live_watch_status",
+                        lambda profile: {"runtime": "missing", "source": None, "reason": "No speech server is set"})
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        error = await _start(bridge, socket, Watch())
+        assert error["type"] == "error" and error["message"] == "No speech server is set"
+        assert call.speech.connects == []
+
+    _run(scenario())
+
+
+def test_turns_cross_from_the_dashboards_loop_to_a_bridge_on_its_own_thread(call):
+    """In the dashboard the model address and the bridge run on two loops."""
+    bridge_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=bridge_loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        async def on_bridge():
+            bridge = _bridge()
+            socket = await _attach(bridge)
+            watch = Watch()
+            await _start(bridge, socket, watch)
+            return bridge, socket, watch
+
+        bridge, socket, watch = asyncio.run_coroutine_threadsafe(on_bridge(), bridge_loop).result(10)
+
+        async def on_dashboard():
+            live, _ = api._local_live_route("", "conduit-ready-1")
+            check = await live.start_turn("conduit-ready-1")
+            await _until(lambda: watch.events(socket, "conduit.turn"))
+            asyncio.run_coroutine_threadsafe(bridge._handle(
+                watch.event({"type": "conduit.turn.done", "turn_id": check.turn_id})), bridge_loop).result(5)
+            assert await _frames(check) == ""
+            turn = await live.start_turn("Hi")
+            await _until(lambda: call.hermes.prompts())
+            # Hermes writes from its own thread.
+            threading.Thread(target=call.hermes.emit, args=("message.complete", {"text": "Hello."})).start()
+            assert await _frames(turn) == "Hello."
+
+        asyncio.run(on_dashboard())
+        asyncio.run_coroutine_threadsafe(bridge._end_session("test"), bridge_loop).result(10)
+    finally:
+        bridge_loop.call_soon_threadsafe(bridge_loop.stop)
+        thread.join(5)
+
+
+# --- Sentences ------------------------------------------------------------------
+
+
+def _spoken(*deltas):
+    text = api._SpokenText()
+    return "".join(text.feed(delta) for delta in deltas) + "|" + text.finish()
+
+
+def test_markdown_is_spoken_as_plain_sentences():
+    assert _spoken("## Summary\n", "- **Bold** item with a [link](https://example.com/x)\n",
+                   "1. Step one is `ls` at https://example.com.\n") == \
+        "Summary.Bold item with a link.Step one is ls at.|"
+
+
+def test_code_and_tables_stay_in_the_chat_said_once():
+    spoken = _spoken("Here you go:\n```python\nprint('a. b')\n```\n", "| a | b |\n|---|---|\n| 1 | 2 |\n",
+                     "```\nmore\n```\nThat's all.")
+    assert spoken.count(api.LOCAL_LIVE_WATCH_CODE_NOTE) == 1
+    assert spoken == f"Here you go: {api.LOCAL_LIVE_WATCH_CODE_NOTE}|That's all."
+
+
+def test_numbers_dont_end_sentences_and_a_long_run_is_cut_on_a_space():
+    assert _spoken("It was 3.5 percent. ", "Then") == "It was 3.5 percent.|Then."
+    text = api._SpokenText()
+    out = text.feed("word " * 120)
+    assert out and len(out) <= api.LOCAL_LIVE_WATCH_MAX_SENTENCE_CHARS

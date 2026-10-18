@@ -2255,6 +2255,28 @@ _speech_server_auth_failure_limiter = _MintLimiter(SPEECH_SERVER_AUTH_FAILURE_LI
                                                    message="Too many refused speech server connections")
 _speech_server_open: Dict[str, int] = {}
 
+_speech_server_open_lock = threading.Lock()
+
+
+def _speech_server_take_open(key: str) -> bool:
+    """A slot among the speech server connections open on this host, the
+    phone's relays and Watch calls together (they run on several threads)."""
+    with _speech_server_open_lock:
+        if _speech_server_open.get(key, 0) >= SPEECH_SERVER_MAX_OPEN_PER_PROFILE or \
+                sum(_speech_server_open.values()) >= SPEECH_SERVER_MAX_OPEN:
+            return False
+        _speech_server_open[key] = _speech_server_open.get(key, 0) + 1
+        return True
+
+
+def _speech_server_give_open(key: str) -> None:
+    with _speech_server_open_lock:
+        remaining = _speech_server_open.get(key, 1) - 1
+        if remaining > 0:
+            _speech_server_open[key] = remaining
+        else:
+            _speech_server_open.pop(key, None)
+
 
 def _speech_server_settings() -> Dict[str, Any]:
     """The profile's ``voice.speech_server`` block (profile-scoped by _run_scoped), or {}."""
@@ -2532,19 +2554,13 @@ async def _speech_server_socket(ws: WebSocket, relay: Callable[..., Any]) -> Non
         return
 
     open_key = _limiter_key(profile)
-    if _speech_server_open.get(open_key, 0) >= SPEECH_SERVER_MAX_OPEN_PER_PROFILE or \
-            sum(_speech_server_open.values()) >= SPEECH_SERVER_MAX_OPEN:
+    if not _speech_server_take_open(open_key):
         await refuse(SPEECH_SERVER_CLOSE_RATE_LIMITED, "Too many speech server connections are open on this host")
         return
-    _speech_server_open[open_key] = _speech_server_open.get(open_key, 0) + 1
     try:
         await relay(refuse, url, key, profile)
     finally:
-        remaining = _speech_server_open.get(open_key, 1) - 1
-        if remaining > 0:
-            _speech_server_open[open_key] = remaining
-        else:
-            _speech_server_open.pop(open_key, None)
+        _speech_server_give_open(open_key)
 
 
 async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any], url: str, key: str,
@@ -3079,7 +3095,27 @@ class _LocalLiveCall:
         self.turns.clear()
 
 
-_local_live_calls: Dict[str, List[_LocalLiveCall]] = {}
+_local_live_calls: Dict[str, List[Any]] = {}
+# Registered from the dashboard's loop (the phone's sockets) and from Watch
+# bridges' threads (_LocalLiveWatchCall); read anywhere.
+_local_live_calls_lock = threading.Lock()
+
+
+def _local_live_register(call: Any) -> None:
+    with _local_live_calls_lock:
+        _local_live_calls.setdefault(call.profile, []).append(call)
+
+
+def _local_live_unregister(call: Any) -> None:
+    with _local_live_calls_lock:
+        calls = _local_live_calls.get(call.profile)
+        if calls is None:
+            return
+        with contextlib.suppress(ValueError):
+            calls.remove(call)
+        if not calls:
+            _local_live_calls.pop(call.profile, None)
+
 # How long a read-back sentence can be asked for again (a server's retry).
 LOCAL_LIVE_RETRY_WINDOW_S = 30.0
 # Requests per profile a minute: a speak socket asks once a sentence, a
@@ -3115,17 +3151,25 @@ def _local_live_profile_key(profile: Optional[str]) -> str:
     return "" if name.lower() in ("", "current") else name
 
 
-def _local_live_open_calls(profile: str) -> List[_LocalLiveCall]:
-    return [call for call in _local_live_calls.get(_local_live_profile_key(profile), []) if not call.closed]
+# The phone's _LocalLiveCall or a Watch's _LocalLiveWatchCall: the same
+# take_words / start_turn / cancel_turn / speaks / closed surface.
+_LocalLiveAnyCall = Any
 
 
-def _local_live_active_call(profile: str) -> Optional[_LocalLiveCall]:
+def _local_live_open_calls(profile: str) -> List[_LocalLiveAnyCall]:
+    # A copy taken under the lock: Watch bridges register from their own threads.
+    with _local_live_calls_lock:
+        calls = list(_local_live_calls.get(_local_live_profile_key(profile), ()))
+    return [call for call in calls if not call.closed]
+
+
+def _local_live_active_call(profile: str) -> Optional[_LocalLiveAnyCall]:
     """The newest live call (not a speak socket), where turns go."""
     calls = [call for call in _local_live_open_calls(profile) if not call.speaks]
     return calls[-1] if calls else None
 
 
-def _local_live_route(profile: str, text: str) -> Tuple[Optional[_LocalLiveCall], bool]:
+def _local_live_route(profile: str, text: str) -> Tuple[Optional[_LocalLiveAnyCall], bool]:
     """Who answers a request: (call, read back). Words a speak socket sent are
     read back; anything else is a live call's turn. With no live call but a
     speak socket open, the request is read back too."""
@@ -3225,16 +3269,12 @@ async def local_live_socket(ws: WebSocket) -> None:
 
     async def relay(refuse: Callable[[int, str], Any], url: str, key: str, profile: Optional[str]) -> None:
         call = _LocalLiveCall(ws, _local_live_profile_key(profile), speaks=ws.query_params.get("mode") == "speak")
-        calls = _local_live_calls.setdefault(call.profile, [])
-        calls.append(call)
+        _local_live_register(call)
         try:
             await _speech_server_relay(ws, refuse, url, key, intercept=call.intercept, send_lock=call.send_lock)
         finally:
             call.close()
-            with contextlib.suppress(ValueError):
-                calls.remove(call)
-            if not calls:
-                _local_live_calls.pop(call.profile, None)
+            _local_live_unregister(call)
 
     _local_live_start_auth()
     await _speech_server_socket(ws, relay)
@@ -7109,7 +7149,7 @@ def open_watch_grant(body: Any, *, profile: Optional[str], path: Any = None,
     call's previous grant in ``carry_jobs_from``: its jobs move to the new
     grant (_carry_watch_jobs). live_token is granted only where this profile
     has a Gemini key to mint with. ``audio`` (true) adds the call's audio
-    bridge for GPT-Live and Grok (Watch audio, below), where the relay has it.
+    bridge for GPT-Live, Grok and Local Live (Watch audio, below), where the relay has it.
     ``job_profiles`` names the user's other profiles the call's jobs may run
     on ("for Fam, …"), as the phone's own jobs may. Like every route here it
     sits behind the dashboard's own auth, whose holder can already start
@@ -7258,7 +7298,7 @@ def open_watch_grant(body: Any, *, profile: Optional[str], path: Any = None,
         **({"job_profiles": list(grant.jobs.profiles)} if grant.jobs is not None else {}),
         **({"jobs_carried_from": carried_from.grant_id} if carried_from is not None else {}),
         **({"audio": {"url": grant.audio.watch_url(), "version": WATCH_AUDIO_VERSION,
-                      "engines": _watch_audio_grant_engines(grant.audio.runtime)}} if grant.audio is not None else {}),
+                      "engines": _watch_audio_grant_engines(grant.audio.runtime, profile)}} if grant.audio is not None else {}),
     }
 
 
@@ -8520,22 +8560,25 @@ def run_watch_job_call(grant: "_WatchGrant", tool: str, args: Dict[str, Any]) ->
 # grant, stream and type. A stream id is taken once per grant: its keys
 # would repeat nonces.
 #
-# Control, Watch to host: {"type": "start", "engine": "gpt_live" | "grok",
-# "voice"?, "briefing"?, "greeting"?, "call_opening"?, "history"?} and {"type": "end"}. Host
-# to Watch: "started" (engine, model, voice, input_rate, output_rate; for
-# GPT-Live also briefing_applied and greeting_applied: true whenever the model
-# was told to speak first, for a greeting or call_opening), "ended" (reason) and
+# Control, Watch to host: {"type": "start", "engine": "gpt_live" | "grok" | "local_live",
+# "voice"?, "briefing"?, "greeting"?, "call_opening"?, "history"?, "resume_session_id"?}
+# and {"type": "end"}. Host to Watch: "started" (engine, model, voice,
+# input_rate, output_rate; for GPT-Live also briefing_applied and
+# greeting_applied: true whenever the model was told to speak first, for a
+# greeting or call_opening; for Local Live session_id, the call's chat, and
+# resumed), "ended" (reason) and
 # "error" (code, message). The Watch waits for "started" before it sends
 # audio or events. It owns the conversation, as the phone does: it speaks each
 # engine's own events (GPT-Live's frameless ones, Grok's realtime ones), and
-# its tools and jobs go through the grant's lookups. The host adds only what
-# has to stay here: the sign-ins, Grok's pacing, and WebRTC for GPT-Live,
+# its tools and jobs go through the grant's lookups (Local Live's turns are
+# Hermes' own, run here: Local Live on the Watch, below). The host adds only
+# what has to stay here: the sign-ins, Grok's pacing, and WebRTC for GPT-Live,
 # which runs in watch_audio_helper.py under a Python with aiortc: this
 # plugin's own environment, made when Conduit asks (/watch-audio/prepare),
 # or Hermes' own Python when it already has aiortc.
 
 WATCH_AUDIO_VERSION = 1
-WATCH_AUDIO_ENGINES = ("gpt_live", "grok")
+WATCH_AUDIO_ENGINES = ("gpt_live", "grok", "local_live")
 WATCH_AUDIO_UP = "watch-to-host"
 WATCH_AUDIO_DOWN = "host-to-watch"
 WATCH_AUDIO_AUDIO = 1
@@ -9392,7 +9435,910 @@ class _GrokWatchSession(_WatchAudioSession):
             await upstream.send(text)
 
 
-_WATCH_AUDIO_SESSIONS = {"gpt_live": _GptLiveWatchSession, "grok": _GrokWatchSession}
+# --- Local Live on the Watch ---------------------------------------------------
+#
+# A Watch call on Local Live is the phone's call, over the call grant's audio
+# bridge instead of /local-live/socket: the same speech server (the profile's
+# voice.speech_server), the same session.update, readiness check and greeting
+# (the Watch runs the iPhone's own LocalLiveSession), and the same model
+# address (/local-live/v1 with the profile's Local Live key). This host relays
+# the Watch's audio and events to the server and the server's back, paced to
+# real time, as it does for Grok.
+#
+# Only who answers a turn differs. On the phone the plugin sends conduit.turn
+# to Conduit, which runs it in the call's chat. A Watch can't run a Hermes
+# turn, so this host does, in process, in a chat of the call's own (Hermes'
+# session API, as Watch jobs use): the server's ask for a reply reaches the
+# Watch's call through _local_live_route, the words go to the chat as a
+# spoken turn, and Hermes' reply streams back to the server as it's written.
+# The readiness check's ask (the Watch's marker words) goes to the Watch,
+# which answers it, with the greeting or nothing, as the phone does.
+#
+#   Watch --PCM 24 kHz, its events-->  host  --relayed-->  speech server
+#   speech server --/local-live/v1/chat/completions-->  this call's turn
+#   host --prompt.submit-->  the call's chat;  message.delta -->  the server
+#
+# A turn's reply follows LocalLiveTurnRunner's rules: words spoken while a
+# reply is still being written correct it (session.redirect), a turn the
+# server lets go only stops being spoken, and what's written to be seen (code,
+# tables, links) stays in the chat. A rejoining Watch (a new stream on the
+# same grant) names the call's chat in its start (resume_session_id) and
+# carries on in it; the grant's end closes it, and it stays in Hermes'
+# history.
+
+LOCAL_LIVE_WATCH_ENGINE = "local_live"
+# The OpenAI Realtime PCM rate both ways, as the phone's Local Live call.
+LOCAL_LIVE_WATCH_RATE = 24_000
+# What the Watch's readiness check asks with (LocalLiveProtocol.readinessMarker):
+# that ask goes to the Watch, never to Hermes.
+LOCAL_LIVE_MARKER_PREFIX = "conduit-ready-"
+LOCAL_LIVE_WATCH_TITLE = "Watch call"
+LOCAL_LIVE_WATCH_CHAT_TIMEOUT_S = 25.0
+# Chats one grant may open: a call, and calls after it on the same grant.
+LOCAL_LIVE_WATCH_CHATS_PER_GRANT = 8
+# As Conduit's spoken turns (AppState.spokenPromptSurface): Hermes answers for
+# speech, on its voice model when one is set.
+LOCAL_LIVE_WATCH_SURFACE = "voice-live"
+# Spoken by the user's speech server instead of a reply (LocalLiveTurnRunner's lines).
+LOCAL_LIVE_WATCH_FAILURE_LINE = "Hermes couldn't take that just now."
+LOCAL_LIVE_WATCH_ERROR_LINE = "Hermes ran into a problem with that."
+LOCAL_LIVE_WATCH_NEEDS_INPUT_LINE = "Hermes needs your answer in the chat before it can go on."
+LOCAL_LIVE_WATCH_STEERED_LINE = "Hermes added this to the reply already running in the chat."
+LOCAL_LIVE_WATCH_QUEUED_LINE = "Hermes queued this in the chat. Its reply will appear there."
+LOCAL_LIVE_WATCH_CODE_NOTE = "I've put the code in the chat."
+LOCAL_LIVE_WATCH_NO_SESSIONS = ("Local Live on the Watch needs this dashboard to serve Hermes' chats "
+                                "(update Hermes, or open a chat in Conduit once)")
+# Hermes' notice for a reply a correction cut off (MessageNormalizer).
+_LOCAL_LIVE_INTERRUPTION_NOTICE = "[this response was interrupted by a user correction.]"
+_LOCAL_LIVE_WATCH_QUESTIONS = ("approval.request", "clarify.request", "sudo.request", "secret.request")
+_LOCAL_LIVE_WATCH_WRITING = ("message.start", "reasoning.delta", "message.reasoning", "message.reasoning.delta",
+                             "tool.start", "tool.complete")
+_LOCAL_LIVE_WATCH_INTERRUPTED = ("message.interrupted", "session.interrupted")
+# Sentences, for keeping what's written to be seen out of what's spoken.
+_LOCAL_LIVE_WATCH_BOUNDARY = re.compile(r"(?<!\d)[.!?…]+[\"')\]]*(?=\s)|\n")
+_LOCAL_LIVE_WATCH_LINK = re.compile(r"(!?)\[([^\]\n]*)\]\([^)\n]*\)")
+_LOCAL_LIVE_WATCH_URL = re.compile(r"(?:https?://|www\.)[^\s]*[^\s.,;:!?)\]'\"]")
+_LOCAL_LIVE_WATCH_SPACE_BEFORE_MARK = re.compile(r"\s+([.,;:!?])")
+_LOCAL_LIVE_WATCH_HTML = re.compile(r"</?[A-Za-z][^>\n]{0,100}>")
+_LOCAL_LIVE_WATCH_MARKS = re.compile(r"\*\*|__|~~|`|(?<![\w*])\*(?=\S)|(?<=\S)\*(?![\w*])")
+_LOCAL_LIVE_WATCH_LINE_START = re.compile(r"^(?:#{1,6}\s+|>\s?|[-*+•]\s+|\d{1,3}[.)]\s+)+")
+_LOCAL_LIVE_WATCH_RULE = re.compile(r"[-=*_|:\s]{3,}")
+LOCAL_LIVE_WATCH_MAX_SENTENCE_CHARS = 400
+
+_local_live_watch_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="conduit-watch-local-live")
+
+
+def _watch_chats_can_load() -> bool:
+    """Whether this is a dashboard that serves Hermes' chats, its session API
+    not imported yet (no chat socket since it started)."""
+    web_server = sys.modules.get("hermes_cli.web_server")
+    if web_server is None or not getattr(web_server, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True):
+        return False
+    try:
+        return importlib.util.find_spec("tui_gateway.server") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _watch_chat_session_api() -> Any:
+    """Hermes' session API for a Watch call's chat.
+
+    As _hermes_session_api, but a dashboard that hasn't had a chat socket yet
+    imports the API now: it's the module the dashboard's /api/ws imports into
+    this same process, so there is still one registry of chats. Never call it
+    inside a profile's scope: the import reads Hermes' home and .env for the
+    whole process.
+    """
+    server = _hermes_session_api()
+    if server is not None or not _watch_chats_can_load():
+        return server
+    try:
+        importlib.import_module("tui_gateway.server")
+    except Exception as exc:  # noqa: BLE001 — reported as unavailable
+        logger.info("Hermes' session API couldn't be loaded for a Watch call: %s", type(exc).__name__)
+        return None
+    return _hermes_session_api()
+
+
+def local_live_watch_status(profile: Optional[str]) -> Dict[str, Any]:
+    """Whether a Watch call can run on Local Live (call in the profile's
+    scope; it never imports Hermes' session API)."""
+    # As local_live_status, without making the profile's key.
+    reason = None
+    if not _local_live_auth_state.get("ready"):
+        reason = str(_local_live_auth_state.get("reason") or LOCAL_LIVE_UNAVAILABLE)
+    elif not _local_live_profile_can_carry_key(profile):
+        reason = LOCAL_LIVE_PROFILE_NAME_REASON
+    else:
+        server = speech_server_status()
+        if not server.get("available"):
+            reason = server.get("reason") or SPEECH_SERVER_NOT_CONFIGURED
+    if reason is not None:
+        return {"runtime": "missing", "source": None, "reason": reason}
+    if _hermes_session_api() is None and not _watch_chats_can_load():
+        return {"runtime": "missing", "source": None, "reason": LOCAL_LIVE_WATCH_NO_SESSIONS}
+    return {"runtime": "ready", "source": "local_live", "reason": None}
+
+
+class _SpokenText:
+    """A reply's text, as it streams, with what's written to be seen left out:
+    Markdown goes (headings, bullets, emphasis; links keep their words), code
+    blocks and tables stay in the chat, said once, and URLs aren't read out.
+    Text goes on at each sentence's end, so the speech server gets whole
+    sentences to speak."""
+
+    def __init__(self) -> None:
+        self.raw = ""
+        self.in_code = False
+        self.code_told = False
+        # The text so far ended inside a line that isn't spoken (a table row).
+        self.skipping_line = False
+
+    def feed(self, text: str) -> str:
+        self.raw += text
+        out: List[str] = []
+        while True:
+            match = _LOCAL_LIVE_WATCH_BOUNDARY.search(self.raw)
+            if match is None:
+                break
+            chunk, self.raw = self.raw[:match.end()], self.raw[match.end():]
+            self._take(chunk, out)
+        while len(self.raw) > LOCAL_LIVE_WATCH_MAX_SENTENCE_CHARS:
+            cut = self.raw.rfind(" ", 0, LOCAL_LIVE_WATCH_MAX_SENTENCE_CHARS)
+            cut = cut if cut > 0 else LOCAL_LIVE_WATCH_MAX_SENTENCE_CHARS
+            chunk, self.raw = self.raw[:cut], self.raw[cut:]
+            self._take(chunk, out)
+        return " ".join(out)
+
+    def finish(self) -> str:
+        out: List[str] = []
+        if self.raw:
+            chunk, self.raw = self.raw, ""
+            self._take(chunk + "\n", out)
+        return " ".join(out)
+
+    def _take(self, chunk: str, out: List[str]) -> None:
+        text = self._clean(chunk)
+        if text:
+            out.append(text)
+
+    def _code(self, entering: bool, parts: List[str]) -> None:
+        self.in_code = entering
+        if entering and not self.code_told:
+            self.code_told = True
+            parts.append(LOCAL_LIVE_WATCH_CODE_NOTE)
+
+    def _clean(self, chunk: str) -> str:
+        lines = chunk.split("\n")
+        parts: List[str] = []
+        for index, line in enumerate(lines):
+            complete = index < len(lines) - 1
+            continuing = index == 0 and self.skipping_line
+            if index == 0:
+                self.skipping_line = False
+            stripped = line.strip()
+            if stripped.startswith("~~~") and not continuing:
+                self._code(not self.in_code, parts)
+                continue
+            # Fences, at the start of a line or after text on it.
+            pieces = stripped.split("```")
+            spoken: List[str] = []
+            for number, piece in enumerate(pieces):
+                if number > 0:
+                    self._code(not self.in_code, parts if not spoken else spoken)
+                    if self.in_code:
+                        continue
+                if not self.in_code:
+                    spoken.append(piece)
+            stripped = " ".join(piece for piece in spoken if piece.strip()).strip()
+            if continuing or not stripped:
+                if continuing and not complete:
+                    self.skipping_line = True
+                continue
+            if stripped.startswith("|") or _LOCAL_LIVE_WATCH_RULE.fullmatch(stripped):
+                if not complete:
+                    self.skipping_line = True
+                continue
+            text = _LOCAL_LIVE_WATCH_LINE_START.sub("", stripped)
+            text = _LOCAL_LIVE_WATCH_LINK.sub(lambda match: "" if match.group(1) else match.group(2), text)
+            text = _LOCAL_LIVE_WATCH_URL.sub("", text)
+            text = _LOCAL_LIVE_WATCH_HTML.sub("", text)
+            text = _LOCAL_LIVE_WATCH_MARKS.sub("", text)
+            text = _LOCAL_LIVE_WATCH_SPACE_BEFORE_MARK.sub(r"\1", " ".join(text.split())).lstrip(".,;:!? ")
+            if not text:
+                continue
+            if complete and text[-1] not in ".!?…:;,\"')]":
+                # A heading or a bullet ends where its line does.
+                text += "."
+            parts.append(text)
+        return " ".join(parts)
+
+
+class _WatchChatTransport:
+    """Where Hermes writes a Watch call chat's responses and events, as it
+    would to the app's WebSocket; ``_closed`` is what Hermes' reaper reads."""
+
+    conduit_client = "conduit"
+
+    def __init__(self, chat: "_WatchCallChat") -> None:
+        self._chat = chat
+        self._closed = False
+
+    def write(self, obj: dict) -> bool:
+        if self._closed:
+            return False
+        try:
+            self._chat.frame(obj)
+        except Exception as exc:  # noqa: BLE001 — Hermes' writer must never see our failure
+            _log_watch_failure("A Watch call chat's event couldn't be read", exc)
+        return True
+
+    def close(self) -> None:
+        self._closed = True
+
+
+class _WatchCallChat:
+    """A Watch call's Hermes chat, through Hermes' session API.
+
+    The calls block (as _WatchJobs.rpc): run them off the event loop. Hermes
+    writes the chat's events from its own threads; ``listener`` gets them.
+    """
+
+    def __init__(self, server: Any, profile: Optional[str]) -> None:
+        self.server = server
+        self.profile = profile
+        self.session_id = ""
+        self.stored_session_id = ""
+        self.transport = _WatchChatTransport(self)
+        self.lock = threading.Lock()
+        self._waiters: Dict[str, _RpcWaiter] = {}
+        self._rpc_ids = 0
+        self.rid_tag = secrets.token_hex(4)
+        self.listener: Optional[Callable[[str, Dict[str, Any]], None]] = None
+        self.voice_turn = True
+        self.closed = False
+
+    @property
+    def public_id(self) -> str:
+        return (self.stored_session_id or self.session_id)[:128]
+
+    def rpc(self, method: str, params: Dict[str, Any], timeout: float = WATCH_JOB_RPC_TIMEOUT_S) -> Dict[str, Any]:
+        with self.lock:
+            self._rpc_ids += 1
+            rid = f"conduit-watch-call-{self.rid_tag}-{self._rpc_ids}"
+            waiter = self._waiters[rid] = _RpcWaiter()
+        try:
+            response = self.server.dispatch({"jsonrpc": "2.0", "id": rid, "method": method, "params": params},
+                                            self.transport)
+            if response is None:
+                if not waiter.done.wait(timeout):
+                    raise WatchJobError(f"{method} timed out")
+                response = waiter.response
+        finally:
+            with self.lock:
+                self._waiters.pop(rid, None)
+        if not isinstance(response, dict):
+            raise WatchJobError(f"{method} gave no answer")
+        error = response.get("error")
+        if error:
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            code = error.get("code") if isinstance(error, dict) else None
+            raise WatchJobError(str(message or f"{method} failed")[:300], code=code)
+        result = response.get("result")
+        return result if isinstance(result, dict) else {}
+
+    def frame(self, obj: Any) -> None:
+        if not isinstance(obj, dict):
+            return
+        method = obj.get("method")
+        if method is None:
+            with self.lock:
+                waiter = self._waiters.get(obj.get("id")) if isinstance(obj.get("id"), str) else None
+            if waiter is not None:
+                waiter.response = obj
+                waiter.done.set()
+            return
+        params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+        sid = params.get("session_id") if isinstance(params.get("session_id"), str) else ""
+        if method != "event" or not sid or sid not in (self.session_id, self.stored_session_id):
+            return
+        payload = params.get("payload") if isinstance(params.get("payload"), dict) else {}
+        listener = self.listener
+        if listener is not None:
+            listener(str(params.get("type") or ""), payload)
+
+    def open(self) -> None:
+        params: Dict[str, Any] = {"cols": 96, "source": "desktop", "title": LOCAL_LIVE_WATCH_TITLE}
+        if self.profile:
+            params["profile"] = self.profile
+        created = self.rpc("session.create", params)
+        sid = created.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise WatchJobError("session.create gave no session")
+        stored = created.get("stored_session_id")
+        self.session_id = sid
+        self.stored_session_id = stored if isinstance(stored, str) else ""
+
+    def submit(self, text: str) -> str:
+        """Sends ``text`` as the chat's next spoken turn; Hermes' status for it."""
+        params: Dict[str, Any] = {"session_id": self.session_id, "text": text, "surface": LOCAL_LIVE_WATCH_SURFACE}
+        if self.voice_turn:
+            params["voice_turn"] = True
+        try:
+            result = self.rpc("prompt.submit", params)
+        except WatchJobError as exc:
+            # A Hermes that refuses the marker (Conduit's HermesClient does the same).
+            if "voice_turn" not in params or "voice_turn" not in str(exc):
+                raise
+            self.voice_turn = False
+            params.pop("voice_turn")
+            result = self.rpc("prompt.submit", params)
+        return str(result.get("status") or "").lower()
+
+    def redirect(self, text: str) -> str:
+        """Puts ``text`` into the reply running now: redirected, queued or rejected
+        (AppState.redirectLiveVoiceFollowUp)."""
+        try:
+            status = str(self.rpc("session.redirect", {"session_id": self.session_id, "text": text})
+                         .get("status") or "").lower()
+        except WatchJobError as exc:
+            if not exc.unsupported_redirect:
+                raise
+            # An older Hermes: steered in instead.
+            steered = self.rpc("session.steer", {"session_id": self.session_id, "text": text})
+            return "rejected" if str(steered.get("status") or "").lower() == "rejected" else "redirected"
+        return status if status in ("redirected", "queued") else "rejected"
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.listener = None
+        if self.session_id:
+            try:
+                self.rpc("session.close", {"session_id": self.session_id})
+            except Exception as exc:  # noqa: BLE001 — Hermes' reaper closes it anyway
+                logger.info("Closing a Watch call's chat failed: %s", type(exc).__name__)
+        self.transport.close()
+
+
+class _LocalLiveWatchReply:
+    """The Hermes reply a Watch call follows, from its send until it ends."""
+
+    def __init__(self) -> None:
+        # A correction is on its way to Hermes: its marker or the reply's end
+        # can arrive before Hermes answers the redirect.
+        self.correcting = False
+        # The completion that arrived while correcting, until Hermes says what
+        # it did with the words (``_NO_COMPLETION`` while none did).
+        self.held_completion: Any = _NO_COMPLETION
+        # A correction went into it: the marker for the words it cut off
+        # isn't its end.
+        self.skips_interruption = False
+        # Corrections Hermes queued behind it: the current reply's end isn't
+        # the one the call waits for.
+        self.skips_completions = 0
+
+
+_NO_COMPLETION = object()
+
+
+class _LocalLiveWatchTurns:
+    """A Watch Local Live call's turns, run in its chat on this host: the
+    iPhone's LocalLiveTurnRunner, here.
+
+    One turn at a time, as the model address sends them. A turn that arrives
+    while Hermes is still on the last one goes into that reply as a
+    correction rather than starting a second turn. A turn the server lets go
+    only stops being spoken: Hermes' reply still lands in the chat. Turns
+    start on the dashboard's loop, Hermes' events come on its own threads,
+    and the chat's calls run one after another on a worker; state is under
+    ``lock``.
+    """
+
+    def __init__(self, chat: _WatchCallChat) -> None:
+        self.chat = chat
+        self.lock = threading.Lock()
+        # The open turn: its id, how its words are delivered, and whether
+        # anything was said for it yet.
+        self.turn: Optional[Tuple[str, Callable[[str, str], None]]] = None
+        self.spoke = False
+        self.reply: Optional[_LocalLiveWatchReply] = None
+        self.spoken = _SpokenText()
+        self.generation = 0
+        self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="conduit-watch-local-live-turn")
+        self.closed = False
+
+    def start(self, turn_id: str, text: str, deliver: Callable[[str, str], None]) -> None:
+        with self.lock:
+            if self.closed:
+                deliver("done", "")
+                return
+            # The model address cancels a turn before sending the next:
+            # whatever is still open here has nobody waiting for it.
+            self.turn = (turn_id, deliver)
+            self.spoke = False
+            self.spoken = _SpokenText()
+            self.generation += 1
+            generation = self.generation
+        try:
+            # After the last turn's work: one send or correction at a time,
+            # in the order the user spoke.
+            self.worker.submit(self._run, turn_id, text, generation)
+        except RuntimeError:  # closed meanwhile
+            deliver("done", "")
+
+    def cancel(self, turn_id: str) -> None:
+        with self.lock:
+            if self.turn is not None and self.turn[0] == turn_id:
+                self.turn = None
+
+    def close(self) -> None:
+        with self.lock:
+            self.closed = True
+            self.generation += 1
+            self.turn = None
+            self.reply = None
+        # Turns still queued would only submit to a chat that's closing.
+        self.worker.shutdown(wait=False, cancel_futures=True)
+
+    def _current(self, generation: int) -> bool:
+        with self.lock:
+            return generation == self.generation
+
+    def _run(self, turn_id: str, text: str, generation: int) -> None:
+        # A newer turn came while this one waited: the model address let it go.
+        if not self._current(generation):
+            return
+        words = " ".join(text.split())
+        if not words:
+            with self.lock:
+                self._finish(turn_id)
+            return
+        following: Optional[_LocalLiveWatchReply] = None
+        try:
+            with self.lock:
+                running = self.reply
+                if running is not None:
+                    running.correcting = True
+                    running.skips_interruption = True
+            if running is not None:
+                try:
+                    status = self.chat.redirect(words)
+                except Exception:
+                    self._settle(running, "rejected")
+                    raise
+                starts = self._settle(running, status)
+                if not starts or not self._current(generation):
+                    return
+            with self.lock:
+                if generation != self.generation:
+                    return
+                # Its events are this turn's from the send on.
+                following = self.reply = _LocalLiveWatchReply()
+            status = self.chat.submit(words)
+            if status in ("steered", "redirected", "queued"):
+                with self.lock:
+                    if self.reply is following:
+                        self.reply = None
+                    self._say(LOCAL_LIVE_WATCH_QUEUED_LINE if status == "queued" else LOCAL_LIVE_WATCH_STEERED_LINE,
+                              turn_id, generation)
+        except Exception as exc:  # noqa: BLE001 — said on the call; the next turn tries again
+            logger.info("A Watch Local Live turn didn't reach Hermes: %s",
+                        exc if isinstance(exc, WatchJobError) else type(exc).__name__)
+            with self.lock:
+                if following is not None and self.reply is following:
+                    self.reply = None
+                self._say(LOCAL_LIVE_WATCH_FAILURE_LINE, turn_id, generation)
+
+    def _settle(self, running: _LocalLiveWatchReply, status: str) -> bool:
+        """What Hermes did with a correction: True when nothing was running to
+        take it, so the words start a turn of their own."""
+        with self.lock:
+            # The reply ended meanwhile (an error said so): nothing more here.
+            if self.reply is not running:
+                return False
+            held = running.held_completion
+            running.correcting = False
+            running.held_completion = _NO_COMPLETION
+            if status == "redirected":
+                # The running reply carries on with the new words; a
+                # completion that came first was the cut-off reply's.
+                return False
+            if status == "queued":
+                # Hermes runs the words after the reply it was finishing. If
+                # that reply already ended, the next completion is theirs.
+                running.skips_interruption = False
+                if held is _NO_COMPLETION:
+                    running.skips_completions += 1
+                return False
+            self.reply = None
+            return True
+
+    # Hermes' events
+
+    def observe(self, kind: str, payload: Dict[str, Any]) -> None:
+        with self.lock:
+            current = self.reply
+            if current is None:
+                return
+            if kind in _LOCAL_LIVE_WATCH_WRITING:
+                # Hermes is writing again after the correction: a marker
+                # after this ends the reply.
+                if not current.correcting:
+                    current.skips_interruption = False
+            elif kind == "message.delta":
+                text = payload.get("text")
+                # Until Hermes takes the correction, the words are the reply
+                # the user talked over: the new turn doesn't say them.
+                if current.correcting or not isinstance(text, str):
+                    return
+                current.skips_interruption = False
+                self._speak(text)
+            elif kind == "message.complete":
+                content = next((payload[key] for key in ("content", "text", "rendered")
+                                if isinstance(payload.get(key), str)), None)
+                # The notice for a reply a correction cut off is never its answer.
+                if content is not None and content.strip().lower() == _LOCAL_LIVE_INTERRUPTION_NOTICE:
+                    return
+                if current.correcting:
+                    current.held_completion = content
+                    return
+                if current.skips_completions > 0:
+                    current.skips_completions -= 1
+                    return
+                self.reply = None
+                if self.turn is not None and not self.spoke and content:
+                    self._speak(content)
+                if self.turn is not None:
+                    self._finish(self.turn[0])
+            elif kind in _LOCAL_LIVE_WATCH_INTERRUPTED:
+                if current.skips_interruption:
+                    current.skips_interruption = False
+                    return
+                self.reply = None
+                if self.turn is not None:
+                    self._finish(self.turn[0])
+            elif kind == "error":
+                self.reply = None
+                if self.turn is not None:
+                    self._say(LOCAL_LIVE_WATCH_ERROR_LINE, self.turn[0], self.generation)
+            elif kind in _LOCAL_LIVE_WATCH_QUESTIONS:
+                # Hermes waits on the user: the call says where to answer,
+                # and the reply is still followed for the turn after.
+                if self.turn is not None:
+                    self._say(LOCAL_LIVE_WATCH_NEEDS_INPUT_LINE, self.turn[0], self.generation)
+
+    # Speaking (under lock)
+
+    def _speak(self, text: str) -> None:
+        if self.turn is None or not text:
+            return
+        self.spoke = True
+        spoken = self.spoken.feed(text)
+        if spoken:
+            self.turn[1]("delta", spoken + " ")
+
+    def _say(self, line: str, turn_id: str, generation: int) -> None:
+        """A line of the call's own instead of Hermes' reply."""
+        if generation != self.generation or self.turn is None or self.turn[0] != turn_id:
+            return
+        self.spoke = True
+        # What the reply still held ends with it: nothing of it follows the line.
+        self.spoken = _SpokenText()
+        self.turn[1]("delta", line)
+        self._finish(turn_id)
+
+    def _finish(self, turn_id: str) -> None:
+        if self.turn is None or self.turn[0] != turn_id:
+            return
+        deliver = self.turn[1]
+        rest = self.spoken.finish()
+        if rest:
+            deliver("delta", rest)
+        self.spoken = _SpokenText()
+        self.turn = None
+        deliver("done", "")
+
+
+class _LocalLiveWatchCall:
+    """A Watch's Local Live call, where the model address sends its turns
+    (_local_live_calls, beside the phone's _LocalLiveCall).
+
+    Turns start on the dashboard's loop, where the model address waits on
+    their frames; the call itself runs on the Watch bridge's loop. Frames
+    cross back with call_soon_threadsafe.
+    """
+
+    speaks = False
+
+    def __init__(self, session: "_LocalLiveWatchSession", profile: str) -> None:
+        self.session = session
+        self.profile = profile
+        self.turns: Dict[str, Tuple[_LocalLiveTurn, asyncio.AbstractEventLoop, bool]] = {}
+        self.numbers = itertools.count(1)
+        self.closed = False
+        # As _LocalLiveCall's: turns never overlap. Only used on the
+        # dashboard's loop, where turns start.
+        self.turn_lock = asyncio.Lock()
+
+    def take_words(self, text: str) -> bool:
+        return False
+
+    async def start_turn(self, text: str) -> Optional[_LocalLiveTurn]:
+        async with self.turn_lock:
+            return await self._start_turn(text)
+
+    async def _start_turn(self, text: str) -> Optional[_LocalLiveTurn]:
+        if self.closed:
+            return None
+        for old, _, _ in list(self.turns.values()):
+            await self.cancel_turn(old)
+        loop = asyncio.get_running_loop()
+        turn = _LocalLiveTurn(f"w{next(self.numbers)}")
+        asks_watch = text.strip().startswith(LOCAL_LIVE_MARKER_PREFIX)
+        self.turns[turn.turn_id] = (turn, loop, asks_watch)
+        if asks_watch:
+            # The Watch's readiness check: the Watch answers it.
+            if not await self.session.to_watch({"type": "conduit.turn", "turn_id": turn.turn_id, "text": text}):
+                self.turns.pop(turn.turn_id, None)
+                return None
+            return turn
+        runner = self.session.runner
+        if runner is None:
+            self.turns.pop(turn.turn_id, None)
+            return None
+        runner.start(turn.turn_id, text, lambda kind, words: self.deliver(turn.turn_id, kind, words))
+        return turn
+
+    async def cancel_turn(self, turn: _LocalLiveTurn) -> None:
+        entry = self.turns.pop(turn.turn_id, None)
+        if entry is None:
+            return
+        turn.frames.put_nowait(("done", ""))
+        if entry[2]:
+            await self.session.to_watch({"type": "conduit.turn.cancel", "turn_id": turn.turn_id})
+        elif self.session.runner is not None:
+            self.session.runner.cancel(turn.turn_id)
+
+    def deliver(self, turn_id: str, kind: str, text: str) -> None:
+        """Part of a turn's reply, or its end, from any thread."""
+        entry = self.turns.get(turn_id)
+        if entry is None:
+            return
+        with contextlib.suppress(RuntimeError):  # the dashboard's loop already closed
+            entry[1].call_soon_threadsafe(self._deliver, turn_id, kind, text)
+
+    def _deliver(self, turn_id: str, kind: str, text: str) -> None:
+        entry = self.turns.get(turn_id)
+        if entry is None:
+            return
+        turn = entry[0]
+        if kind == "delta":
+            if text and turn.chars < LOCAL_LIVE_MAX_REPLY_CHARS:
+                text = text[:min(LOCAL_LIVE_MAX_DELTA_CHARS, LOCAL_LIVE_MAX_REPLY_CHARS - turn.chars)]
+                turn.chars += len(text)
+                turn.frames.put_nowait(("delta", text))
+        else:
+            self.turns.pop(turn_id, None)
+            turn.frames.put_nowait(("done", ""))
+
+    def watch_frame(self, frame: Dict[str, Any]) -> None:
+        """The Watch's answer to a turn it was sent (the readiness check)."""
+        turn_id = str(frame.get("turn_id") or "")
+        entry = self.turns.get(turn_id)
+        if entry is None or not entry[2]:
+            return
+        if frame.get("type") == "conduit.turn.delta":
+            text = frame.get("text")
+            if isinstance(text, str) and text:
+                self.deliver(turn_id, "delta", text)
+        elif frame.get("type") in ("conduit.turn.done", "conduit.turn.error"):
+            self.deliver(turn_id, "done", "")
+
+    def close(self) -> None:
+        self.closed = True
+        for turn_id in list(self.turns):
+            self.deliver(turn_id, "done", "")
+
+
+class _LocalLiveWatchSession(_WatchAudioSession):
+    """Local Live on the Watch: the profile's speech server, relayed as for
+    Grok, with Hermes answering its turns here."""
+
+    engine = LOCAL_LIVE_WATCH_ENGINE
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.upstream: Any = None
+        self.pacer: Optional[_WatchAudioPacer] = None
+        self.call: Optional[_LocalLiveWatchCall] = None
+        self.runner: Optional[_LocalLiveWatchTurns] = None
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+
+    async def run(self) -> None:
+        profile = self.profile
+        loop = self.loop = asyncio.get_running_loop()
+
+        def setup() -> Tuple[str, str]:
+            status = local_live_watch_status(profile)
+            if status["runtime"] != "ready" and status["reason"] != LOCAL_LIVE_WATCH_NO_SESSIONS:
+                raise TokenError(503, str(status["reason"]))
+            return _speech_server_setup(profile)
+
+        try:
+            url, key = await asyncio.wait_for(_run_scoped(profile, setup, _speech_server_executor),
+                                              timeout=SPEECH_SERVER_SETUP_TIMEOUT_S)
+            # Outside any profile's scope: importing it reads Hermes' home.
+            server = await asyncio.wait_for(loop.run_in_executor(_local_live_watch_executor, _watch_chat_session_api),
+                                            timeout=SPEECH_SERVER_SETUP_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            raise WatchAudioFailure("unreachable", "The Hermes host timed out reading the speech server settings")
+        except TokenError as exc:
+            raise _watch_audio_failure(exc)
+        if server is None:
+            raise WatchAudioFailure("unavailable", LOCAL_LIVE_WATCH_NO_SESSIONS)
+        # The speech server's turns go to the profile's newest live call: one
+        # running elsewhere (the phone, another Watch grant) would take them.
+        if any(not call.speaks and not (isinstance(call, _LocalLiveWatchCall) and call.session.bridge is self.bridge)
+               for call in _local_live_open_calls(profile)):
+            raise WatchAudioFailure("busy", "A Local Live call is already running on this Hermes profile")
+        open_key = _limiter_key(profile)
+        if not _speech_server_take_open(open_key):
+            raise WatchAudioFailure("busy", "Too many speech server connections are open on this host")
+        upstream: Any = None
+        call: Optional[_LocalLiveWatchCall] = None
+        tasks: list = []
+        try:
+            upstream = await self._dial(url, key)
+            # After the server answered: a call that can't reach it opens no chat.
+            chat, resumed = await self._chat(server)
+            runner = self.runner = _LocalLiveWatchTurns(chat)
+            chat.listener = runner.observe
+            call = self.call = _LocalLiveWatchCall(self, _local_live_profile_key(profile))
+            _local_live_register(call)
+            pacer = self.pacer = _WatchAudioPacer(self.send, LOCAL_LIVE_WATCH_RATE)
+            # Set first: the Watch answers "started" with its session.update.
+            self.upstream = upstream
+            await self.bridge.control(self.stream, {
+                "type": "started", "engine": self.engine, "voice": None,
+                "input_rate": LOCAL_LIVE_WATCH_RATE, "output_rate": LOCAL_LIVE_WATCH_RATE,
+                "session_id": chat.public_id, "resumed": resumed,
+            })
+            pacing = asyncio.ensure_future(pacer.run())
+            reader = asyncio.ensure_future(self._read(upstream, pacer))
+            tasks = [reader, pacing]
+            await _first_done(None, self.stopping.wait(), reader)
+            if reader.done() and not self.stopping.is_set():
+                code, reason = _forwardable_close(getattr(upstream, "close_code", None),
+                                                  str(getattr(upstream, "close_reason", "") or ""))
+                self.reason = reason or ("The speech server ended the call" if code in (1000, 1001)
+                                         else "The connection to the speech server was lost")
+        finally:
+            self.upstream = None
+            if call is not None:
+                _local_live_unregister(call)
+                call.close()
+            if self.runner is not None:
+                if self.runner.chat.listener == self.runner.observe:
+                    self.runner.chat.listener = None
+                self.runner.close()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if upstream is not None:
+                with contextlib.suppress(Exception):
+                    await upstream.close()
+            _speech_server_give_open(open_key)
+
+    async def _chat(self, server: Any) -> Tuple[_WatchCallChat, bool]:
+        """The call's chat: the one a rejoining Watch names, else a new one."""
+        chats = self.bridge.call_chats
+        wanted = self.request.get("resume_session_id")
+        if isinstance(wanted, str) and wanted:
+            chat = chats.get(wanted)
+            if chat is not None and not chat.closed:
+                return chat, True
+        if len(chats) >= LOCAL_LIVE_WATCH_CHATS_PER_GRANT:
+            raise WatchAudioFailure("busy", "This call has started as many chats as it may")
+        chat = _WatchCallChat(server, self.profile)
+        opening = asyncio.get_running_loop().run_in_executor(_local_live_watch_executor, chat.open)
+        try:
+            await asyncio.wait_for(asyncio.shield(opening), LOCAL_LIVE_WATCH_CHAT_TIMEOUT_S)
+        except WatchJobError as exc:
+            raise WatchAudioFailure("failed", f"Hermes couldn't open the call's chat: {exc}")
+        except BaseException as exc:
+            # Timed out or cancelled while Hermes opens it: closed once it
+            # has, so no chat is left without a call.
+            opening.add_done_callback(lambda _: _local_live_watch_executor.submit(chat.close))
+            if isinstance(exc, asyncio.TimeoutError):
+                raise WatchAudioFailure("unreachable", "Hermes took too long to open the call's chat")
+            raise
+        replaced = chats.get(chat.public_id)
+        if replaced is not None and replaced is not chat:
+            # Hermes named a chat this grant already had: the old one closes.
+            _local_live_watch_executor.submit(replaced.close)
+        chats[chat.public_id] = chat
+        return chat, False
+
+    async def _dial(self, url: str, key: str) -> Any:
+        try:
+            return await _connect_speech_server(url, _speech_server_headers(key))
+        except RealtimeUpstreamRefused as exc:
+            code, message = _speech_server_refusal(exc.status)
+            raise WatchAudioFailure("refused" if code == SPEECH_SERVER_CLOSE_REFUSED else "unreachable", message)
+        except Exception as exc:
+            # The type only: the text could quote the address.
+            logger.warning("A Watch Local Live call couldn't reach the speech server: %s", type(exc).__name__)
+            raise WatchAudioFailure("unreachable", "Could not reach the speech server from the Hermes host")
+
+    async def _read(self, upstream: Any, pacer: _WatchAudioPacer) -> None:
+        with contextlib.suppress(Exception):
+            async for message in upstream:
+                if not isinstance(message, str):
+                    continue
+                try:
+                    event = json.loads(message)
+                except ValueError:
+                    continue
+                kind = event.get("type") if isinstance(event, dict) else None
+                if kind in _GROK_AUDIO_DELTAS:
+                    try:
+                        pcm = base64.b64decode(str(event.get("delta") or ""), validate=True)
+                    except (ValueError, TypeError):
+                        continue
+                    pacer.audio(pcm)
+                    continue
+                if kind == "input_audio_buffer.speech_started":
+                    pacer.interrupt()
+                pacer.event(message)
+
+    async def to_watch(self, payload: Dict[str, Any]) -> bool:
+        """An event for the Watch, from any loop; False once it can't go."""
+        loop = self.loop
+        if loop is None or self.stopping.is_set():
+            return False
+        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        try:
+            if asyncio.get_running_loop() is loop:
+                return await self.send(WATCH_AUDIO_EVENT, data)
+            return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.send(WATCH_AUDIO_EVENT, data), loop))
+        except RuntimeError:  # the bridge's loop already closed
+            return False
+
+    async def audio(self, pcm: bytes) -> None:
+        upstream = self.upstream
+        if upstream is not None and pcm:
+            with contextlib.suppress(Exception):
+                await upstream.send(json.dumps({"type": "input_audio_buffer.append",
+                                                "audio": base64.b64encode(pcm).decode("ascii")}))
+
+    async def event(self, data: bytes) -> None:
+        upstream = self.upstream
+        if upstream is None or len(data) > SPEECH_SERVER_MAX_CLIENT_FRAME_BYTES:
+            return
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        if '"conduit.' in text:
+            # The call's own frames stay here, as on /local-live/socket: the
+            # Watch's answers to the turns it was sent, and its keepalive.
+            try:
+                frame = json.loads(text)
+            except ValueError:
+                return
+            kind = frame.get("type") if isinstance(frame, dict) else None
+            if isinstance(kind, str) and kind.startswith("conduit."):
+                if kind.startswith("conduit.turn.") and self.call is not None:
+                    self.call.watch_frame(frame)
+                return
+        with contextlib.suppress(Exception):
+            await upstream.send(text)
+
+
+_WATCH_AUDIO_SESSIONS = {"gpt_live": _GptLiveWatchSession, "grok": _GrokWatchSession,
+                         LOCAL_LIVE_WATCH_ENGINE: _LocalLiveWatchSession}
 
 
 # --- The bridge -----------------------------------------------------------------
@@ -9474,6 +10420,9 @@ class _WatchAudioBridge:
         self.session_task: Optional[asyncio.Task] = None
         self.sids: set = set()
         self.rejected = 0
+        # Local Live's chats, by the id the Watch resumes them with: they
+        # outlive a stream, and end with the grant.
+        self.call_chats: Dict[str, "_WatchCallChat"] = {}
 
     def watch_url(self) -> str:
         return _watch_audio_ws_url(self.grant.relay_url, self.grant.grant_id, "watch")
@@ -9497,6 +10446,14 @@ class _WatchAudioBridge:
         except Exception as exc:  # noqa: BLE001 — the grant's lookups go on without audio
             logger.warning("The Watch audio bridge stopped: %s", type(exc).__name__)
         finally:
+            # Each close can wait on Hermes: they go on in the background, so
+            # the bridge's end isn't held up by one that hangs.
+            for chat in list(self.call_chats.values()):
+                try:
+                    _local_live_watch_executor.submit(chat.close)
+                except RuntimeError:  # the executor already shut down
+                    chat.close()
+            self.call_chats.clear()
             self.finished.set()
 
     async def _main(self) -> None:
@@ -9703,22 +10660,40 @@ class _WatchAudioBridge:
         return True
 
 
-def watch_audio_status(runtime: Optional[_WatchAudioRuntime] = None) -> Dict[str, Any]:
+def watch_audio_status(runtime: Optional[_WatchAudioRuntime] = None, profile: Optional[str] = None,
+                       local_live: Optional[Callable[[Optional[str]], Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Each engine's readiness; local_live's is the profile's (call in its scope)."""
     runtime = runtime or _watch_audio_runtime
     return {"version": WATCH_AUDIO_VERSION,
-            "engines": {"gpt_live": runtime.status(), "grok": {"runtime": "ready", "source": "hermes", "reason": None}}}
+            "engines": {"gpt_live": runtime.status(), "grok": {"runtime": "ready", "source": "hermes", "reason": None},
+                        LOCAL_LIVE_WATCH_ENGINE: (local_live or local_live_watch_status)(profile)}}
 
 
-def _watch_audio_grant_engines(runtime: Optional[_WatchAudioRuntime] = None) -> list:
+def _watch_audio_grant_engines(runtime: Optional[_WatchAudioRuntime] = None, profile: Optional[str] = None,
+                               local_live: Optional[Callable[[Optional[str]], Dict[str, Any]]] = None) -> list:
+    """The engines a grant's bridge can start (local_live's check in the profile's scope)."""
     runtime = runtime or _watch_audio_runtime
-    return [engine for engine in WATCH_AUDIO_ENGINES if engine != "gpt_live" or runtime.python() is not None]
+    engines = []
+    for engine in WATCH_AUDIO_ENGINES:
+        if engine == "gpt_live" and runtime.python() is None:
+            continue
+        if engine == LOCAL_LIVE_WATCH_ENGINE and (local_live or local_live_watch_status)(profile).get("runtime") != "ready":
+            continue
+        engines.append(engine)
+    return engines
 
 
 @router.get("/watch-audio/status")
-async def get_watch_audio_status(response: Response) -> Dict[str, Any]:
+async def get_watch_audio_status(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
+    _local_live_start_auth()
     try:
-        return {"ok": True, **(await asyncio.get_running_loop().run_in_executor(None, watch_audio_status))}
+        return {"ok": True, **(await asyncio.wait_for(_run_scoped(profile, lambda: watch_audio_status(profile=profile)),
+                                                      timeout=SPEECH_SERVER_SETUP_TIMEOUT_S))}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Watch audio status timed out", headers={"Cache-Control": "no-store"})
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     except Exception as exc:
         raise _unexpected("status", exc, feature="Watch audio")
 
@@ -10945,6 +11920,7 @@ ROUTE_CAPABILITIES = (
     "watch-live-token",
     "watch-chats",
     "watch-audio",
+    "watch-local-live",
     "desktop-views",
     "hermes-calls",
     "hermes-call-presence",
