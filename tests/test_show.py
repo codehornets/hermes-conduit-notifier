@@ -250,7 +250,7 @@ def test_information_cards_go_only_to_a_conduit_that_draws_them(tool_home):
     assert answer["ok"] is False and answer["error"] == "unsupported_cards", "an older Conduit would draw nothing"
     answer = _call({"title": "Today", "cards": [STATS, MAP]})
     assert answer["ok"] is True and answer["cards"] == [CLEAN_MAP], "the cards it can draw still go"
-    assert "stats card(s) weren't shown" in answer["note"], "Hermes hears what was left out"
+    assert "can't draw stats cards" in answer["note"], "Hermes hears what was left out"
     answer = _call({"title": "Today", "markdown": "**Steps** 8,000", "cards": [STATS]})
     assert answer["error"] == "no_device", "Markdown Hermes wrote still goes to a call screen, without the cards"
     _exchange(PresentStore(tool_home), features=("chat-cards", "info-cards"))
@@ -270,6 +270,30 @@ def test_a_phone_without_information_cards_gets_only_what_it_draws(store):
     assert "cards" not in info_only and "fallback" not in info_only, "and the Markdown when nothing else is left"
     assert [card["cards"] for card in _exchange(store, features=("show-cards", "info-cards"))["cards"]] == \
         [[STATS, CLEAN_MAP], [STATS]]
+
+
+def test_each_group_of_cards_needs_its_own_feature(store):
+    contact = {"type": "contact", "people": [{"name": "Dr Lee", "phone": "+1 415 555 0100"}]}
+    status = {"type": "status", "live": "order", "status": {"state": "Shipped"}}
+    _exchange(store, features=("show-cards", "info-cards", "media-cards", "live-cards"))
+    store.show("Today", TABLE, cards=[STATS, contact, status], markdown_is_fallback=True)
+    older = {"installation_id": "older-phone", "device": "iPhone", "app_version": "1.9", "results": [],
+             "features": ["show-cards", "info-cards"]}
+    [card] = store.exchange(older)["cards"]
+    assert card["cards"] == [STATS], "media and live cards wait for a Conduit that draws them"
+
+
+def test_a_live_card_replaces_the_conversations_earlier_one(store):
+    _exchange(store, features=("show-cards", "live-cards"))
+    status = {"type": "status", "live": "order", "status": {"state": "Shipped"}}
+    store.show("Order", TABLE, session_id="s1", cards=[status])
+    store.show("Order", TABLE, session_id="s2", cards=[status])
+    store.show("Map", TABLE, session_id="s1", cards=[CLEAN_MAP])
+    later = {**status, "status": {"state": "Delivered", "phase": "done"}}
+    store.show("Order", TABLE, session_id="s1", cards=[later])
+    shown = _exchange(store, features=("show-cards", "live-cards"))["cards"]
+    assert [(card["session_id"], card["cards"][0].get("status", {}).get("state")) for card in shown] == \
+        [("s2", "Shipped"), ("s1", None), ("s1", "Delivered")]
 
 
 def test_cards_are_refused_where_conduit_isnt_drawing_them(tool_home, monkeypatch):

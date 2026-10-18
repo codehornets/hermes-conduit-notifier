@@ -9,13 +9,15 @@ the turn and again when the turn ends. Conduit opens the card over the call;
 Hermes says in a sentence that it's there. A card nobody picks up within ten
 minutes is dropped: it belongs to the conversation it was shown in.
 
-Maps, places, stats, charts, forecasts, comparisons and steps go as rich
-cards (``cards``, checked against ``card_schema``): Conduit draws them
+Maps, places, stats, charts, forecasts, comparisons, steps, media, contacts
+and statuses go as rich cards (``cards``, checked against ``card_schema``): Conduit draws them
 natively, in a typed chat as well as on a call, and fills in what Apple Maps
 knows on the phone. The call's normalized
 cards come back in the tool's answer, so they stay in the chat's history and
 Conduit draws them again whenever the chat is opened. Without ``markdown``,
-the cards' own Markdown is shown where they can't be drawn.
+the cards' own Markdown is shown where they can't be drawn. A card with a
+``live`` name replaces the conversation's earlier card of that name, so
+Hermes keeps a status up to date by showing it again.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from typing import Any, Callable
 from hermes_constants import get_hermes_home
 
 from . import card_schema, client, reply_sources
-from .present_store import INFO_CARDS_FEATURE, MAX_CARD_MARKDOWN_CHARS, MAX_CARD_TITLE_CHARS, PresentError, PresentStore
+from .present_store import MAX_CARD_MARKDOWN_CHARS, MAX_CARD_TITLE_CHARS, PresentError, PresentStore
 
 logger = logging.getLogger("hermes.plugins.conduit_push")
 
@@ -44,11 +46,15 @@ SCHEMA: dict[str, Any] = {
         "code, images and links, and whenever the user asks to see or show something. Prefer cards, which Conduit "
         "draws natively, on a call or in a typed chat: a map with pins and a route, one place in detail, several "
         "places to swipe through, big numbers (stats), a line, bar or pie chart, a weather forecast, a comparison "
-        "of two to four options, or steps the user can tick off, with timers. For places, Conduit adds what Apple "
+        "of two to four options, steps the user can tick off (with timers), photos, videos or audio to play, people "
+        "to call, message or email, or the status of something in progress (a delivery, a flight, a match, a job). "
+        "To keep a card up to date, give it a live name and show the whole card again with the same name as "
+        "things change: it replaces the earlier one. For places, Conduit adds what Apple "
         "Maps knows (address, phone, website, travel time), so give names, addresses, coordinates or conduit_maps "
         "place ids, and only ratings, hours, prices and photos you actually found, each with its source; never draw "
         "a map of your own as an HTML page. Name the "
-        "source of numbers and forecasts you got from a tool or site; a forecast needs one. For anything else, "
+        "source of numbers, forecasts, media and statuses you got from a tool or site; a forecast and media need "
+        "one, and media must be direct https links to files you actually found. For anything else, "
         "write Markdown: tables for data, numbered lists for steps, ![description](url) for images (direct image "
         "URLs you actually found) and [title](url) for links. Then say in a sentence that it's on their screen and "
         "give the gist; don't read it out, and don't repeat it in your reply. In a typed chat, use it only for "
@@ -69,12 +75,13 @@ SCHEMA: dict[str, Any] = {
 }
 
 INVALID_CARDS_NOTE = ("None of the cards could be shown: each needs a type and that type's field (places with "
-                      "names for map, place and places; stats, chart, weather, options or steps for the others), "
-                      "and a forecast needs its source.")
-UNSUPPORTED_CARDS_NOTE = ("This version of Conduit draws only map, place and places cards. On a call, show it as "
-                          "Markdown instead; in a typed chat, write it in your reply.")
-LEFT_OUT_NOTE = ("This version of Conduit draws only map, place and places cards, so the {kinds} card(s) weren't "
-                 "shown: give what they held in your reply.")
+                      "names for map, place and places, people for contact; stats, chart, weather, options, steps, "
+                      "media or status for the others), "
+                      "and a forecast and media need their source.")
+UNSUPPORTED_CARDS_NOTE = ("This version of Conduit can't draw these cards. On a call, show it as Markdown instead; "
+                          "in a typed chat, write it in your reply.")
+LEFT_OUT_NOTE = ("This version of Conduit can't draw {kinds} cards, so they weren't shown: give what they held in "
+                 "your reply.")
 SHOWN_NOTE = ("On the user's screen. Say in a sentence that it's there and give the gist; don't read it out or "
               "repeat it in your reply.")
 IN_CHAT_NOTE = ("The cards are shown in the chat; Markdown isn't, so put anything else in your reply. Give the "
@@ -145,11 +152,13 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
     markdown = args.get("markdown")
     given_markdown = isinstance(markdown, str) and bool(markdown.strip())
     left_out: list[str] = []
-    if any(card["type"] in card_schema.INFO_TYPES for card in cards) and not store.has_feature(INFO_CARDS_FEATURE):
+    hidden = {kind for feature, kinds in card_schema.FEATURE_TYPES.items()
+              if any(card["type"] in kinds for card in cards) and not store.has_feature(feature) for kind in kinds}
+    if hidden:
         # An older Conduit would draw nothing for them; Hermes hears which
         # ones so it can say what they held.
-        left_out = list(dict.fromkeys(card["type"] for card in cards if card["type"] in card_schema.INFO_TYPES))
-        cards = [card for card in cards if card["type"] not in card_schema.INFO_TYPES]
+        left_out = list(dict.fromkeys(card["type"] for card in cards if card["type"] in hidden))
+        cards = [card for card in cards if card["type"] not in hidden]
         if not cards and not given_markdown:
             return {"ok": False, "error": "unsupported_cards", "note": UNSUPPORTED_CARDS_NOTE}
     fallback = bool(cards) and not given_markdown

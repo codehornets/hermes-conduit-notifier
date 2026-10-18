@@ -1435,7 +1435,30 @@ keep only that field.
 - **Only where they're drawn.** A Conduit says `info-cards` in its
   exchange's `features` when it draws them. Without it, the tool leaves
   them out (`unsupported_cards` when nothing else is left), so an older
-  build never gets a card it would show as nothing.
+  build never gets a card it would show as nothing. Each phone's exchange
+  also leaves out the cards it can't draw and shows the Markdown instead.
+
+### Media, contact and live cards (plugin 0.47+)
+
+- **`media`**: up to 12 photos, videos or audio clips, as direct https links
+  (`kind`, `url`, and `title`, `by`, `caption`, `duration`, `artwork`,
+  `page`). Conduit shows photos in a gallery and plays video and audio
+  itself. A media card needs a `source`.
+- **`contact`**: up to six people (`people`: `name`, `detail`, `phone`,
+  `email`, `url`, `address`, `note`, and a `photo` with its source). Conduit
+  offers Call, Message, Email and Add to Contacts, and says "In your
+  contacts" when the person matches one the user already has (checked on
+  the phone, only when Conduit already has access). A phone or email that
+  doesn't read as one is dropped.
+- **`status`**: where something in progress stands (`state`, `phase`
+  waiting/active/done/problem, `progress` 0–1, `detail`, `eta`,
+  `milestones`).
+- **Live names.** Any card can carry `live`, a name Hermes picks. Showing a
+  card with the same live name again in the conversation replaces the
+  earlier one, on the call screen and in the chat, so Hermes keeps a
+  delivery, a score or a job's progress up to date by showing it again.
+- A Conduit says `media-cards` and `live-cards` in its exchange when it
+  draws them; the same gating as information cards applies.
 
 ## Health data from Conduit (plugin 0.23+)
 

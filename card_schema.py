@@ -1,6 +1,6 @@
-"""Conduit's rich cards: maps, places, stats, charts, forecasts, comparisons
-and steps Conduit draws natively, checked against the one schema both sides
-read (``cards/card-schema.json``).
+"""Conduit's rich cards: maps, places, stats, charts, forecasts, comparisons,
+steps, media, contacts and statuses Conduit draws natively, checked against
+the one schema both sides read (``cards/card-schema.json``).
 
 Hermes fills in a card's facts (a place's name, where it is, a rating it
 found and where from; numbers, a forecast, the steps of a recipe); Conduit
@@ -8,8 +8,10 @@ owns the look, and the phone adds what Apple Maps knows itself at draw time
 (address, category, phone, website, travel time, Look Around). So the schema
 has no fields for those, and a rating, hours, price or photo without a named
 source is left out rather than shown as fact. The other cards say where
-their information is from when Hermes names a source (a forecast must), and
-otherwise read as Hermes' own.
+their information is from when Hermes names a source (a forecast and media
+must), and otherwise read as Hermes' own; a contact says when the person is
+in the user's own contacts. A card with a ``live`` name replaces the earlier
+card of that name in the conversation, so a status can be kept up to date.
 
 Normalizing follows the schema and is the same in Conduit's Swift
 (``RichCardSchema``); ``cards/card-vectors.json`` holds the examples both
@@ -28,7 +30,9 @@ test suites run, so the two can't drift:
   first place; a chart keeps the series that fit its labels (one, never
   negative, for a pie); a forecast needs a source and something to show,
   and drops a day whose low is above its high; a comparison recommends one
-  option at most.
+  option at most; media needs a source, and an image has no duration or
+  artwork; a contact keeps only a phone and an email that look like one;
+  a live name is kept on the first card of a set that has it.
 
 The tool (agent process) and the dashboard (dashboard process, voice call
 turns) both use this module: the dashboard loads it by path, so it imports
@@ -74,12 +78,19 @@ def normalize_cards(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     cards = []
+    live = set()
     for raw in value:
         if len(cards) == MAX_CARDS:
             break
         card = normalize_card(raw)
-        if card is not None:
-            cards.append(card)
+        if card is None:
+            continue
+        if "live" in card:
+            if card["live"] in live:
+                del card["live"]
+            else:
+                live.add(card["live"])
+        cards.append(card)
     return cards
 
 
@@ -169,24 +180,33 @@ def clean_text(text: str) -> str:
 
 # Each type's own field; a card keeps it and the shared fields, and nothing else.
 _TYPE_FIELDS = {"map": ("places", "route"), "place": ("places",), "places": ("places",), "stats": ("stats",),
-                "chart": ("chart",), "weather": ("weather",), "comparison": ("options",), "steps": ("steps", "needs")}
-# The information cards (plugin 0.46+): they name a source, and a Conduit
-# draws them only when its exchange says "info-cards".
+                "chart": ("chart",), "weather": ("weather",), "comparison": ("options",), "steps": ("steps", "needs"),
+                "media": ("media",), "contact": ("people",), "status": ("status",)}
+PLACE_TYPES = ("map", "place", "places")
+# The information cards (plugin 0.46+), media and contacts, and statuses
+# (0.47+): a Conduit draws each group only when its exchange names it.
 INFO_TYPES = ("stats", "chart", "weather", "comparison", "steps")
+MEDIA_TYPES = ("media", "contact")
+LIVE_TYPES = ("status",)
+FEATURE_TYPES = {"info-cards": INFO_TYPES, "media-cards": MEDIA_TYPES, "live-cards": LIVE_TYPES}
+# A phone number's characters, and an address with nothing that could end a
+# link or a header early.
+_PHONE = re.compile(r"^[0-9+\-(). ]+$")
+_EMAIL = re.compile(r"^[^@\s<>()\[\]\"'`,;:\\]+@[^@\s<>()\[\]\"'`,;:\\]+\.[^@\s<>()\[\]\"'`,;:\\.]+$")
 
 
 def _apply_rules(card: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any] | None:
     kind = card["type"]
     if kind not in _TYPE_FIELDS:
         return None
-    keep = {"type", "title", *_TYPE_FIELDS[kind]}
-    if kind in INFO_TYPES:
+    keep = {"type", "title", "live", *_TYPE_FIELDS[kind]}
+    if kind not in PLACE_TYPES:
         keep.add("source")
     card = {key: value for key, value in card.items() if key in keep}
     field = _TYPE_FIELDS[kind][0]
     if field not in card:
         return None
-    if kind in ("map", "place", "places"):
+    if kind in PLACE_TYPES:
         return _place_rules(card, raw)
     if kind == "chart":
         chart = _chart_rules(card["chart"])
@@ -209,7 +229,33 @@ def _apply_rules(card: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any] | 
                 if seen:
                     del option["recommended"]
                 seen = True
+    elif kind == "media":
+        if "source" not in card:
+            return None
+        # The phone loads media over https only.
+        card["media"] = [item for item in card["media"] if _is_https(item["url"])]
+        if not card["media"]:
+            return None
+        for item in card["media"]:
+            if item["kind"] == "image" or not _is_https(item.get("artwork", "https://")):
+                item.pop("artwork", None)
+            if item["kind"] == "image":
+                item.pop("duration", None)
+    elif kind == "contact":
+        for person in card["people"]:
+            if "phone" in person and not _phone_ok(person["phone"]):
+                del person["phone"]
+            if "email" in person and not _EMAIL.match(person["email"]):
+                del person["email"]
     return card
+
+
+def _is_https(url: str) -> bool:
+    return url[:8].lower() == "https://"
+
+
+def _phone_ok(phone: str) -> bool:
+    return bool(_PHONE.match(phone)) and 3 <= sum(char.isdigit() for char in phone) <= 20
 
 
 def _place_rules(card: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
@@ -426,8 +472,68 @@ def _number(value: float) -> str:
     return "0" if text in ("-0", "") else text
 
 
+def _media_markdown(card: dict[str, Any]) -> list[str]:
+    rows = []
+    for item in card["media"]:
+        name = _escape(item.get("title") or _MEDIA_KINDS[item["kind"]])
+        row = f"- [{name}]({item['url']})"
+        if item.get("by"):
+            row += f" · {_escape(item['by'])}"
+        if item.get("duration"):
+            row += f" ({_duration(item['duration'])})"
+        if item.get("caption"):
+            row += f": {_escape(item['caption'])}"
+        rows.append(row)
+    return ["\n".join(rows)]
+
+
+_MEDIA_KINDS = {"image": "Photo", "video": "Video", "audio": "Audio"}
+
+
+def _contact_markdown(card: dict[str, Any]) -> list[str]:
+    parts = []
+    for person in card["people"]:
+        head = f"**{_escape(person['name'])}**"
+        if person.get("detail"):
+            head += f" · {_escape(person['detail'])}"
+        lines = [head]
+        lines.extend(_escape(person[key]) for key in ("phone", "email", "address") if person.get(key))
+        if person.get("url"):
+            lines.append(f"[Website]({person['url']})")
+        if person.get("note"):
+            lines.append(f"_{_escape(person['note'])}_")
+        parts.append("  \n".join(lines))
+    return parts
+
+
+_PHASES = {"waiting": "Not started", "active": "", "done": "Done", "problem": "Problem"}
+
+
+def _status_markdown(card: dict[str, Any]) -> list[str]:
+    status = card["status"]
+    head = f"**{_escape(status['state'])}**"
+    phase = _PHASES.get(status.get("phase", "active"), "")
+    if phase and phase.lower() != status["state"].lower():
+        head += f" ({phase})"
+    facts = []
+    if "progress" in status:
+        facts.append(f"{round(status['progress'] * 100)}%")
+    if status.get("eta"):
+        facts.append(_escape(status["eta"]))
+    if facts:
+        head += " · " + " · ".join(facts)
+    lines = [head]
+    if status.get("detail"):
+        lines.append(_escape(status["detail"]))
+    if status.get("milestones"):
+        lines.append(" → ".join(("✓ " if stage.get("done") else "") + _escape(stage["label"])
+                                for stage in status["milestones"]))
+    return ["  \n".join(lines)]
+
+
 _INFO_MARKDOWN = {"stats": _stats_markdown, "chart": _chart_markdown, "weather": _weather_markdown,
-                  "comparison": _comparison_markdown, "steps": _steps_markdown}
+                  "comparison": _comparison_markdown, "steps": _steps_markdown, "media": _media_markdown,
+                  "contact": _contact_markdown, "status": _status_markdown}
 
 
 def _sourced_name(source: dict[str, Any]) -> str:

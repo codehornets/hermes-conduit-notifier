@@ -99,12 +99,39 @@ def test_fallback_markdown_shows_information_cards_and_their_sources():
 
 def test_every_type_has_its_field_and_markdown():
     fields = {"map": "places", "place": "places", "places": "places", "stats": "stats", "chart": "chart",
-              "weather": "weather", "comparison": "options", "steps": "steps"}
+              "weather": "weather", "comparison": "options", "steps": "steps", "media": "media",
+              "contact": "people", "status": "status"}
     assert set(card_schema.CARD_SCHEMA["properties"]["type"]["enum"]) == set(fields)
     for kind, field in fields.items():
         assert card_schema._TYPE_FIELDS[kind][0] == field
         assert field in card_schema.CARD_SCHEMA["properties"]
-    assert set(card_schema.INFO_TYPES) == set(card_schema._INFO_MARKDOWN)
+    gated = [kind for kinds in card_schema.FEATURE_TYPES.values() for kind in kinds]
+    assert set(gated) == set(card_schema._INFO_MARKDOWN) == set(fields) - set(card_schema.PLACE_TYPES)
+
+
+def test_fallback_markdown_shows_media_contacts_and_statuses():
+    cards = card_schema.normalize_cards([
+        {"type": "media", "source": {"name": "NASA"}, "media": [
+            {"kind": "image", "url": "https://a.test/moon.jpg", "title": "Moon", "duration": 9},
+            {"kind": "audio", "url": "https://a.test/talk.mp3", "by": "JPL", "duration": 125}]},
+        {"type": "contact", "people": [{"name": "Dr *Lee*", "detail": "Dentist", "phone": "+1 (415) 555-0100",
+                                        "email": "a@b.co"}, {"name": "X", "phone": "tel:1"}]},
+        {"type": "status", "live": "order", "status": {"state": "Out for delivery", "progress": 0.75, "eta": "14:20",
+                                                      "milestones": [{"label": "Shipped", "done": True},
+                                                                     {"label": "Delivered"}]}}])
+    assert "duration" not in cards[0]["media"][0], "an image has no length"
+    assert "phone" not in cards[1]["people"][1], "only something that reads as a phone number"
+    text = card_schema.fallback_markdown(cards)
+    assert "- [Moon](https://a.test/moon.jpg)" in text and "- [Audio](https://a.test/talk.mp3) · JPL (2 min 5 s)" in text
+    assert "_From NASA_" in text
+    assert "**Dr \\*Lee\\*** · Dentist  \n+1 (415) 555-0100  \na@b.co" in text
+    assert "**Out for delivery** · 75% · 14:20  \n✓ Shipped → Delivered" in text
+
+
+def test_a_live_name_stays_on_the_first_card_that_has_it():
+    status = {"type": "status", "live": "deploy", "status": {"state": "Building"}}
+    first, second = card_schema.normalize_cards([status, status])
+    assert first["live"] == "deploy" and "live" not in second
 
 
 def test_a_url_that_could_end_a_link_is_invalid():

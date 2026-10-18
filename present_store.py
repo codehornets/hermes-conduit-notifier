@@ -86,8 +86,6 @@ MAX_CARD_MARKDOWN_CHARS = 8000
 # exchanged for Hermes to count on it (a phone in a voice conversation
 # exchanges at least every reply).
 SHOW_FEATURE = "show-cards"
-# A phone that draws stats, charts, forecasts, comparisons and steps.
-INFO_CARDS_FEATURE = "info-cards"
 SHOW_DEVICE_RECENT_S = 6 * 3600
 # How often an unchanged phone's last-seen time is refreshed.
 SEEN_REFRESH_S = 60
@@ -276,6 +274,13 @@ class PresentStore:
                 card["cards"] = rich
                 if markdown_is_fallback:
                     card["fallback"] = True
+            # A card with a live name replaces the conversation's earlier
+            # card of that name.
+            live = {item["live"] for item in rich if "live" in item}
+            if live:
+                state["cards"] = [old for old in state["cards"]
+                                  if old.get("session_id") != card["session_id"]
+                                  or not any(item.get("live") in live for item in old.get("cards", []))]
             state["cards"] = (state["cards"] + [card])[-MAX_CARDS:]
             state["shown"] = (recent + [now])[-CARDS_PER_HOUR:]
             return dict(card)
@@ -586,14 +591,16 @@ def _normalized(raw: Any, now: float) -> dict[str, Any]:
 
 
 def _for_device(card: dict[str, Any], features: list[str]) -> dict[str, Any]:
-    """A copy of the card for one phone: one that doesn't draw information
-    cards gets the rest, with the Markdown shown (it covers what was left
-    out), or just the Markdown when nothing else is left."""
+    """A copy of the card for one phone: one that doesn't draw some kinds of
+    card (it doesn't name their feature) gets the rest, with the Markdown
+    shown (it covers what was left out), or just the Markdown when nothing
+    else is left."""
     card = dict(card)
     schema = _card_schema()
-    if INFO_CARDS_FEATURE in features or not card.get("cards") or schema is None:
+    if not card.get("cards") or schema is None:
         return card
-    kept = [rich for rich in card["cards"] if rich.get("type") not in schema.INFO_TYPES]
+    hidden = {kind for feature, kinds in schema.FEATURE_TYPES.items() if feature not in features for kind in kinds}
+    kept = [rich for rich in card["cards"] if rich.get("type") not in hidden]
     if len(kept) == len(card["cards"]):
         return card
     if kept:
