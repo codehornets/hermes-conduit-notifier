@@ -9,9 +9,10 @@ the turn and again when the turn ends. Conduit opens the card over the call;
 Hermes says in a sentence that it's there. A card nobody picks up within ten
 minutes is dropped: it belongs to the conversation it was shown in.
 
-Maps and places go as rich cards (``cards``, checked against
-``card_schema``): Conduit draws them natively, in a typed chat as well as on
-a call, and fills in what Apple Maps knows on the phone. The call's normalized
+Maps, places, stats, charts, forecasts, comparisons and steps go as rich
+cards (``cards``, checked against ``card_schema``): Conduit draws them
+natively, in a typed chat as well as on a call, and fills in what Apple Maps
+knows on the phone. The call's normalized
 cards come back in the tool's answer, so they stay in the chat's history and
 Conduit draws them again whenever the chat is opened. Without ``markdown``,
 the cards' own Markdown is shown where they can't be drawn.
@@ -26,7 +27,7 @@ from typing import Any, Callable
 from hermes_constants import get_hermes_home
 
 from . import card_schema, client, reply_sources
-from .present_store import MAX_CARD_MARKDOWN_CHARS, MAX_CARD_TITLE_CHARS, PresentError, PresentStore
+from .present_store import INFO_CARDS_FEATURE, MAX_CARD_MARKDOWN_CHARS, MAX_CARD_TITLE_CHARS, PresentError, PresentStore
 
 logger = logging.getLogger("hermes.plugins.conduit_push")
 
@@ -40,14 +41,18 @@ SCHEMA: dict[str, Any] = {
     "description": (
         "Show something on the user's phone screen in Conduit. On a voice call, use it for anything better seen "
         "than heard: tables, charts, forecasts, recipes and other step-by-step instructions, lists, comparisons, "
-        "code, images and links, and whenever the user asks to see or show something. Write Markdown: tables for "
-        "data, numbered lists for steps, ```mermaid blocks for charts, ![description](url) for images (direct image "
+        "code, images and links, and whenever the user asks to see or show something. Prefer cards, which Conduit "
+        "draws natively, on a call or in a typed chat: a map with pins and a route, one place in detail, several "
+        "places to swipe through, big numbers (stats), a line, bar or pie chart, a weather forecast, a comparison "
+        "of two to four options, or steps the user can tick off, with timers. For places, Conduit adds what Apple "
+        "Maps knows (address, phone, website, travel time), so give names, addresses, coordinates or conduit_maps "
+        "place ids, and only ratings, hours, prices and photos you actually found, each with its source; never draw "
+        "a map of your own as an HTML page. Name the "
+        "source of numbers and forecasts you got from a tool or site; a forecast needs one. For anything else, "
+        "write Markdown: tables for data, numbered lists for steps, ![description](url) for images (direct image "
         "URLs you actually found) and [title](url) for links. Then say in a sentence that it's on their screen and "
-        "give the gist; don't read it out, and don't repeat it in your reply. For places, on a call or in a typed "
-        "chat, use cards instead: a map with pins and a route, one place in detail, or several to swipe through. "
-        "Conduit draws them and adds what Apple Maps knows (address, phone, website, travel time), so give names, "
-        "addresses, coordinates or conduit_maps place ids, and only ratings, hours, prices and photos you actually "
-        "found, each with its source. In a typed chat, use it only for cards and write the rest in your reply."
+        "give the gist; don't read it out, and don't repeat it in your reply. In a typed chat, use it only for "
+        "cards and write the rest in your reply."
     ),
     "parameters": {
         "type": "object",
@@ -57,12 +62,19 @@ SCHEMA: dict[str, Any] = {
             "markdown": {"type": "string", "maxLength": MAX_CARD_MARKDOWN_CHARS,
                          "description": f"What to show, as Markdown (up to {MAX_CARD_MARKDOWN_CHARS} characters). "
                                         "Leave it out when cards say it all."},
-            "cards": card_schema.tool_parameter("Maps and places for Conduit to draw, shown above the Markdown."),
+            "cards": card_schema.tool_parameter("Cards for Conduit to draw, shown above the Markdown."),
         },
         "required": ["title"],
     },
 }
 
+INVALID_CARDS_NOTE = ("None of the cards could be shown: each needs a type and that type's field (places with "
+                      "names for map, place and places; stats, chart, weather, options or steps for the others), "
+                      "and a forecast needs its source.")
+UNSUPPORTED_CARDS_NOTE = ("This version of Conduit draws only map, place and places cards. On a call, show it as "
+                          "Markdown instead; in a typed chat, write it in your reply.")
+LEFT_OUT_NOTE = ("This version of Conduit draws only map, place and places cards, so the {kinds} card(s) weren't "
+                 "shown: give what they held in your reply.")
 SHOWN_NOTE = ("On the user's screen. Say in a sentence that it's there and give the gist; don't read it out or "
               "repeat it in your reply.")
 IN_CHAT_NOTE = ("The cards are shown in the chat; Markdown isn't, so put anything else in your reply. Give the "
@@ -123,19 +135,26 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
     given = args.get("cards")
     cards = card_schema.normalize_cards(given)
     if given not in (None, []) and not cards:
-        return {"ok": False, "error": "invalid_cards",
-                "note": "None of the cards could be shown: each needs a type (map, place or places) and places "
-                        "with names."}
-    markdown = args.get("markdown")
-    fallback = bool(cards) and (not isinstance(markdown, str) or not markdown.strip())
-    if fallback:
-        markdown = _fallback(cards)
+        return {"ok": False, "error": "invalid_cards", "note": INVALID_CARDS_NOTE}
     if cards and _turn_source() not in (None, "conduit"):
         # Desktop, a messaging app or the terminal draws no cards.
         return {"ok": False, "error": "not_conduit",
                 "note": "This conversation isn't open in Conduit, so cards can't be drawn. Write it in your "
                         "reply instead."}
     store = _store()
+    markdown = args.get("markdown")
+    given_markdown = isinstance(markdown, str) and bool(markdown.strip())
+    left_out: list[str] = []
+    if any(card["type"] in card_schema.INFO_TYPES for card in cards) and not store.has_feature(INFO_CARDS_FEATURE):
+        # An older Conduit would draw nothing for them; Hermes hears which
+        # ones so it can say what they held.
+        left_out = list(dict.fromkeys(card["type"] for card in cards if card["type"] in card_schema.INFO_TYPES))
+        cards = [card for card in cards if card["type"] not in card_schema.INFO_TYPES]
+        if not cards and not given_markdown:
+            return {"ok": False, "error": "unsupported_cards", "note": UNSUPPORTED_CARDS_NOTE}
+    fallback = bool(cards) and not given_markdown
+    if fallback:
+        markdown = _fallback(cards)
     try:
         card = store.show(args.get("title"), markdown, session_id=session, cards=cards,
                           markdown_is_fallback=fallback)
@@ -143,17 +162,21 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
         if error.code == "no_device" and cards and store.has_feature(CHAT_CARDS_FEATURE):
             # No call screen to put it on, but the chat draws it from this
             # answer.
-            return {"ok": True, "cards": cards, "note": IN_CHAT_NOTE}
+            return {"ok": True, "cards": cards, "note": _with_left_out(IN_CHAT_NOTE, left_out)}
         note = str(error)
         if error.code in ("no_device", "rate_limited"):
             note += " Tell the user the gist instead."
-        return {"ok": False, "error": error.code, "note": note}
+        return {"ok": False, "error": error.code, "note": _with_left_out(note, left_out)}
     answer: dict[str, Any] = {"ok": True, "id": card["id"]}
     if cards:
         # The chat's history keeps the cards from here.
         answer["cards"] = cards
-    answer["note"] = SHOWN_NOTE
+    answer["note"] = _with_left_out(SHOWN_NOTE, left_out)
     return answer
+
+
+def _with_left_out(note: str, left_out: list[str]) -> str:
+    return f"{note} {LEFT_OUT_NOTE.format(kinds=', '.join(left_out))}" if left_out else note
 
 
 def _fallback(cards: list[dict[str, Any]]) -> str:

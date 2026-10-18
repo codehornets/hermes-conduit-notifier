@@ -241,6 +241,37 @@ def test_cards_that_are_all_invalid_are_refused(tool_home):
     assert "cards" not in _exchange(PresentStore(tool_home))
 
 
+STATS = {"type": "stats", "stats": [{"label": "Steps", "value": "8,412"}], "source": {"name": "Health"}}
+
+
+def test_information_cards_go_only_to_a_conduit_that_draws_them(tool_home):
+    _exchange(PresentStore(tool_home), features=("chat-cards",))
+    answer = _call({"title": "Today", "cards": [STATS]})
+    assert answer["ok"] is False and answer["error"] == "unsupported_cards", "an older Conduit would draw nothing"
+    answer = _call({"title": "Today", "cards": [STATS, MAP]})
+    assert answer["ok"] is True and answer["cards"] == [CLEAN_MAP], "the cards it can draw still go"
+    assert "stats card(s) weren't shown" in answer["note"], "Hermes hears what was left out"
+    answer = _call({"title": "Today", "markdown": "**Steps** 8,000", "cards": [STATS]})
+    assert answer["error"] == "no_device", "Markdown Hermes wrote still goes to a call screen, without the cards"
+    _exchange(PresentStore(tool_home), features=("chat-cards", "info-cards"))
+    answer = _call({"title": "Today", "cards": [STATS]})
+    assert answer == {"ok": True, "cards": [STATS], "note": tool.IN_CHAT_NOTE}
+
+
+def test_a_phone_without_information_cards_gets_only_what_it_draws(store):
+    _exchange(store, features=("show-cards", "info-cards"))
+    store.show("Today", TABLE, cards=[STATS, CLEAN_MAP], markdown_is_fallback=True)
+    store.show("Steps", TABLE, cards=[STATS], markdown_is_fallback=True)
+    old = {"installation_id": "older-phone", "device": "iPhone", "app_version": "1.9", "results": [],
+           "features": ["show-cards"]}
+    mixed, info_only = store.exchange(old)["cards"]
+    assert mixed["cards"] == [CLEAN_MAP], "an older build gets the cards it draws"
+    assert "fallback" not in mixed, "and the Markdown, which covers what was left out"
+    assert "cards" not in info_only and "fallback" not in info_only, "and the Markdown when nothing else is left"
+    assert [card["cards"] for card in _exchange(store, features=("show-cards", "info-cards"))["cards"]] == \
+        [[STATS, CLEAN_MAP], [STATS]]
+
+
 def test_cards_are_refused_where_conduit_isnt_drawing_them(tool_home, monkeypatch):
     _exchange(PresentStore(tool_home), features=("chat-cards",))
     monkeypatch.setattr(tool, "_turn_source", lambda: "messaging")
