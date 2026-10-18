@@ -1357,6 +1357,8 @@ that phone gets the cards; subagents can't use it. Limits:
 natively, in a typed chat as well as on a call. `markdown` is optional with
 cards; without it, the cards' own Markdown (each place with an Apple Maps
 link) is what a phone that doesn't draw cards, or another client, shows.
+A call-screen card whose Markdown is only that text carries `"fallback": true`
+in the exchange (0.45.1+), so a phone that draws the cards leaves it out.
 
 - **One schema.** [`cards/card-schema.json`](cards/card-schema.json) is the
   only definition. The tool's `cards` parameter is built from it and

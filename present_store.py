@@ -17,7 +17,8 @@ The same exchange carries the cards ``conduit_show`` puts on the screen of
 a voice call (a table, steps, a chart): short-lived, shown once by a phone
 that says it can (feature ``show-cards``), never answered. A card can carry
 rich cards (maps and places, ``card_schema``) beside its Markdown; a phone
-that doesn't draw them shows the Markdown.
+that doesn't draw them shows the Markdown. ``fallback`` marks Markdown that
+is only the cards' own text, which a phone that draws them leaves out.
 
 State lives in the profile's ``conduit-present.json`` beside the pairing
 state. The tool (agent process) and the dashboard route (dashboard process)
@@ -239,10 +240,12 @@ class PresentStore:
             state["asked"] = (recent + [now])[-PER_HOUR:]
             return _shown(prompt)
 
-    def show(self, title: Any, markdown: Any, *, session_id: Any = None, cards: Any = None) -> dict[str, Any]:
+    def show(self, title: Any, markdown: Any, *, session_id: Any = None, cards: Any = None,
+             markdown_is_fallback: bool = False) -> dict[str, Any]:
         """Keeps a card for the screen of the user's voice call. ``cards``
         are rich cards, already normalized; ``markdown`` is what shows where
-        they can't be drawn. Raises PresentError when it won't."""
+        they can't be drawn (``markdown_is_fallback``: only there, it's the
+        cards' own text). Raises PresentError when it won't."""
         clean_title = _line(title, MAX_CARD_TITLE_CHARS + 1)
         if not clean_title:
             raise PresentError("no_title", "Give a short title, a few words.")
@@ -268,6 +271,8 @@ class PresentStore:
                     "session_id": _line(session_id, 180), "created_at": created, "expires_at": created + CARD_TTL_S}
             if rich:
                 card["cards"] = rich
+                if markdown_is_fallback:
+                    card["fallback"] = True
             state["cards"] = (state["cards"] + [card])[-MAX_CARDS:]
             state["shown"] = (recent + [now])[-CARDS_PER_HOUR:]
             return dict(card)
@@ -603,6 +608,8 @@ def _card(raw: Any, now: float) -> dict[str, Any] | None:
     rich = schema.normalize_cards(raw.get("cards")) if schema else []
     if rich:
         card["cards"] = rich
+        if raw.get("fallback") is True:
+            card["fallback"] = True
     return card
 
 

@@ -127,7 +127,8 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
                 "note": "None of the cards could be shown: each needs a type (map, place or places) and places "
                         "with names."}
     markdown = args.get("markdown")
-    if cards and (not isinstance(markdown, str) or not markdown.strip()):
+    fallback = bool(cards) and (not isinstance(markdown, str) or not markdown.strip())
+    if fallback:
         markdown = _fallback(cards)
     if cards and _turn_source() not in (None, "conduit"):
         # Desktop, a messaging app or the terminal draws no cards.
@@ -136,7 +137,8 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
                         "reply instead."}
     store = _store()
     try:
-        card = store.show(args.get("title"), markdown, session_id=session, cards=cards)
+        card = store.show(args.get("title"), markdown, session_id=session, cards=cards,
+                          markdown_is_fallback=fallback)
     except PresentError as error:
         if error.code == "no_device" and cards and store.has_feature(CHAT_CARDS_FEATURE):
             # No call screen to put it on, but the chat draws it from this

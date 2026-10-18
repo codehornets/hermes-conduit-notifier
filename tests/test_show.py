@@ -213,6 +213,7 @@ def test_cards_go_to_the_call_screen_and_come_back_normalized(tool_home):
     assert "**Kin Khao**" in card["markdown"] and "maps.apple.com" in card["markdown"], \
         "a screen that doesn't draw cards shows their Markdown"
     assert "4.4" not in card["markdown"], "an unsourced rating is shown nowhere"
+    assert card["fallback"] is True, "a phone that draws the cards leaves their Markdown out"
 
 
 def test_given_markdown_is_kept_beside_cards(tool_home):
@@ -220,6 +221,7 @@ def test_given_markdown_is_kept_beside_cards(tool_home):
     _call({"title": "Dinner", "markdown": TABLE, "cards": [MAP]})
     [card] = _exchange(PresentStore(tool_home))["cards"]
     assert card["markdown"] == TABLE and card["cards"] == [CLEAN_MAP]
+    assert "fallback" not in card, "Markdown Hermes wrote shows beside the cards"
 
 
 def test_cards_show_in_a_chat_without_a_call_screen(tool_home):
@@ -259,9 +261,11 @@ def test_a_card_on_disk_keeps_only_valid_rich_cards(store):
     store.show("Dinner", TABLE, cards=[CLEAN_MAP])
     state = json.loads(store.path.read_text())
     state["cards"][0]["cards"].append({"type": "weather"})
+    state["cards"][0]["fallback"] = "yes"
     store.path.write_text(json.dumps(state))
     [card] = _exchange(store)["cards"]
     assert card["cards"] == [CLEAN_MAP]
+    assert "fallback" not in card, "only a true flag is kept"
 
 
 def test_a_turn_source_lookup_that_fails_draws_no_cards(tool_home, monkeypatch):
