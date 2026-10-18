@@ -27,5 +27,10 @@
         }
       }
     }
+  },
+  "permission": {
+    "edit": "deny",
+    "bash": "deny",
+    "webfetch": "deny"
   }
 }
