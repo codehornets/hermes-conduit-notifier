@@ -871,6 +871,47 @@ the server speaks Classic's replies in its own voice. Classic then uses one
 server for listening and speaking. While the reply plays, Classic may open
 its listening socket too, so start the server with `--num_pipelines 2`.
 
+### Local Live on a read-back speech server (plugin 0.49+)
+
+Some speech servers only listen and read text aloud, with no model of their
+own: a response reads back the user text it's given, and a session that asks
+for automatic responses (`turn_detection.create_response: true`) is refused.
+The farm's fleet voice adapter is one. Such a server never asks the model
+address for a reply, so the plugin runs the call's turns on the relay instead
+(capability `local-live-read-back`), on the phone's socket and the Watch's
+bridge alike:
+
+- When the server refuses automatic responses for that reason
+  (`realtime_live_unavailable`, or an error naming
+  `turn_detection.create_response`), the plugin sends the call's
+  session.update again with `create_response` and `interrupt_response` off.
+  Conduit never sees the refusal.
+- Each finished transcription (`conversation.item.input_audio_transcription.completed`)
+  starts the call's turn, as the model address would. The readiness check's
+  marker and a typed turn do too, so neither is read aloud.
+- The reply, as it streams, goes back in sentences, one read-back
+  `response.create` (inline input) per sentence, one at a time. The first
+  sentence goes as soon as it ends; later ones join until they're 40
+  characters, and text that waits 1.2 s goes anyway.
+- Conduit sees one response per reply, however many sentences it takes, with
+  its transcript spaced between them, and an empty reply as a response that
+  begins and ends.
+- When the user starts speaking over the reply (`input_audio_buffer.speech_started`),
+  the reply stops: the plugin cancels the server's response, drops its late
+  audio, and lets the turn go, as a server that answers by itself would.
+  While nothing of the reply has been said yet (Hermes still at work), only
+  words stop it: its first sentence waits until the speech is transcribed
+  (10 s at most), the words start a new turn, and a sound that transcribes
+  to nothing lets the reply go on.
+- A cancelled response the server says nothing more about is over after 2 s,
+  and one that goes quiet (not started, or no audio) for 30 s is given up on.
+- A server whose transcripts of two sentences in a row don't match them
+  (sentences of five words or more, without digits) isn't reading back. The
+  call ends with a reason: close code 4400 on the phone's socket, an `error`
+  with code `refused` on the Watch's bridge.
+
+Nothing changes for a server that answers by itself.
+
 ### Local Live on the Apple Watch (plugin 0.48+)
 
 A Watch call on Local Live uses the same server, key and model address. The
