@@ -160,9 +160,13 @@ counts. Inactive installations remain in the store and still consume slots:
 automatic APNs deactivation and repeated uninstall/reinstall cycles count
 toward the installation limit (50,000 by default, `RELAY_MAX_INSTALLATIONS`),
 which the printed maximum reflects. Review counts before scheduling offline data
-maintenance; the relay never deletes installation records or their
-credentials automatically. `DELETE /v1/installations/:id` deactivates an
-installation and does not free its slot.
+maintenance. `DELETE /v1/installations/:id` deactivates an installation and
+does not free its slot right away. When the relay is full, a new
+registration takes the slot of the longest-inactive installation (with its
+pairing codes and parked decisions): an inactive installation can never be
+used again, since its credential no longer authenticates and its hosts'
+events are refused. Only a relay full of active installations refuses new
+ones.
 
 For offline reclamation, `storage:prune-inactive` previews the number of
 eligible records by default. It removes only installations that have been
@@ -201,8 +205,9 @@ gateway-bound inactive records still require separately reviewed maintenance.
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/healthz` | Health check |
-| POST | `/v1/installations` | Register a device |
-| PUT | `/v1/installations/:id` | Update device token, PushKit token (`voip_token`, `null` clears it), the paired Apple Watch's PushKit token (`watch_voip_token`, 0.10+), location push token (`location_token`, 0.12+) / preferences |
+| POST | `/v1/token-challenges` | Push a one-time registration nonce to `device_token` (`bundle_id`, `environment` as for registering); 0.16+ |
+| POST | `/v1/installations` | Register a device; `token_proof` carries the pushed nonce (see "Registration proof") |
+| PUT | `/v1/installations/:id` | Update device token (a new one needs `token_proof`), PushKit token (`voip_token`, `null` clears it), the paired Apple Watch's PushKit token (`watch_voip_token`, 0.10+), location push token (`location_token`, 0.12+) / preferences |
 | DELETE | `/v1/installations/:id` | Deactivate a device |
 | POST | `/v1/installations/:id/pairings` | Create a pairing code |
 | POST | `/v1/pairings/claim` | Claim a pairing code (gateway side) |
@@ -279,6 +284,36 @@ otherwise), lasts 2 minutes in memory, and is at most 96 KB; the relay holds
 fetches at a time. An older relay ignores `start`, and the Watch then starts
 the call over its link to the iPhone, as before.
 
+### Registration proof
+
+A phone proves it holds the APNs device token it registers. It asks
+`POST /v1/token-challenges` for a challenge, the relay sends a silent push
+carrying a one-time nonce (`conduit_token_challenge`) to that token, and the
+phone sends the nonce back as `token_proof` with `POST /v1/installations`, or
+with a `PUT` that moves the installation to a new device token. A nonce lasts
+10 minutes and works once. Without a proof the relay answers `403`
+`token_proof_required`; a wrong or expired one gets `token_proof_invalid`.
+
+So a token that leaks (a data-file backup, a log) can't be bound to someone
+else's installation, and filling the relay's installation slots takes real
+phones running the app rather than a script. A proven registration retires
+the same phone's earlier installations for that token. PushKit and location
+tokens can't be challenged this way, so a registration or update naming one
+that another active installation already holds is accepted without it: a
+registration gets none (`voip`, `watch_voip` or `location` comes back
+`false`), and an update keeps the token the installation had.
+
+A challenge answers `400 invalid_device_token` when APNs refuses the token,
+so it shows whether a token is currently live for the app. The nonce never
+reaches whoever asked, so that grants nothing else, and per-token, per-IP
+and relay-wide limits bound such probing.
+
+`RELAY_TOKEN_PROOF` is `required` by default. `optional` still accepts
+registrations and token changes without a proof (a proof that is sent must
+be valid): use it only while app builds from before token proof still need
+to register. Installations registered before token proof keep working
+either way; they need a proof only to move to a new device token.
+
 ### Capacity and admission limits
 
 The defaults are sized for the shared public relay with thousands of
@@ -296,6 +331,7 @@ integer stops the relay at boot.
 | Active clarify decisions across the relay | 1,024 | `RELAY_MAX_ACTIVE_DECISIONS` |
 | Retained clarify decisions across the relay | 4,096 | `RELAY_MAX_RETAINED_DECISIONS` |
 | Registrations per minute | 24 | `RELAY_REGISTRATIONS_PER_MINUTE` |
+| Registration challenges per minute (each is a push; also 5 per device token per 10 minutes and 12 per IP address per minute, fixed) | 240 | `RELAY_TOKEN_CHALLENGES_PER_MINUTE` |
 | Events per minute | 6,000 | `RELAY_EVENTS_PER_MINUTE` |
 | Device updates that change state, pairing creations, and valid claims per minute | 240 | `RELAY_DEVICE_CHANGES_PER_MINUTE` |
 | Decision answers and releases that change state per minute | 600 | `RELAY_DECISION_ACTIONS_PER_MINUTE` |
@@ -461,7 +497,8 @@ native clarify path remains available, and existing decisions remain
 answerable, pollable, and cancellable.
 
 The global limits apply across every installation. Because installation
-self-registration is open, one actor can create multiple installations,
+self-registration is open to anyone with a phone running the app, one actor
+can create multiple installations,
 occupy the global active and retained pools, and keep refreshing them as
 records expire, denying new relay clarifies indefinitely. The relay cannot
 identify a shared actor or enforce fairness from installation IDs alone.

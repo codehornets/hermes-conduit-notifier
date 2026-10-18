@@ -93,6 +93,7 @@ def relay():
             "APNS_KEY_ID": "AAAAAAAAAA",
             "APNS_TEAM_ID": "BBBBBBBBBB",
             "APNS_TOPIC": "com.milim.relay",
+            "RELAY_TOKEN_PROOF": "optional",
             "APNS_MODE": "accept",
             "RELAY_TEST_SEAMS": "1",
         },

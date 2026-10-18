@@ -222,8 +222,64 @@ export class RelayStore {
   }
 
   assertInstallationCapacity() {
-    if (Object.keys(this.data.installations).length >= this.limits.maxInstallations) throw capacityError('installation_limit_reached');
+    if (Object.keys(this.data.installations).length < this.limits.maxInstallations) return true;
+    if (!this.reclaimInactiveInstallation()) throw capacityError('installation_limit_reached');
     return true;
+  }
+
+  // Refuses only a relay full of active installations; reclaiming waits for
+  // a registration that will go through (assertInstallationCapacity).
+  assertInstallationRoom() {
+    if (Object.keys(this.data.installations).length < this.limits.maxInstallations) return true;
+    if (Object.values(this.data.installations).some((installation) => installation && typeof installation === 'object' && !installation.active)) return true;
+    throw capacityError('installation_limit_reached');
+  }
+
+  // A full relay makes room by forgetting the longest-inactive installation
+  // (#142). Inactive is final: its credential no longer authenticates and
+  // its hosts' events are refused, so the record only takes a slot.
+  reclaimInactiveInstallation() {
+    let oldest;
+    for (const installation of Object.values(this.data.installations)) {
+      if (!installation || typeof installation !== 'object' || installation.active) continue;
+      if (!oldest || String(installation.updatedAt ?? '') < String(oldest.updatedAt ?? '')) oldest = installation;
+    }
+    if (!oldest) return false;
+    delete this.data.installations[oldest.id];
+    for (const [key, pairing] of Object.entries(this.data.pairings)) {
+      if (pairing?.installationId === oldest.id) delete this.data.pairings[key];
+    }
+    for (const [key, decision] of Object.entries(this.data.pendingDecisions ?? {})) {
+      if (decision?.installationId === oldest.id) delete this.data.pendingDecisions[key];
+    }
+    this.save();
+    this.onReclaim?.(oldest.id);
+    return true;
+  }
+
+  // Another active installation that registered this push token, or null.
+  // `field` is deviceToken, voipToken, watchVoipToken or locationToken.
+  // Installations registered for `sameDeviceToken` (the same phone) don't count.
+  activeInstallationWithToken(field, token, exceptId, sameDeviceToken) {
+    if (!token) return null;
+    for (const installation of Object.values(this.data.installations)) {
+      if (sameDeviceToken && installation?.deviceToken === sameDeviceToken) continue;
+      if (installation?.active && installation.id !== exceptId && installation[field] === token) return installation;
+    }
+    return null;
+  }
+
+  // A phone that proved it holds `deviceToken` replaces any earlier
+  // registration of it: those are the same phone's stale records.
+  retireOtherInstallationsWithDeviceToken(deviceToken, exceptId) {
+    const retired = [];
+    for (const installation of Object.values(this.data.installations)) {
+      if (installation?.active && installation.id !== exceptId && installation.deviceToken === deviceToken) {
+        this.deactivateInstallation(installation.id);
+        retired.push(installation.id);
+      }
+    }
+    return retired;
   }
 
   // The installation record for a ring settled with its token (rings.mjs),

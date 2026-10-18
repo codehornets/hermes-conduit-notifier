@@ -312,7 +312,11 @@ test('installation and gateway quotas reject new records without evicting existi
   assert.equal(relay.acceptEvent(first.installation.id, 'event-0002', claim.gatewayId), false);
   relay.deactivateInstallation(first.installation.id);
   assert.equal(relay.data.installations[first.installation.id].active, false);
-  assert.throws(() => relay.createInstallation({ bundleId: 'app', deviceToken: 'c'.repeat(64), environment: 'production' }), /installation_limit_reached/);
+  // An inactive installation can never be used again, so a full relay
+  // gives its slot to the next registration (#142).
+  const third = relay.createInstallation({ bundleId: 'app', deviceToken: 'c'.repeat(64), environment: 'production' });
+  assert.deepEqual(Object.keys(relay.data.installations), [third.installation.id]);
+  assert.equal(Object.keys(relay.data.pairings).length, 0, 'its pairing code goes with it');
 });
 
 test('loading a store already above a configured quota preserves all existing records', () => {

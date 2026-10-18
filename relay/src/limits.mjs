@@ -43,6 +43,9 @@ export const DEFAULT_LIVE_ACTIVITY_LIMITS = Object.freeze({
 // Process-wide admissions per minute, per class of action.
 export const DEFAULT_BUDGETS = Object.freeze({
   registrationsPerMinute: 24,
+  // Registration challenges (token-proof.mjs): each is a push, and a phone
+  // asks for one before registering or moving to a new device token.
+  tokenChallengesPerMinute: 240,
   eventsPerMinute: 6_000,
   // Device updates that change state, pairing creation, and valid claims.
   deviceChangesPerMinute: 240,
@@ -92,6 +95,7 @@ const CALL_LIMIT_VARIABLES = Object.freeze({
 
 const BUDGET_VARIABLES = Object.freeze({
   registrationsPerMinute: 'RELAY_REGISTRATIONS_PER_MINUTE',
+  tokenChallengesPerMinute: 'RELAY_TOKEN_CHALLENGES_PER_MINUTE',
   eventsPerMinute: 'RELAY_EVENTS_PER_MINUTE',
   deviceChangesPerMinute: 'RELAY_DEVICE_CHANGES_PER_MINUTE',
   decisionActionsPerMinute: 'RELAY_DECISION_ACTIONS_PER_MINUTE',

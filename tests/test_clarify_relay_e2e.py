@@ -129,6 +129,7 @@ def relay():
         "APNS_KEY_ID": "AAAAAAAAAA",
         "APNS_TEAM_ID": "BBBBBBBBBB",
         "APNS_TOPIC": "com.milim.relay",
+        "RELAY_TOKEN_PROOF": "optional",
         # Every APNs send succeeds without touching the network, so parked
         # decisions stay deliverable and the middleware's poll loop runs to
         # the answer (a rejected/thrown send would flip it undeliverable and

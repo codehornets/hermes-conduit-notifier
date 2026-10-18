@@ -127,6 +127,7 @@ async function startRelay(aPort, apnsMode, dataFile, extraEnv = {}, { logs = fal
       APNS_KEY_ID: 'AAAAAAAAAA',
       APNS_TEAM_ID: 'BBBBBBBBBB',
       APNS_TOPIC: 'com.milim.relay',
+      RELAY_TOKEN_PROOF: 'optional',
       APNS_MODE: apnsMode,
       RELAY_TEST_SEAMS: '1',
       ...extraEnv,
@@ -524,7 +525,7 @@ test('a full installation store rejects a valid registration before charging its
   const installations = {};
   for (let index = 0; index < 1024; index += 1) {
     const id = `20000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
-    installations[id] = { id, active: false, gateways: {}, deviceSecretHash: 'synthetic', preferences: {} };
+    installations[id] = { id, active: true, gateways: {}, deviceSecretHash: 'synthetic', preferences: {} };
   }
   writeFileSync(isolatedPath, JSON.stringify({ version: 1, installations, pairings: {}, eventIds: {}, pendingDecisions: {} }));
   const before = readFileSync(isolatedPath, 'utf8');
@@ -844,6 +845,7 @@ test('an invalid capacity setting stops the relay at boot', async () => {
       APNS_KEY_ID: 'AAAAAAAAAA',
       APNS_TEAM_ID: 'BBBBBBBBBB',
       APNS_TOPIC: 'com.milim.relay',
+      RELAY_TOKEN_PROOF: 'optional',
       APNS_MODE: 'accept',
       RELAY_TEST_SEAMS: '1',
       RELAY_MAX_INSTALLATIONS: '10k',

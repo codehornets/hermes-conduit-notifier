@@ -22,6 +22,7 @@ test('relay limits default when unset or empty and accept positive integer overr
     RELAY_MAX_ACTIVE_DECISIONS: '4096',
     RELAY_MAX_RETAINED_DECISIONS: ' 16384 ',
     RELAY_REGISTRATIONS_PER_MINUTE: '60',
+    RELAY_TOKEN_CHALLENGES_PER_MINUTE: '480',
     RELAY_EVENTS_PER_MINUTE: '12000',
     RELAY_DEVICE_CHANGES_PER_MINUTE: '480',
     RELAY_DECISION_ACTIONS_PER_MINUTE: '1200',
@@ -50,6 +51,7 @@ test('relay limits default when unset or empty and accept positive integer overr
   });
   assert.deepEqual(configured.budgets, {
     registrationsPerMinute: 60,
+    tokenChallengesPerMinute: 480,
     eventsPerMinute: 12_000,
     deviceChangesPerMinute: 480,
     decisionActionsPerMinute: 1_200,

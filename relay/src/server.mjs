@@ -10,6 +10,7 @@ import { LIVE_ACTIVITIES_CAPABILITY, LiveActivities, validateRegistration, valid
 import { MAPS_TOKEN_ROUTE, MAPS_TOKENS_CAPABILITY, mapsTokensFromEnv } from './maps-tokens.mjs';
 import { RING_ROUTE, RING_SESSION_MAX_CHARS, RING_SESSION_ROUTE, RING_SESSION_WAIT_MAX_MS, Rings, ringBearer, validSessionStore, validSettle } from './rings.mjs';
 import { normalizeDashboardId, RelayStore, sanitizeBatchQuestions } from './store.mjs';
+import { TOKEN_PROOF_CAPABILITY, TokenChallenges, tokenChallengePush, tokenProofModeFromEnv } from './token-proof.mjs';
 import { CLOSE_GRANT_CLOSED, WATCH_AUDIO_CAPABILITY, WatchAudioBridges, watchAudioUpgrade } from './watch-audio.mjs';
 import { WATCH_TOOLS_CAPABILITY, WatchToolGrants, watchToolRoutes } from './watch-tools.mjs';
 
@@ -18,9 +19,9 @@ import { WATCH_TOOLS_CAPABILITY, WatchToolGrants, watchToolRoutes } from './watc
 const RELAY_INFO = (() => {
   try {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    return { version: String(pkg.version || 'unknown'), capabilities: ['decisions', 'decision-cards', 'meta', 'e2e-v1', WATCH_TOOLS_CAPABILITY, WATCH_AUDIO_CAPABILITY, 'calls', 'voip-calls', 'watch-calls', 'ring-sessions', 'location-push', 'phone-changes', MAPS_TOKENS_CAPABILITY, LIVE_ACTIVITIES_CAPABILITY] };
+    return { version: String(pkg.version || 'unknown'), capabilities: ['decisions', 'decision-cards', 'meta', 'e2e-v1', WATCH_TOOLS_CAPABILITY, WATCH_AUDIO_CAPABILITY, 'calls', 'voip-calls', 'watch-calls', 'ring-sessions', 'location-push', 'phone-changes', MAPS_TOKENS_CAPABILITY, LIVE_ACTIVITIES_CAPABILITY, TOKEN_PROOF_CAPABILITY] };
   } catch {
-    return { version: 'unknown', capabilities: ['decisions', 'decision-cards', 'meta', 'e2e-v1', WATCH_TOOLS_CAPABILITY, WATCH_AUDIO_CAPABILITY, 'calls', 'voip-calls', 'watch-calls', 'ring-sessions', 'location-push', 'phone-changes', MAPS_TOKENS_CAPABILITY, LIVE_ACTIVITIES_CAPABILITY] };
+    return { version: 'unknown', capabilities: ['decisions', 'decision-cards', 'meta', 'e2e-v1', WATCH_TOOLS_CAPABILITY, WATCH_AUDIO_CAPABILITY, 'calls', 'voip-calls', 'watch-calls', 'ring-sessions', 'location-push', 'phone-changes', MAPS_TOKENS_CAPABILITY, LIVE_ACTIVITIES_CAPABILITY, TOKEN_PROOF_CAPABILITY] };
   }
 })();
 
@@ -33,6 +34,7 @@ let watchTools;
 let rings;
 let liveActivities;
 let mapsTokens;
+let tokenChallenges;
 // Maps tokens a gateway may fetch an hour (each lasts about 30 minutes).
 const MAPS_TOKENS_PER_HOUR = 12;
 
@@ -92,6 +94,12 @@ const LOCATION_PUSH_TTL_S = 60;
 // Locate and maps lookups (conduit_maps) share it; the plugin keeps tighter budgets per kind.
 const LOCATION_PUSH_PER_HOUR = 60;
 const LOCATION_TOKEN_GONE = new Set(['BadDeviceToken', 'Unregistered', 'DeviceTokenNotForTopic']);
+// Registration proof (token-proof.mjs): how long a pushed challenge stays
+// usable, and how often one device token may be challenged (each is a push).
+const TOKEN_CHALLENGE_TTL_S = 10 * 60;
+const TOKEN_CHALLENGES_PER_TOKEN = 5;
+const TOKEN_CHALLENGE_WINDOW_MS = 10 * 60_000;
+const DEVICE_TOKEN_REFUSED = new Set(['BadDeviceToken', 'Unregistered', 'DeviceTokenNotForTopic']);
 
 // Conduit dashboard UUIDs (opaque app-generated identity, #148) are
 // canonicalized and validated in the store (normalizeDashboardId); the route
@@ -110,6 +118,13 @@ function main() {
   });
   limits = new Map();
   rings = new Rings();
+  tokenChallenges = new TokenChallenges({ ttlMs: TOKEN_CHALLENGE_TTL_S * 1000 });
+  // A reclaimed slot's installation leaves nothing behind in memory either.
+  store.onReclaim = (id) => {
+    liveActivities?.removeInstallation(id);
+    console.warn(JSON.stringify({ level: 'warn', message: 'relay full: reclaimed the longest-inactive installation', installation_id: id }));
+  };
+  setInterval(() => tokenChallenges.sweep(), 60_000).unref();
   const watchGrants = new WatchToolGrants({
     maxGrants: config.watchLimits.maxGrants,
     maxPerGateway: config.watchLimits.maxGrantsPerGateway,
@@ -281,18 +296,60 @@ async function route(request, response) {
   const client = clientAddress(request);
   if (request.method === 'GET' && url.pathname === '/healthz') return sendJson(response, 200, { ok: true });
 
+  // Registration proof (#142, #146): push a one-time nonce to the device
+  // token; the phone sends it back with the registration or token change.
+  if (request.method === 'POST' && url.pathname === '/v1/token-challenges') {
+    enforceRateLimit(`token-challenge:${client}`, 12, 60_000);
+    const body = await readJson(request, 4_096);
+    const deviceToken = validateDeviceToken(body.device_token);
+    if (body.bundle_id !== config.topic) return sendJson(response, 400, { error: 'invalid_topic' });
+    if (body.environment !== 'production') return sendJson(response, 400, { error: 'production_only' });
+    enforceRateLimit(`token-challenge-token:${deviceToken}`, TOKEN_CHALLENGES_PER_TOKEN, TOKEN_CHALLENGE_WINDOW_MS);
+    enforceRateLimit('token-challenge-global', config.budgets.tokenChallengesPerMinute, 60_000);
+    const nonce = tokenChallenges.issue(deviceToken);
+    let result;
+    try {
+      result = await apnsSend(deviceToken, tokenChallengePush(nonce, { topic: config.topic, ttlSeconds: TOKEN_CHALLENGE_TTL_S }));
+    } catch (error) {
+      console.error(JSON.stringify({ level: 'error', message: 'apns token challenge send threw', error: error instanceof Error ? error.message : String(error) }));
+      tokenChallenges.withdraw(deviceToken, nonce);
+      return sendJson(response, 502, { error: 'apns_unreachable' });
+    }
+    if (!result.ok) {
+      if (result.status === 410 || DEVICE_TOKEN_REFUSED.has(result.reason)) {
+        tokenChallenges.forget(deviceToken);
+        return sendJson(response, 400, { error: 'invalid_device_token' });
+      }
+      // An earlier challenge the phone already got stays usable.
+      tokenChallenges.withdraw(deviceToken, nonce);
+      return sendJson(response, 502, { error: 'apns_rejected', reason: result.reason, status: result.status });
+    }
+    return sendJson(response, 202, { challenge_sent: true, expires_in: TOKEN_CHALLENGE_TTL_S });
+  }
+
   if (request.method === 'POST' && url.pathname === '/v1/installations') {
     enforceRateLimit(`registration:${client}`, 12, 60_000);
     const body = await readJson(request);
     const deviceToken = validateDeviceToken(body.device_token);
-    const voipToken = validateVoipToken(body.voip_token) ?? undefined;
-    const watchVoipToken = validateWatchVoipToken(body.watch_voip_token) ?? undefined;
-    const locationToken = validateLocationToken(body.location_token) ?? undefined;
+    let voipToken = validateVoipToken(body.voip_token) ?? undefined;
+    let watchVoipToken = validateWatchVoipToken(body.watch_voip_token) ?? undefined;
+    let locationToken = validateLocationToken(body.location_token) ?? undefined;
     if (body.bundle_id !== config.topic) return sendJson(response, 400, { error: 'invalid_topic' });
     if (body.environment !== 'production') return sendJson(response, 400, { error: 'production_only' });
-    store.assertInstallationCapacity();
+    store.assertInstallationRoom();
     enforceRegistrationBudget();
+    // Proof before reclaiming: only a registration that can succeed may
+    // take an inactive installation's slot.
+    const proven = proveDeviceToken(deviceToken, body.token_proof);
+    store.assertInstallationCapacity();
+    // A proven phone's earlier installations are its own stale records:
+    // their tokens are its own, and they're retired once this one exists.
+    const sameDeviceToken = proven ? deviceToken : undefined;
+    voipToken = unclaimedToken('voipToken', voipToken, undefined, sameDeviceToken) ?? undefined;
+    watchVoipToken = unclaimedToken('watchVoipToken', watchVoipToken, undefined, sameDeviceToken) ?? undefined;
+    locationToken = unclaimedToken('locationToken', locationToken, undefined, sameDeviceToken) ?? undefined;
     const created = store.createInstallation({ bundleId: body.bundle_id, deviceToken, voipToken, watchVoipToken, locationToken, environment: body.environment, preferences: body.preferences });
+    if (proven) retireOtherInstallations(deviceToken, created.installation.id);
     return sendJson(response, 201, {
       installation: created.installation,
       credential: `${created.installation.id}.${created.deviceSecret}`,
@@ -307,15 +364,34 @@ async function route(request, response) {
     enforceRateLimit(`installation-update:${installation.id}`, 30, 60_000);
     const body = await readJson(request);
     const deviceToken = body.device_token === undefined ? undefined : validateDeviceToken(body.device_token);
-    const changes = {
+    const moving = Boolean(deviceToken && deviceToken !== installation.deviceToken);
+    // Other installations for a proven new device token are this phone's
+    // stale records, so the PushKit and location tokens they hold are its own.
+    // Checked before any proof is spent, so a malformed token doesn't burn it.
+    const voipToken = validateVoipToken(body.voip_token);
+    const watchVoipToken = validateWatchVoipToken(body.watch_voip_token);
+    const locationToken = validateLocationToken(body.location_token);
+    const changesFor = (sameDeviceToken) => ({
       deviceToken,
-      voipToken: validateVoipToken(body.voip_token),
-      watchVoipToken: validateWatchVoipToken(body.watch_voip_token),
-      locationToken: validateLocationToken(body.location_token),
+      voipToken: unclaimedToken('voipToken', voipToken, installation.id, sameDeviceToken),
+      watchVoipToken: unclaimedToken('watchVoipToken', watchVoipToken, installation.id, sameDeviceToken),
+      locationToken: unclaimedToken('locationToken', locationToken, installation.id, sameDeviceToken),
       preferences: body.preferences,
-    };
-    if (store.wouldUpdateInstallation(installation.id, changes)) enforceDeviceChangeBudget();
-    return sendJson(response, 200, { installation: store.updateInstallation(installation.id, changes) });
+    });
+    let changes;
+    let proven = false;
+    if (moving) {
+      enforceDeviceChangeBudget();
+      // Moving to another device token takes the same proof as registering it.
+      proven = proveDeviceToken(deviceToken, body.token_proof);
+      changes = changesFor(proven ? deviceToken : undefined);
+    } else {
+      changes = changesFor();
+      if (store.wouldUpdateInstallation(installation.id, changes)) enforceDeviceChangeBudget();
+    }
+    const updated = store.updateInstallation(installation.id, changes);
+    if (proven) retireOtherInstallations(deviceToken, installation.id);
+    return sendJson(response, 200, { installation: updated });
   }
   if (installationMatch && request.method === 'DELETE') {
     const installation = authorize(request, installationMatch[1], 'device');
@@ -790,6 +866,37 @@ async function route(request, response) {
   if (await watchTools(request, response, url)) return;
 
   sendJson(response, 404, { error: 'not_found' });
+}
+
+// True when `proof` is the nonce last pushed to `deviceToken`. Without one,
+// a relay in `optional` mode (the rollout window for phones that predate
+// token proof) still accepts the token unproven; `required` refuses it so
+// the phone asks for a challenge. A wrong or expired proof always fails.
+function proveDeviceToken(deviceToken, proof) {
+  if (proof === undefined || proof === null) {
+    if (config.tokenProof === 'required') throw httpError(403, 'token_proof_required');
+    return false;
+  }
+  if (!tokenChallenges.verify(deviceToken, proof)) throw httpError(403, 'token_proof_invalid');
+  return true;
+}
+
+// The same phone's earlier installations for a token it just proved, with
+// their Live Activities.
+function retireOtherInstallations(deviceToken, exceptId) {
+  for (const id of store.retireOtherInstallationsWithDeviceToken(deviceToken, exceptId)) liveActivities.removeInstallation(id);
+}
+
+// A PushKit or location token another active installation registered is
+// left out: it can't be proven like the device token, and taking it would
+// let a leaked token ring or locate someone else's phone (#146). Records for
+// `sameDeviceToken` (the proven phone's own) don't count. Left out means
+// unchanged: an update keeps the token it had.
+function unclaimedToken(field, token, exceptId, sameDeviceToken) {
+  if (!token) return token;
+  if (!store.activeInstallationWithToken(field, token, exceptId, sameDeviceToken)) return token;
+  console.warn(JSON.stringify({ level: 'warn', message: 'push token already registered elsewhere; left out', field }));
+  return undefined;
 }
 
 // The authenticated gateway's ids, or null.
@@ -1562,6 +1669,9 @@ function readConfig() {
     },
     // Test seam: a shorter idle cut for live Watch audio.
     ...optionalMilliseconds('WATCH_AUDIO_IDLE_MS', 'watchAudioIdleMs'),
+    // `required` (default) or `optional` while phones without token proof
+    // still need to register (token-proof.mjs).
+    tokenProof: tokenProofModeFromEnv(process.env),
     ...limitsFromEnv(process.env),
   };
 }
