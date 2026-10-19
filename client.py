@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import hmac
 import json
@@ -38,7 +39,7 @@ DEFAULT_RELAY_URL = "https://push.milim.dev"
 # (no second hand-synchronized constant).
 USER_AGENT = f"Hermes-Conduit-Notifier/{PLUGIN_VERSION}"
 logger = logging.getLogger("hermes.plugins.conduit_push")
-_events: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=128)
+_events: queue.Queue[tuple[contextvars.Context, dict[str, Any]]] = queue.Queue(maxsize=128)
 _worker_started = False
 _worker_lock = threading.Lock()
 
@@ -253,7 +254,11 @@ def enqueue(event: dict[str, Any]) -> bool:
         return False
     _start_worker()
     try:
-        _events.put_nowait(event)
+        # Hermes can serve several profiles in one process, each through a
+        # context variable for its home that a new thread doesn't inherit.
+        # The event goes out under the profile that accepted it here: its
+        # pairing, credential and encryption key, not the launch profile's.
+        _events.put_nowait((contextvars.copy_context(), event))
     except queue.Full:
         logger.warning("Conduit notification queue is full; dropping %s", event.get("type", "event"))
         return False
@@ -580,9 +585,9 @@ def _start_worker() -> None:
 
 def _delivery_worker() -> None:
     while True:
-        event = _events.get()
+        context, event = _events.get()
         try:
-            send_now(event)
+            context.run(send_now, event)
         except Exception as error:
             logger.warning("Conduit notification delivery failed for %s: %s", event.get("type", "event"), error)
         finally:

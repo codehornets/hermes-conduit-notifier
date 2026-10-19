@@ -23,6 +23,7 @@ the whole thing off for a while.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
 import threading
@@ -344,7 +345,10 @@ class LiveActivityReporter:
         if not self._start_thread:
             return
         if self._thread is None:
-            self._thread = threading.Thread(target=self._run, name="conduit-live-activity", daemon=True)
+            # Under the profile whose turn started it (see client.enqueue):
+            # each profile's plugin has its own reporter.
+            self._thread = threading.Thread(target=contextvars.copy_context().run, args=(self._run,),
+                                            name="conduit-live-activity", daemon=True)
             self._thread.start()
         self._wake.notify()
 
