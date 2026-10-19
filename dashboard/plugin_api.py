@@ -4787,6 +4787,9 @@ def e2e_status(path: Any = None) -> Dict[str, Any]:
         "gateway_id": state.get("gateway_id"),
         "e2e": {"kid": kid} if isinstance(kid, str) and _E2E_KID.match(kid) else None,
         "crypto": crypto,
+        # The relay answered 401 to this pairing's last delivery (client.py):
+        # it no longer knows this gateway, so the phone should pair again.
+        "relay_rejected": bool(state.get("relay_rejected_at")),
     }
 
 
