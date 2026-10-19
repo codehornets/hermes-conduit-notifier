@@ -13,9 +13,9 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 
-from . import (call_tool, call_watches, calls, clarify_loop, conduit_first, cron_runs, desktop_selected, health_tool,
-               live_activity, location_tool, maps_tool, phone_tool, present_tool, reply_sources, settings_tool,
-               show_tool)
+from . import (call_tool, call_watches, calls, clarify_loop, client, conduit_first, cron_runs, desktop_selected,
+               health_tool, live_activity, location_tool, maps_tool, phone_tool, present_tool, reply_sources,
+               settings_tool, show_tool)
 from .session_titles import title as _session_title, titled as _titled
 from .client import enqueue
 from .events import approval_decision, clarification_text, event_id, is_silent_response, plain_text, push_event
@@ -48,6 +48,13 @@ PARENT_TURN_MAX_S = 6 * 3600.0
 def register(ctx: Any) -> None:
     global _profile
     _profile = ctx.profile_name
+    # Background work belongs to this load: unloading the plugin (disable,
+    # reload) stops it. A Hermes without on_unload keeps it until exit.
+    client.start()
+    calls.start()
+    live_activity.reporter.start()
+    if hasattr(ctx, "on_unload"):
+        ctx.on_unload(_unload)
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_llm_call", _post_llm_call)
     ctx.register_hook("on_session_end", _on_session_end)
@@ -226,6 +233,22 @@ def _finish_ready(session_id: str, ready: dict[str, Any] | None, send: bool) -> 
         return
     if ready is not None and send:
         enqueue(ready)
+
+
+def _unload() -> None:
+    """Hermes unloads the plugin: replies held for a turn's end are
+    dropped with their timers, held calls stay stored for the next load, and
+    the delivery and Live Activity threads end (waiting about a second for
+    a send in progress). Nothing more goes to the relay from this load."""
+    with _pending_lock:
+        held = list(_pending_ready.values())
+        _pending_ready.clear()
+    for _ready, _send, timer in held:
+        _cancel(timer)
+    calls.stop()
+    deadline = time.monotonic() + 1.0
+    live_activity.reporter.stop(timeout=max(0.0, deadline - time.monotonic()))
+    client.stop(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def _later(delay: float, work: Any) -> Any:

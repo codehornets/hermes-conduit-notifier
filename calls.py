@@ -49,6 +49,8 @@ APNS_FAILURES = frozenset({"apns_rejected", "apns_unreachable"})
 
 
 def _spawn(work: Callable[[], None]) -> None:
+    if _stopped.is_set():
+        return
     # Under the profile that started the work (see client.enqueue).
     threading.Thread(target=contextvars.copy_context().run, args=(work,), name="conduit-call", daemon=True).start()
 
@@ -58,6 +60,29 @@ def _spawn(work: Callable[[], None]) -> None:
 _waiting: set[str] = set()
 _wakes: dict[str, threading.Event] = {}
 _waiting_lock = threading.Lock()
+# Set while the plugin is unloaded (stop()): no call request goes out and the
+# waiters end. A waiter from before a stop() ends even if start() ran
+# meanwhile: it belongs to an older generation.
+_stopped = threading.Event()
+_generation = 0
+
+
+def start() -> None:
+    _stopped.clear()
+
+
+def stop() -> None:
+    """The plugin is being unloaded: held calls stay in the store (the next
+    load's resume() waits on them again) but nothing here sends them."""
+    global _generation
+    with _waiting_lock:
+        _stopped.set()
+        _generation += 1
+        wakes = list(_wakes.values())
+        _waiting.clear()
+        _wakes.clear()
+    for wake in wakes:
+        wake.set()
 
 
 def _sleep(seconds: float, wake: threading.Event | None = None) -> None:
@@ -166,6 +191,8 @@ def _wait_for_holds(home: Any, profile: str) -> None:
     unless Conduit released or removed the watch meanwhile."""
     key = str(home)
     with _waiting_lock:
+        if _stopped.is_set():
+            return
         if key in _waiting:
             # It may now be due sooner than the waiter wakes (an alert's
             # minute beside a long hold): the waiter looks again.
@@ -174,14 +201,14 @@ def _wait_for_holds(home: Any, profile: str) -> None:
             return
         _waiting.add(key)
     try:
-        _spawn(_waiter(home, profile, key))
+        _spawn(_waiter(home, profile, key, _generation))
     except BaseException:
         with _waiting_lock:
             _waiting.discard(key)
         raise
 
 
-def _waiter(home: Any, profile: str, key: str) -> Callable[[], None]:
+def _waiter(home: Any, profile: str, key: str, generation: int = 0) -> Callable[[], None]:
     def wait() -> None:
         store = _store(home)
         try:
@@ -189,6 +216,8 @@ def _waiter(home: Any, profile: str, key: str) -> Callable[[], None]:
                 # Under the lock: a hold that starts now either shows up here
                 # or wakes this waiter, or starts its own.
                 with _waiting_lock:
+                    if generation != _generation:  # stop() already let go of its key
+                        return
                     due_at = store.next_due()
                     if due_at is None:
                         _waiting.discard(key)
@@ -197,12 +226,15 @@ def _waiter(home: Any, profile: str, key: str) -> Callable[[], None]:
                     wake = _wakes.setdefault(key, threading.Event())
                     wake.clear()
                 _sleep(max(0.0, due_at - store.clock()) + 1.0, wake)
+                if generation != _generation:
+                    return
                 _send_due(store.fire_due(), profile)
         except Exception:  # noqa: BLE001 — the next turn end sweeps again
             logger.warning("Conduit stopped waiting on a held call", exc_info=True)
             with _waiting_lock:
-                _waiting.discard(key)
-                _wakes.pop(key, None)
+                if generation == _generation:
+                    _waiting.discard(key)
+                    _wakes.pop(key, None)
 
     return wait
 
@@ -353,6 +385,9 @@ def deliver(event: dict[str, Any], fallback: dict[str, Any] | None) -> None:
     for delay in DELIVERY_DELAYS_S:
         if delay:
             _sleep(delay)
+        if _stopped.is_set():
+            logger.info("Conduit call request dropped: the plugin was unloaded")
+            return
         try:
             answer = client.send_now(event)
         except RuntimeError as error:

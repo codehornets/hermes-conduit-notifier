@@ -43,7 +43,13 @@ USER_AGENT = f"Hermes-Conduit-Notifier/{PLUGIN_VERSION}"
 logger = logging.getLogger("hermes.plugins.conduit_push")
 _events: queue.Queue[tuple[contextvars.Context, dict[str, Any]]] = queue.Queue(maxsize=128)
 _worker_started = False
+_worker: threading.Thread | None = None
 _worker_lock = threading.Lock()
+# Set while the plugin is unloaded (stop()): nothing more is queued or sent.
+# A worker from before a stop() exits even when start() ran meanwhile: it
+# belongs to an older generation.
+_stopped = threading.Event()
+_generation = 0
 
 
 def state_path() -> Path:
@@ -252,7 +258,7 @@ def enqueue(event: dict[str, Any]) -> bool:
     on this event, so a drop has to fall back to the native clarify path
     instead of polling an answer that can never arrive.
     """
-    if not load_state():
+    if _stopped.is_set() or not load_state():
         return False
     _start_worker()
     try:
@@ -579,14 +585,46 @@ def _request(
 
 
 def _start_worker() -> None:
-    global _worker_started
+    global _worker_started, _worker
     if _worker_started:
         return
     with _worker_lock:
-        if _worker_started:
+        if _worker_started or _stopped.is_set():
             return
-        threading.Thread(target=_delivery_worker, name="conduit-push", daemon=True).start()
+        _worker = threading.Thread(target=_delivery_worker, args=(_generation,), name="conduit-push", daemon=True)
+        _worker.start()
         _worker_started = True
+
+
+def start() -> None:
+    """Lets events be queued again after stop() (the plugin was enabled
+    again without a fresh import)."""
+    _stopped.clear()
+
+
+def stop(timeout: float = 1.0) -> None:
+    """The plugin is being unloaded: events still queued are dropped, the
+    worker exits after the send in progress (its retries end), and later
+    enqueue() calls are refused. Waits up to ``timeout`` for the worker."""
+    global _worker_started, _worker, _generation
+    with _worker_lock:
+        _stopped.set()
+        _generation += 1
+        running, _worker, _worker_started = _worker, None, False
+        dropped = 0
+        while True:
+            try:
+                _events.get_nowait()
+            except queue.Empty:
+                break
+            _events.task_done()
+            dropped += 1
+        if running is not None:
+            _events.put_nowait(None)  # wakes the worker; the queue was just emptied
+    if dropped:
+        logger.info("Conduit dropped %d queued notification(s): the plugin was unloaded", dropped)
+    if running is not None:
+        running.join(timeout)
 
 
 # A delivery that fails on the way (no connection, a timeout, the relay busy
@@ -599,10 +637,17 @@ RETRY_DELAYS = (1.0, 2.0, 4.0)
 RETRY_BUDGET = 30.0
 
 
-def _delivery_worker() -> None:
-    while True:
-        context, event = _events.get()
+def _delivery_worker(generation: int = 0) -> None:
+    while generation == _generation:
+        item = _events.get()
         try:
+            if item is None:  # stop()'s wake-up
+                continue
+            if generation != _generation:
+                # Queued for the worker started after a stop(): hand it back.
+                _requeue(item)
+                continue
+            context, event = item
             context.run(_deliver, event)
         except Exception as error:  # the worker thread must outlive any one event
             logger.warning("Conduit notification delivery failed for %s: %s", event.get("type", "event"), error)
@@ -610,10 +655,25 @@ def _delivery_worker() -> None:
             _events.task_done()
 
 
-def _deliver(event: dict[str, Any], *, sleep: Callable[[float], None] = time.sleep,
+def _requeue(item: Any) -> None:
+    try:
+        _events.put_nowait(item)
+    except queue.Full:
+        logger.warning("Conduit notification queue is full; dropping %s", item[1].get("type", "event"))
+
+
+def _pause(seconds: float) -> None:
+    # A stop() ends the wait (and _deliver then gives up).
+    _stopped.wait(seconds)
+
+
+def _deliver(event: dict[str, Any], *, sleep: Callable[[float], None] = _pause,
              clock: Callable[[], float] = time.monotonic) -> bool:
     started = clock()
     for delay in (*RETRY_DELAYS, None):
+        if _stopped.is_set():
+            logger.info("Conduit notification dropped for %s: the plugin was unloaded", event.get("type", "event"))
+            return False
         state = load_state()
         if not state:
             logger.warning("Conduit notification dropped for %s: this profile is no longer paired", event.get("type", "event"))
