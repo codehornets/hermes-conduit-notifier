@@ -11,7 +11,9 @@ import os
 import queue
 import secrets
 import socket
+import ssl
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -41,7 +43,13 @@ USER_AGENT = f"Hermes-Conduit-Notifier/{PLUGIN_VERSION}"
 logger = logging.getLogger("hermes.plugins.conduit_push")
 _events: queue.Queue[tuple[contextvars.Context, dict[str, Any]]] = queue.Queue(maxsize=128)
 _worker_started = False
+_worker: threading.Thread | None = None
 _worker_lock = threading.Lock()
+# Set while the plugin is unloaded (stop()): nothing more is queued or sent.
+# A worker from before a stop() exits even when start() ran meanwhile: it
+# belongs to an older generation.
+_stopped = threading.Event()
+_generation = 0
 
 
 def state_path() -> Path:
@@ -250,7 +258,7 @@ def enqueue(event: dict[str, Any]) -> bool:
     on this event, so a drop has to fall back to the native clarify path
     instead of polling an answer that can never arrive.
     """
-    if not load_state():
+    if _stopped.is_set() or not load_state():
         return False
     _start_worker()
     try:
@@ -269,6 +277,10 @@ def send_now(event: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     state = load_state()
     if not state:
         raise RuntimeError("This Hermes profile is not paired with Conduit.")
+    return _send(event, state, timeout)
+
+
+def _send(event: dict[str, Any], state: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     return request_json(
         f"{state['relay_url'].rstrip('/')}/v1/events",
         method="POST",
@@ -573,22 +585,146 @@ def _request(
 
 
 def _start_worker() -> None:
-    global _worker_started
+    global _worker_started, _worker
     if _worker_started:
         return
     with _worker_lock:
-        if _worker_started:
+        if _worker_started or _stopped.is_set():
             return
-        threading.Thread(target=_delivery_worker, name="conduit-push", daemon=True).start()
+        _worker = threading.Thread(target=_delivery_worker, args=(_generation,), name="conduit-push", daemon=True)
+        _worker.start()
         _worker_started = True
 
 
-def _delivery_worker() -> None:
-    while True:
-        context, event = _events.get()
+def start() -> None:
+    """Lets events be queued again after stop() (the plugin was enabled
+    again without a fresh import)."""
+    _stopped.clear()
+
+
+def stop(timeout: float = 1.0) -> None:
+    """The plugin is being unloaded: events still queued are dropped, the
+    worker exits after the send in progress (its retries end), and later
+    enqueue() calls are refused. Waits up to ``timeout`` for the worker."""
+    global _worker_started, _worker, _generation
+    with _worker_lock:
+        _stopped.set()
+        _generation += 1
+        running, _worker, _worker_started = _worker, None, False
+        dropped = 0
+        while True:
+            try:
+                _events.get_nowait()
+            except queue.Empty:
+                break
+            _events.task_done()
+            dropped += 1
+        if running is not None:
+            _events.put_nowait(None)  # wakes the worker; the queue was just emptied
+    if dropped:
+        logger.info("Conduit dropped %d queued notification(s): the plugin was unloaded", dropped)
+    if running is not None:
+        running.join(timeout)
+
+
+# A delivery that fails on the way (no connection, a timeout, the relay busy
+# or failing) is sent again. That's safe: the relay keeps each accepted
+# event_id per pairing and answers a repeat as a duplicate, and an event's id
+# stays the same from one send to the next (redaction and encryption re-key it
+# the same way every time). One thread delivers everything, so the retries of
+# one event stop after RETRY_BUDGET seconds instead of holding up the rest.
+RETRY_DELAYS = (1.0, 2.0, 4.0)
+RETRY_BUDGET = 30.0
+
+
+def _delivery_worker(generation: int = 0) -> None:
+    while generation == _generation:
+        item = _events.get()
         try:
-            context.run(send_now, event)
-        except Exception as error:
+            if item is None:  # stop()'s wake-up
+                continue
+            if generation != _generation:
+                # Queued for the worker started after a stop(): hand it back.
+                _requeue(item)
+                continue
+            context, event = item
+            context.run(_deliver, event)
+        except Exception as error:  # the worker thread must outlive any one event
             logger.warning("Conduit notification delivery failed for %s: %s", event.get("type", "event"), error)
         finally:
             _events.task_done()
+
+
+def _requeue(item: Any) -> None:
+    try:
+        _events.put_nowait(item)
+    except queue.Full:
+        logger.warning("Conduit notification queue is full; dropping %s", item[1].get("type", "event"))
+
+
+def _pause(seconds: float) -> None:
+    # A stop() ends the wait (and _deliver then gives up).
+    _stopped.wait(seconds)
+
+
+def _deliver(event: dict[str, Any], *, sleep: Callable[[float], None] = _pause,
+             clock: Callable[[], float] = time.monotonic) -> bool:
+    started = clock()
+    for delay in (*RETRY_DELAYS, None):
+        if _stopped.is_set():
+            logger.info("Conduit notification dropped for %s: the plugin was unloaded", event.get("type", "event"))
+            return False
+        state = load_state()
+        if not state:
+            logger.warning("Conduit notification dropped for %s: this profile is no longer paired", event.get("type", "event"))
+            return False
+        try:
+            _send(event, state)
+        except Exception as error:
+            if delay is not None and _worth_retrying(error) and clock() - started + delay <= RETRY_BUDGET:
+                logger.info("Conduit notification delivery for %s will be retried: %s", event.get("type", "event"), error)
+                sleep(delay)
+                continue
+            logger.warning("Conduit notification delivery failed for %s: %s", event.get("type", "event"), error)
+            if isinstance(error, RelayRejected) and error.status == 401:
+                _mark_relay_rejected(state, True)
+            return False
+        if state.get("relay_rejected_at"):
+            _mark_relay_rejected(state, False)
+        return True
+    return False  # not reached: the last attempt has no delay
+
+
+def _worth_retrying(error: Exception) -> bool:
+    if isinstance(error, RelayRejected):
+        # 408/429 and the relay failing; any other answer would be the same.
+        return error.status in (408, 429) or 500 <= error.status <= 599
+    if isinstance(error, urllib.error.URLError):
+        # No connection, DNS, a reset: worth another go. A certificate the
+        # relay's name doesn't match won't fix itself in seconds.
+        return not isinstance(error.reason, ssl.SSLCertVerificationError)
+    return isinstance(error, (TimeoutError, ConnectionError))
+
+
+def _mark_relay_rejected(sent_with: dict[str, Any], rejected: bool) -> None:
+    """Records that the relay refused this pairing's credential (401), or that
+    it accepts it again. A 401 means the relay no longer knows the gateway:
+    the phone removed it, or the relay lost its data. The pairing is kept
+    (it holds the redaction key, and the relay may be restored), but
+    `status` tells the user to pair again. Only the pairing that was used is
+    marked: one replaced or removed meanwhile is left alone."""
+
+    def mark(current: dict[str, Any]) -> bool:
+        if any(current.get(name) != sent_with.get(name) for name in ("credential", "installation_id", "gateway_id")):
+            return False
+        if rejected:
+            if current.get("relay_rejected_at"):
+                return False
+            current["relay_rejected_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            return True
+        return current.pop("relay_rejected_at", None) is not None
+
+    try:
+        update_state(mark)
+    except OSError as error:
+        logger.warning("Conduit could not record the relay's answer for this pairing: %s", error)
