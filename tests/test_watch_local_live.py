@@ -157,6 +157,7 @@ class Hermes:
         self.sessions = 0
         self.redirect_status = "redirected"
         self.submit_status = ""
+        self.resolved = True
 
     def dispatch(self, request, transport=None):
         self.transport = transport
@@ -170,6 +171,8 @@ class Hermes:
             return {"id": request["id"], "result": {"status": self.redirect_status}}
         if method == "prompt.submit":
             return {"id": request["id"], "result": {"status": self.submit_status}}
+        if method == "approval.respond":
+            return {"id": request["id"], "result": {"resolved": self.resolved}}
         return {"id": request["id"], "result": {}}
 
     def emit(self, kind, payload, sid="s1"):
@@ -623,3 +626,313 @@ def test_numbers_dont_end_sentences_and_a_long_run_is_cut_on_a_space():
     text = api._SpokenText()
     out = text.feed("word " * 120)
     assert out and len(out) <= api.LOCAL_LIVE_WATCH_MAX_SENTENCE_CHARS
+
+
+# --- Approvals on the Watch -------------------------------------------------------
+
+
+def _approval(command="rm -rf build", request_id="req1", description="Delete the build folder"):
+    return {"command": command, "description": description, "request_id": request_id}
+
+
+def _responds(hermes):
+    return [params for method, params in hermes.calls if method == "approval.respond"]
+
+
+async def _approvals_call(call, **extra):
+    bridge = _bridge()
+    socket = await _attach(bridge)
+    watch = Watch()
+    await _start(bridge, socket, watch, approvals=True, **extra)
+    return bridge, socket, watch
+
+
+def test_a_watch_that_takes_approvals_is_shown_hermes_request_and_answers_it(call):
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        turn = await bridge.session.call.start_turn("Clean the build")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("message.start", {})
+        call.hermes.emit("message.delta", {"text": "Okay, cleaning up. "})
+        call.hermes.emit("approval.request", _approval())
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        [card] = watch.events(socket, "conduit.approval")
+        assert card == {"type": "conduit.approval", "id": card["id"], "command": "rm -rf build",
+                        "description": "Delete the build folder", "choices": ["once", "deny"], "pending": 1,
+                        "cut": False}
+        await bridge._handle(watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "once"}))
+        await _until(lambda: watch.events(socket, "conduit.approval.done"))
+        assert watch.events(socket, "conduit.approval.done") == [
+            {"type": "conduit.approval.done", "id": card["id"], "resolved": True}]
+        assert _responds(call.hermes) == [{"session_id": "s1", "choice": "once", "request_id": "req1"}]
+        # The turn stayed open through the card: what Hermes says after is spoken too.
+        call.hermes.emit("message.delta", {"text": "Done, the build folder is gone."})
+        call.hermes.emit("message.complete", {"text": "whole", "status": "complete"})
+        assert await _frames(turn) == ("Okay, cleaning up. " + api.LOCAL_LIVE_WATCH_APPROVAL_LINE + " "
+                                       "Done, the build folder is gone.")
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_with_two_pending_or_a_cut_command_the_card_offers_deny_only(call):
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Do both")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval("one", "r1"))
+        call.hermes.emit("approval.request", _approval("two", "r2"))
+        await _until(lambda: any(card["choices"] == ["deny"] for card in watch.events(socket, "conduit.approval")))
+        card = watch.events(socket, "conduit.approval")[-1]
+        assert card["command"] == "one" and card["pending"] == 2
+        # Once isn't taken while the card might not be Hermes' oldest.
+        await bridge._handle(watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "once"}))
+        await _until(lambda: watch.events(socket, "conduit.approval.done"))
+        assert watch.events(socket, "conduit.approval.done")[0]["resolved"] is False
+        assert _responds(call.hermes) == []
+        await bridge._handle(watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "deny"}))
+        await _until(lambda: _responds(call.hermes))
+        # The next one is shown, and alone it can be approved.
+        await _until(lambda: watch.events(socket, "conduit.approval")[-1]["command"] == "two")
+        assert watch.events(socket, "conduit.approval")[-1]["choices"] == ["once", "deny"]
+        call.hermes.emit("message.complete", {"text": "whole"})
+        await _until(lambda: watch.events(socket, "conduit.approval.gone"))
+        long = "x" * (api.LOCAL_LIVE_WATCH_APPROVAL_COMMAND_CHARS + 1)
+        call.hermes.emit("approval.request", _approval(long, "r3"))
+        await _until(lambda: watch.events(socket, "conduit.approval")[-1].get("cut"))
+        cut = watch.events(socket, "conduit.approval")[-1]
+        assert cut["choices"] == ["deny"] and len(cut["command"]) == api.LOCAL_LIVE_WATCH_APPROVAL_COMMAND_CHARS
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_rejoining_watch_is_shown_the_approval_still_pending(call):
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        await bridge._handle(bytes([0, 2]))  # the Watch's socket went
+        # Hermes asks between the two streams.
+        call.hermes.emit("approval.request", _approval())
+        again = Watch()
+        await _start(bridge, socket, again, approvals=True, resume_session_id="stored1")
+        await _until(lambda: again.events(socket, "conduit.approval"))
+        assert again.events(socket, "conduit.approval")[0]["command"] == "rm -rf build"
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_an_approval_nobody_answers_goes_with_hermes_timeout(call, monkeypatch):
+    monkeypatch.setattr(api, "_hermes_approval_timeout", lambda: 0.2)
+
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval())
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        await _until(lambda: watch.events(socket, "conduit.approval.gone"), timeout=3)
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_watch_that_doesnt_take_approvals_is_told_to_answer_in_the_chat(call):
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        watch = Watch()
+        await _start(bridge, socket, watch)
+        turn = await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval())
+        assert await _frames(turn) == api.LOCAL_LIVE_WATCH_NEEDS_INPUT_LINE
+        await asyncio.sleep(0.05)
+        assert watch.events(socket, "conduit.approval") == []
+        # And its answers aren't taken.
+        await bridge._handle(watch.event({"type": "conduit.approval.answer", "id": "x", "choice": "once"}))
+        await asyncio.sleep(0.05)
+        assert _responds(call.hermes) == []
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+
+def test_a_second_answer_to_the_same_card_never_reaches_hermes(call):
+    gate = threading.Event()
+    respond = call.hermes.dispatch
+
+    def slow(request, transport=None):
+        if request["method"] == "approval.respond":
+            gate.wait(5)
+        return respond(request, transport)
+
+    call.hermes.dispatch = slow
+
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval("one", "r1"))
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        card = watch.events(socket, "conduit.approval")[0]
+        answer = watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "once"})
+        again = watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "once"})
+        await bridge._handle(answer)
+        await _until(lambda: bridge.session.chat.answering)
+        # Hermes asks again meanwhile: not shown until the first answer is back.
+        call.hermes.emit("approval.request", _approval("two", "r2"))
+        await bridge._handle(again)
+        await asyncio.sleep(0.1)
+        # The repeat gets no answer of its own, and the next card waits.
+        assert watch.events(socket, "conduit.approval.done") == []
+        assert [c["command"] for c in watch.events(socket, "conduit.approval")] == ["one"]
+        gate.set()
+        await _until(lambda: watch.events(socket, "conduit.approval.done"))
+        assert watch.events(socket, "conduit.approval.done") == [
+            {"type": "conduit.approval.done", "id": card["id"], "resolved": True}]
+        await _until(lambda: watch.events(socket, "conduit.approval")[-1]["command"] == "two")
+        assert len(_responds(call.hermes)) == 1
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_reply_that_comes_whole_after_the_approval_is_still_said(call):
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        turn = await bridge.session.call.start_turn("Clean the build")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval())
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        card = watch.events(socket, "conduit.approval")[0]
+        await bridge._handle(watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "deny"}))
+        await _until(lambda: watch.events(socket, "conduit.approval.done"))
+        call.hermes.emit("message.complete", {"text": "I left the build folder alone."})
+        assert await _frames(turn) == api.LOCAL_LIVE_WATCH_APPROVAL_LINE + " I left the build folder alone."
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_the_turn_stays_open_while_the_card_waits(call, monkeypatch):
+    monkeypatch.setattr(api, "LOCAL_LIVE_WATCH_APPROVAL_KEEPALIVE_S", 0.05)
+
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        turn = await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval())
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        frames = []
+        while len([kind for kind, _ in frames if kind == "keepalive"]) < 3:
+            frames.append(await asyncio.wait_for(turn.frames.get(), 5))
+        # Nothing said for them: they only keep the turn open.
+        assert [text for kind, text in frames if kind == "keepalive"] == ["", "", ""]
+        call.hermes.emit("error", {"message": "stopped"})
+        await _until(lambda: watch.events(socket, "conduit.approval.gone"))
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_call_the_server_ends_sends_no_card_after_its_end(call):
+    gate = threading.Event()
+    respond = call.hermes.dispatch
+
+    def slow(request, transport=None):
+        if request["method"] == "approval.respond":
+            gate.wait(5)
+        return respond(request, transport)
+
+    call.hermes.dispatch = slow
+
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval("one", "r1"))
+        call.hermes.emit("approval.request", _approval("two", "r2"))
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        card = watch.events(socket, "conduit.approval")[-1]
+        await bridge._handle(watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "deny"}))
+        await _until(lambda: bridge.session.chat.answering)
+        session = bridge.session
+        await call.speech.sockets[0].close()  # the speech server ends the call
+        await _until(lambda: watch.events(socket, "ended"))
+        gate.set()
+        await _until(lambda: not session.chat.answering)
+        await asyncio.sleep(0.2)
+        events = [event["type"] for event in watch.events(socket)]
+        assert events[events.index("ended"):] == ["ended"]
+        assert session.approval_timer is None
+
+    _run(scenario())
+
+
+
+def test_a_watch_that_rejoins_while_an_answer_is_out_gets_the_next_card_once_it_is_back(call):
+    gate = threading.Event()
+    respond = call.hermes.dispatch
+
+    def slow(request, transport=None):
+        if request["method"] == "approval.respond":
+            gate.wait(5)
+        return respond(request, transport)
+
+    call.hermes.dispatch = slow
+
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval("one", "r1"))
+        call.hermes.emit("approval.request", _approval("two", "r2"))
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        card = watch.events(socket, "conduit.approval")[-1]
+        await bridge._handle(watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "deny"}))
+        await _until(lambda: bridge.session.chat.answering)
+        await bridge._handle(bytes([0, 2]))  # the Watch's socket went
+        again = Watch()
+        await _start(bridge, socket, again, approvals=True, resume_session_id="stored1")
+        gate.set()
+        await _until(lambda: any(c["command"] == "two" for c in again.events(socket, "conduit.approval")), timeout=2)
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_hermes_that_asks_by_server_request_gets_the_same_card_and_withdraws_only_that_one(call):
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        turn = await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+
+        def ask(rpc_id, command):
+            call.hermes.transport.write({"jsonrpc": "2.0", "id": rpc_id, "method": "approval",
+                                         "params": {"session_id": "s1", "command": command, "description": "Run it"}})
+
+        ask(7, "one")
+        ask(8, "two")
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        assert watch.events(socket, "conduit.approval")[0]["command"] == "one"
+        # Withdrawn by its id (answered in Conduit): the other stays.
+        call.hermes.emit("request.cancel", {"id": 7})
+        await _until(lambda: watch.events(socket, "conduit.approval")[-1]["command"] == "two")
+        assert watch.events(socket, "conduit.approval")[-1]["choices"] == ["once", "deny"]
+        # A cancel naming no request the call holds changes nothing.
+        call.hermes.emit("request.cancel", {"id": 99})
+        await asyncio.sleep(0.05)
+        assert watch.events(socket, "conduit.approval.gone")[-1]["id"] != watch.events(socket, "conduit.approval")[-1]["id"]
+        call.hermes.emit("approval.cancelled", {})
+        await _until(lambda: watch.events(socket, "conduit.approval.gone")[-1]["id"]
+                     == watch.events(socket, "conduit.approval")[-1]["id"])
+        call.hermes.emit("message.complete", {"text": "ok"})
+        # The call said where the card is, once, as for an event-asked request.
+        assert (await _frames(turn)).startswith(api.LOCAL_LIVE_WATCH_APPROVAL_LINE)
+        await bridge._end_session("test")
+
+    _run(scenario())
