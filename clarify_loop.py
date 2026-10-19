@@ -335,7 +335,9 @@ def _release_decision(request_id: str, relay_won: bool) -> None:
         except Exception as error:  # pragma: no cover - defensive
             logger.warning("Conduit decision release failed for %s: %s", request_id, error)
 
-    threading.Thread(target=_cancel, name="conduit-push-release", daemon=True).start()
+    # Under the profile that parked the decision (see the native-race worker).
+    threading.Thread(target=contextvars.copy_context().run, args=(_cancel,), name="conduit-push-release",
+                     daemon=True).start()
 
 
 def _poll_delay(unanswered_polls: int) -> float:

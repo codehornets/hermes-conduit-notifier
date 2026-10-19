@@ -26,6 +26,7 @@ dashboard's outcome route), and the next turn of its chat tells Hermes so
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import threading
 import time
@@ -48,7 +49,8 @@ APNS_FAILURES = frozenset({"apns_rejected", "apns_unreachable"})
 
 
 def _spawn(work: Callable[[], None]) -> None:
-    threading.Thread(target=work, name="conduit-call", daemon=True).start()
+    # Under the profile that started the work (see client.enqueue).
+    threading.Thread(target=contextvars.copy_context().run, args=(work,), name="conduit-call", daemon=True).start()
 
 
 # Homes with a waiter thread running, so a burst of held turn ends starts one,

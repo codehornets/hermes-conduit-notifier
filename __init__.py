@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import logging
 import threading
@@ -228,7 +229,8 @@ def _finish_ready(session_id: str, ready: dict[str, Any] | None, send: bool) -> 
 
 
 def _later(delay: float, work: Any) -> Any:
-    timer = threading.Timer(delay, work)
+    # Under the profile that set the timer (see client.enqueue).
+    timer = threading.Timer(delay, contextvars.copy_context().run, args=(work,))
     timer.daemon = True
     timer.start()
     return timer
