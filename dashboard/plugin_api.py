@@ -10331,6 +10331,9 @@ class _LocalLiveWatchSession(_WatchAudioSession):
         self.chat: Optional[_WatchCallChat] = None
         # run() is over: its cards and answers are done too.
         self.finished = False
+        # This call shows Hermes' requests on the Watch's card: the Watch
+        # asked, and Hermes waits for an answer (a timeout above 0).
+        self.cards = False
 
     async def run(self) -> None:
         profile = self.profile
@@ -10377,10 +10380,12 @@ class _LocalLiveWatchSession(_WatchAudioSession):
                     self.approval_timeout = await asyncio.wait_for(
                         _run_scoped(profile, _hermes_approval_timeout, _speech_server_executor),
                         timeout=SPEECH_SERVER_SETUP_TIMEOUT_S)
-                # A Hermes that denies at once (a timeout of 0) shows no card
-                # to point to.
-                runner.watch_approvals = self.approval_timeout > 0
-                chat.on_approvals = self._approvals_changed
+                # A Hermes that denies at once (a timeout of 0) has no card
+                # to show, nor a line to point to one.
+                self.cards = self.approval_timeout > 0
+                runner.watch_approvals = self.cards
+                if self.cards:
+                    chat.on_approvals = self._approvals_changed
             call = self.call = _LocalLiveWatchCall(self, _local_live_profile_key(profile))
             _local_live_register(call)
             pacer = self.pacer = _WatchAudioPacer(self.send, LOCAL_LIVE_WATCH_RATE)
@@ -10509,6 +10514,10 @@ class _LocalLiveWatchSession(_WatchAudioSession):
     def _approval_margin(self) -> float:
         return min(LOCAL_LIVE_WATCH_APPROVAL_MARGIN_S, self.approval_timeout / 10)
 
+    def _purge_expired_approvals(self) -> None:
+        """Drops the requests past Hermes' timeout (before an answer is checked)."""
+        self._pending_approvals()
+
     def _pending_approvals(self) -> List[Dict[str, Any]]:
         """The chat's pending approvals, those past Hermes' timeout dropped."""
         chat = self.chat
@@ -10529,16 +10538,18 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             await self._show_approval_now()
 
     async def _show_approval_now(self) -> None:
-        if not self.watch_approvals or self.stopping.is_set() or self.finished or self.chat is None:
+        if not self.cards or self.stopping.is_set() or self.finished or self.chat is None:
             return
         approvals = self._pending_approvals()
         if self.approval_timer is not None:
             self.approval_timer.cancel()
             self.approval_timer = None
+        # What the Watch was told is only recorded once it's sent: a send
+        # that didn't go is sent again at the next look.
         if not approvals:
-            if self.shown_approval is not None:
-                gone, self.shown_approval = self.shown_approval[0], None
-                await self.to_watch({"type": "conduit.approval.gone", "id": gone})
+            if self.shown_approval is not None and await self.to_watch(
+                    {"type": "conduit.approval.gone", "id": self.shown_approval[0]}):
+                self.shown_approval = None
             return
         # The turn waits on the user: kept open while it does.
         if self.runner is not None:
@@ -10550,29 +10561,35 @@ class _LocalLiveWatchSession(_WatchAudioSession):
         expires = self.approval_timeout - self._approval_margin() - (time.monotonic() - oldest["at"])
         wait = (min(expires + 0.05, LOCAL_LIVE_WATCH_APPROVAL_KEEPALIVE_S) if expires > 0
                 else LOCAL_LIVE_WATCH_APPROVAL_KEEPALIVE_S)
-        self.approval_timer = asyncio.get_running_loop().call_later(
-            wait, lambda: _local_live_spawn(self._show_approval()))
+        if not self.finished:
+            self.approval_timer = asyncio.get_running_loop().call_later(
+                wait, lambda: _local_live_spawn(self._show_approval()))
         if self.chat.answering:
             # Hermes is taking an answer: the next card waits for it.
             return
         choices = self._approval_choices(approvals)
-        shown, self.shown_approval = self.shown_approval, (oldest["id"], choices)
-        if shown == self.shown_approval:
+        card = (oldest["id"], choices)
+        if self.shown_approval == card:
             return
-        if shown is not None and shown[0] != oldest["id"]:
-            await self.to_watch({"type": "conduit.approval.gone", "id": shown[0]})
-        await self.to_watch({"type": "conduit.approval", "id": oldest["id"], "command": oldest["command"],
-                             "description": oldest["description"], "choices": list(choices),
-                             "pending": len(approvals), "cut": bool(oldest.get("cut"))})
+        if self.shown_approval is not None and self.shown_approval[0] != oldest["id"]:
+            if not await self.to_watch({"type": "conduit.approval.gone", "id": self.shown_approval[0]}):
+                return
+            self.shown_approval = None
+        sent = await self.to_watch({"type": "conduit.approval", "id": oldest["id"], "command": oldest["command"],
+                                    "description": oldest["description"], "choices": list(choices),
+                                    "pending": len(approvals), "cut": bool(oldest.get("cut"))})
+        if sent:
+            # Not otherwise: the Watch still holds the card it had, so the
+            # next look sends this again, or takes that one away.
+            self.shown_approval = card
 
     async def _answer_approval(self, frame: Dict[str, Any]) -> None:
         """The Watch's answer: only to the card it was shown (the oldest, the
         one Hermes answers), and only with a choice that card offered."""
         chat = self.chat
-        if chat is None or self.stopping.is_set() or self.finished:
+        if chat is None or not self.cards or self.stopping.is_set() or self.finished:
             return
-        # Drops the ones past Hermes' timeout before the answer is checked.
-        self._pending_approvals()
+        self._purge_expired_approvals()
         choice = frame.get("choice")
         with chat.approvals_lock:
             approvals = list(chat.approvals)
@@ -10654,7 +10671,7 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             if isinstance(kind, str) and kind.startswith("conduit."):
                 if kind.startswith("conduit.turn.") and self.call is not None:
                     self.call.watch_frame(frame)
-                elif kind == "conduit.approval.answer" and self.watch_approvals:
+                elif kind == "conduit.approval.answer" and self.cards and not self.finished:
                     _local_live_spawn(self._answer_approval(frame))
                 return
         with contextlib.suppress(Exception):
