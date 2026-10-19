@@ -210,8 +210,10 @@ def _wait_for_holds(home: Any, profile: str) -> None:
 
 def _waiter(home: Any, profile: str, key: str, generation: int = 0) -> Callable[[], None]:
     def wait() -> None:
-        store = _store(home)
         try:
+            # Inside the try: a store that can't open must still let go of
+            # the key, or no later hold for this home starts a waiter.
+            store = _store(home)
             while True:
                 # Under the lock: a hold that starts now either shows up here
                 # or wakes this waiter, or starts its own.
