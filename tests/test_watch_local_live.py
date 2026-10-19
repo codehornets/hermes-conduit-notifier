@@ -638,6 +638,175 @@ def test_numbers_dont_end_sentences_and_a_long_run_is_cut_on_a_space():
     assert out and len(out) <= api.LOCAL_LIVE_WATCH_MAX_SENTENCE_CHARS
 
 
+# --- A read-back speech server ----------------------------------------------------
+
+
+class ReadBackSocket(SpeechSocket):
+    """The farm voice adapter: no automatic responses, each response read back."""
+
+    hold = False
+    # What its transcripts say instead of the text (a server with a model).
+    says = None
+
+    async def send(self, message):
+        await super().send(message)
+        event = self.received[-1]
+        kind = event.get("type")
+        if kind == "session.update":
+            if api._local_live_turn_detection(event) is not None:
+                self.push({"type": "error", "error": {"code": "realtime_live_unavailable",
+                                                      "param": "session.audio.input.turn_detection.create_response"}})
+            else:
+                self.push({"type": "session.updated", "session": event["session"]})
+        elif kind == "response.create":
+            text = api._local_live_item_words(event["response"]["input"][0])
+            rid = f"r{len(self.received)}"
+            self.push({"type": "response.created", "response": {"id": rid}})
+            if self.hold:
+                self.held = rid
+                return
+            said = self.says or text
+            self.push({"type": "response.output_audio_transcript.delta", "delta": said})
+            self.push({"type": "response.output_audio.delta", "delta": base64.b64encode(b"\x10\x27" * 240).decode()})
+            self.push({"type": "response.output_audio_transcript.done", "transcript": said})
+            self.push({"type": "response.done", "response": {"id": rid, "status": "completed"}})
+        elif kind == "response.cancel" and self.hold:
+            # Audio already on its way when the cancel lands, then the end.
+            self.push({"type": "response.output_audio.delta", "delta": base64.b64encode(b"\x01\x00" * 240).decode()})
+            self.push({"type": "response.done", "response": {"id": self.held, "status": "cancelled"}})
+
+
+WATCH_UPDATE = {"type": "session.update", "session": {"type": "realtime", "audio": {"input": {
+    "turn_detection": {"type": "server_vad", "create_response": True, "interrupt_response": True}}}}}
+
+
+def test_on_a_read_back_server_the_host_runs_the_watchs_turns_and_has_each_sentence_read_back(call, monkeypatch):
+    async def connect(url, headers):
+        socket = ReadBackSocket()
+        call.speech.sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(api, "_connect_speech_server", connect)
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        watch = Watch()
+        await _start(bridge, socket, watch)
+        upstream = call.speech.sockets[0]
+        await bridge._handle(watch.event(WATCH_UPDATE))
+        await _until(lambda: watch.events(socket, "session.updated"))
+        # The refusal stays on the host; the server got automatic responses off.
+        assert not watch.events(socket, "error")
+        assert upstream.received[1]["session"]["audio"]["input"]["turn_detection"]["create_response"] is False
+
+        # The readiness check goes to the Watch, never to Hermes or the server.
+        marker = "conduit-ready-9a"
+        check = {"type": "response.create", "response": {"conversation": "none", "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": marker}]}]}}
+        await bridge._handle(watch.event(check))
+        await _until(lambda: watch.events(socket, "conduit.turn"))
+        [ask] = watch.events(socket, "conduit.turn")
+        assert ask["text"] == marker
+        await bridge._handle(watch.event({"type": "conduit.turn.done", "turn_id": ask["turn_id"]}))
+        await _until(lambda: watch.events(socket, "response.done"))
+        assert [event["type"] for event in watch.events(socket) if event["type"].startswith("response.")] == \
+            ["response.created", "response.done"]
+
+        # A spoken turn runs in the call's chat; its reply is read back.
+        upstream.push({"type": "conversation.item.input_audio_transcription.completed",
+                       "transcript": "What's the weather?"})
+        await _until(lambda: call.hermes.prompts())
+        assert call.hermes.prompts()[0]["text"] == "What's the weather?"
+        call.hermes.emit("message.start", {})
+        call.hermes.emit("message.delta", {"text": "Sunny. "})
+        call.hermes.emit("message.delta", {"text": "It is twenty degrees, with a light wind from the west. "})
+        call.hermes.emit("message.complete", {"text": "whole", "status": "complete"})
+        await _until(lambda: len(watch.events(socket, "response.done")) == 2)
+        spoken = [api._local_live_item_words(event["response"]["input"][0])
+                  for event in upstream.received if event["type"] == "response.create"]
+        assert spoken == ["Sunny.", "It is twenty degrees, with a light wind from the west."]
+        events = watch.events(socket)
+        reply = events[events.index(watch.events(socket, "response.done")[0]) + 1:]
+        assert [event["type"] for event in reply].count("response.created") == 1
+        assert "".join(event["delta"] for event in reply if event["type"] == "response.output_audio_transcript.delta") \
+            == "Sunny. It is twenty degrees, with a light wind from the west."
+        await _until(lambda: sum(1 for kind, _ in watch.received(socket) if kind == 1) >= 2, timeout=10)
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_on_a_read_back_server_speaking_over_the_watchs_reply_stops_it(call, monkeypatch):
+    async def connect(url, headers):
+        socket = ReadBackSocket()
+        socket.hold = True
+        call.speech.sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(api, "_connect_speech_server", connect)
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        watch = Watch()
+        await _start(bridge, socket, watch)
+        upstream = call.speech.sockets[0]
+        await bridge._handle(watch.event(WATCH_UPDATE))
+        await _until(lambda: watch.events(socket, "session.updated"))
+        upstream.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": "Tell me a story"})
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("message.start", {})
+        call.hermes.emit("message.delta", {"text": "Once upon a time, there was a fox. "})
+        await _until(lambda: watch.events(socket, "response.created"))
+        upstream.push({"type": "input_audio_buffer.speech_started", "item_id": "i2"})
+        await _until(lambda: watch.events(socket, "response.done"))
+        events = [event["type"] for event in watch.events(socket)]
+        assert events[events.index("input_audio_buffer.speech_started"):] == \
+            ["input_audio_buffer.speech_started", "response.done"]
+        assert watch.events(socket, "response.done")[0]["response"]["status"] == "cancelled"
+        assert {"type": "response.cancel"} in upstream.received
+        # The turn went; Hermes' reply goes on in the chat, unspoken.
+        assert bridge.session.runner.turn is None
+        await asyncio.sleep(0.1)
+        # The cancelled response's late audio never reached the Watch.
+        assert not any(kind == 1 and value.startswith(b"\x01\x00") for kind, value in watch.received(socket))
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_server_that_doesnt_read_back_ends_the_watch_call_as_refused(call, monkeypatch):
+    async def connect(url, headers):
+        socket = ReadBackSocket()
+        socket.says = "I am a model and I say what I like"
+        call.speech.sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(api, "_connect_speech_server", connect)
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        watch = Watch()
+        await _start(bridge, socket, watch)
+        upstream = call.speech.sockets[0]
+        await bridge._handle(watch.event(WATCH_UPDATE))
+        await _until(lambda: watch.events(socket, "session.updated"))
+        upstream.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": "Hello"})
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("message.delta", {"text": "Hello there, how are you doing today? "})
+        call.hermes.emit("message.delta", {"text": "I hope the weather is kind to you. "})
+        call.hermes.emit("message.complete", {"text": "whole", "status": "complete"})
+        await _until(lambda: watch.events(socket, "error"))
+        [error] = watch.events(socket, "error")
+        # A refusal: the Watch doesn't dial the same server again.
+        assert error == {"type": "error", "code": "refused", "message": api.LOCAL_LIVE_NOT_READ_BACK}
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
 # --- Approvals on the Watch -------------------------------------------------------
 
 

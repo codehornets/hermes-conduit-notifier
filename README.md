@@ -1,8 +1,14 @@
 # Hermes Conduit Notifier
 
-Hermes Conduit Notifier is the open-source Hermes plugin that delivers lifecycle notifications to the Hermes Conduit iOS app. It observes normal Hermes hooks and sends small HTTPS events to the Conduit push relay.
+Hermes Conduit Notifier is the open-source Hermes plugin that connects a Hermes host to the [Hermes Conduit](https://github.com/kaishi00/hermes-conduit) iPhone, iPad and Apple Watch app. It started as the notification sender and now carries most of what Conduit needs from the host:
 
-The plugin does **not** contain an Apple Push Notification service key, dashboard credentials, or access to your Hermes gateway. (Its only dashboard routes hand Conduit short-lived Gemini Live tokens, start GPT-Live sessions on the host's ChatGPT subscription, relay Grok Live calls with the host's SuperGrok sign-in, run its voice web lookups, read memory and personality for voice, save live voice transcripts to this host's session history, ending each call's session there so session hooks and memory see it, and open short-lived grants that let an Apple Watch call run lookups and Hermes jobs through the relay; see below.) Apple credentials remain on the central push relay, so self-hosted users never need to copy a shared signing key onto their gateway.
+- **Notifications and calls**: approval, input, reply, failure and background-task notifications, Hermes calling you (CallKit on the phone and Watch), and Lock Screen progress while a turn runs, all delivered through the Conduit push relay in [`relay/`](relay/), end-to-end encrypted where APNs allows.
+- **Live voice**: single-use Gemini Live tokens, GPT-Live sessions on the host's ChatGPT subscription or API key, Grok Live relayed with the host's xAI sign-in, Local Live and Classic voice through your own speech server, voice web lookups, memory and personality for voice, and saved call transcripts.
+- **Apple Watch**: short-lived grants that let a Watch call run lookups and Hermes jobs, and stream GPT-Live, Grok and Local Live audio, through the relay, sealed end to end.
+- **Phone data the user opts into**: Apple Health, location, maps, calendar, reminders, Focus, phone status, contacts and alarms, sent by the phone straight to this host and sealed end to end, with the `conduit_health`, `conduit_location`, `conduit_maps`, `conduit_calendar`, `conduit_phone` and `conduit_contacts` tools for the agent.
+- **Conduit extras**: rich cards and on-screen cards during calls, Artifacts, group pictures, chat takeover, cron notification settings, Conduit settings the agent can change, and one-tap pairing and updates from the app.
+
+Every route sits behind the Hermes dashboard's own auth. The plugin holds no Apple Push Notification service key and no dashboard credentials: Apple credentials stay on the push relay, so self-hosted users never need to copy a shared signing key onto their gateway, and provider keys and sign-ins never leave this host. What each party can see is in the [privacy policy](https://kaishi00.github.io/hermes-conduit-notifier/privacy/).
 
 ## Install
 
@@ -100,6 +106,8 @@ The iOS app controls which categories are enabled, whether notification previews
 - Lock Screen previews are disabled by default in Hermes Conduit.
 - **End-to-end encryption** (plugin 0.5+, relay 0.5+, a Conduit build with encrypted notifications): Conduit creates a secret for each pairing on the phone and hands it to this profile over your Hermes dashboard connection, so it never passes through the relay. From then on every notification's title, body, profile, session and decision card is sealed with it (ChaCha20-Poly1305, keys derived with HKDF-SHA256), the phone decrypts it in a Notification Service Extension, and clarify answers come back sealed for this profile. The relay and APNs see only routing data: the event type, opaque ids, a keyed thread token and timing. A pairing that has a key never sends plaintext content again, and only accepts clarify answers sealed by the phone. `hermes conduit-push status` shows whether it's on; Conduit turns it on by itself when it connects to this host. Run `hermes conduit-push test --corrupt` to check that the phone shows only generic text for a push it can't verify. The secret is only as private in transit as your dashboard connection (HTTPS or a private tunnel is recommended).
 - `hermes conduit-push redact on` keeps chat content from leaving the gateway: events carry no title or body text, approval cards say "Hermes needs your approval. Open Conduit for details.", and clarify cards replace question text with generic copy. The fields needed to answer stay (session key or request id, question ids, choice labels), so cards raised while the app is backgrounded remain recoverable and answerable. Clarify choice labels still transit the relay because the answer is one of them. `status` shows the current setting; `redact off` restores full content, including for events still waiting in the local delivery queue.
+
+- Besides notifications, the relay carries call pushes (sealed like notifications, except the "stopped ringing" notice), Lock Screen progress (phase, a tool category from a fixed list, tool count and context percentage, never chat text; `redact on` drops the category), Apple Watch grants and audio (sealed per call), the one-time codes that prove a phone holds its APNs token, and short-lived Apple Maps tokens for the host maps engine (the relay never sees the lookups). Health, location, calendar, phone and contacts data never pass through it.
 
 The public relay URL is part of the client protocol. APNs signing material (the `.p8` key) is never committed — see the relay directory below for how to deploy your own.
 
@@ -691,7 +699,7 @@ choose:
   API-billed calls per day (default 20; `0` turns API calls off, a 403). A
   call OpenAI refuses or never answers (a rejected key, an outage) gives its
   slot back; once OpenAI has said yes, the slot stays counted even if its
-  answer turns out unusable, since a billed session may have started.
+  answer turns out unusable or is cut off mid-read, since a billed session may have started.
   The count is kept in memory, per dashboard process: a restart starts it
   again, and a dashboard run with several worker processes allows the cap in
   each.
@@ -887,6 +895,108 @@ the server speaks Classic's replies in its own voice. Classic then uses one
 server for listening and speaking. While the reply plays, Classic may open
 its listening socket too, so start the server with `--num_pipelines 2`.
 
+### Local Live on a read-back speech server (plugin 0.50+)
+
+Some speech servers only listen and read text aloud, with no model of their
+own: a response reads back the user text it's given, and a session that asks
+for automatic responses (`turn_detection.create_response: true`) is refused.
+The farm's fleet voice adapter is one. Such a server never asks the model
+address for a reply, so the plugin runs the call's turns on the relay instead
+(capability `local-live-read-back`), on the phone's socket and the Watch's
+bridge alike:
+
+- When the server refuses automatic responses for that reason
+  (`realtime_live_unavailable`, or an error naming
+  `turn_detection.create_response`), the plugin sends the call's
+  session.update again with `create_response` and `interrupt_response` off.
+  Conduit never sees the refusal.
+- Each finished transcription (`conversation.item.input_audio_transcription.completed`)
+  starts the call's turn, as the model address would. The readiness check's
+  marker and a typed turn do too, so neither is read aloud.
+- The reply, as it streams, goes back in sentences, one read-back
+  `response.create` (inline input) per sentence, one at a time. The first
+  sentence goes as soon as it ends; later ones join until they're 40
+  characters, and text that waits 1.2 s goes anyway.
+- Conduit sees one response per reply, however many sentences it takes, with
+  its transcript spaced between them, and an empty reply as a response that
+  begins and ends.
+- When the user starts speaking over the reply (`input_audio_buffer.speech_started`),
+  the reply stops: the plugin cancels the server's response, drops its late
+  audio, and lets the turn go, as a server that answers by itself would.
+  While nothing of the reply has been said yet (Hermes still at work), only
+  words stop it: its first sentence waits until the speech is transcribed
+  (10 s at most), the words start a new turn, and a sound that transcribes
+  to nothing lets the reply go on.
+- A cancelled response the server says nothing more about is over after 2 s,
+  and one that goes quiet (not started, or no audio) for 30 s is given up on.
+- A server whose transcripts of two sentences in a row don't match them
+  (sentences of five words or more, without digits) isn't reading back. The
+  call ends with a reason: close code 4400 on the phone's socket, an `error`
+  with code `refused` on the Watch's bridge.
+
+Nothing changes for a server that answers by itself.
+
+### Agent mode: a fast model in front of Hermes (plugin 0.49+)
+
+One Hermes turn per utterance is slow to start talking. In agent mode a fast
+model of your choosing holds the conversation and hands real work to Hermes
+as background jobs, the way GPT-Live, Gemini and Grok calls do. Conduit's
+Live > Local mode turns it on; Classic's "Hands-free on your speech server"
+keeps one Hermes turn per utterance.
+
+Set the fast model in the profile's config (Conduit's Local settings write
+it). Any OpenAI-compatible chat-completions server works, local (llama.cpp,
+vLLM, Ollama, LM Studio) or remote. Plain `http://` only reaches private,
+Tailscale and LAN addresses, since the key goes with every request.
+
+```yaml
+voice:
+  local_live:
+    front_model:
+      base_url: http://10.1.10.52:8080/v1   # /chat/completions is added
+      model: qwen3-4b-instruct
+      api_key: sk-...                        # optional; or api_key_file
+```
+
+How a call runs:
+
+- On connecting, Conduit sends `{"type": "conduit.agent", "instructions",
+  "tools"}` (the call's live-model instructions and its tools: start_job,
+  list_jobs, cancel_job and the rest). The plugin answers
+  `{"type": "conduit.agent.ready", "tools": n}`.
+- Each utterance the speech server asks about goes to the fast model with
+  the call's own conversation (the server's history and system prompt are
+  not used) and streams back as it arrives. `<think>` blocks are dropped.
+  The speech server never sees a tool.
+- A tool call goes to Conduit as `{"type": "conduit.tool.call", "call_id",
+  "name", "arguments"}`; Conduit runs it and answers `{"type":
+  "conduit.tool.result", "call_id", "output", "speak"}`. start_job answers
+  as soon as the job runs, in the call's chat with its job card. A call that
+  waits more than 30 seconds tells the model it is still running; a result
+  that comes after that, with `speak` true, is handed back as
+  `conduit.tool.late` and Conduit says it as an update.
+- A job's outcome comes back the way Grok Live's does: once the call is
+  quiet, Conduit sends it to the speech server as a user item plus
+  `response.create`, and the fast model tells you what Hermes found.
+- `{"type": "conduit.agent.note", "text"}` adds context the model keeps
+  without answering (a message typed in the call's chat).
+- The readiness check is still answered by Conduit. With no fast model set,
+  or with one that fails before saying anything, the utterance goes to
+  Hermes as a turn instead.
+
+An engine that runs its own fast model (Pipecat behind the relay, say) uses
+the same tools with the Local Live key:
+
+| Method | Path | Returns |
+|--------|------|---------|
+| GET | `/api/plugins/conduit_push/local-live/v1/tools` | `{in_call, instructions, tools}`: the call's tools, chat-completions shape |
+| POST | `/api/plugins/conduit_push/local-live/v1/tools/call` | `{name, arguments}` in, `{output}` out; 409 with no call |
+
+Job outcomes reach such an engine on the relay as a user
+`conversation.item.create` plus `response.create`. `GET /local-live/status`
+adds `front_model: {configured, available, base_url, model, has_key,
+reason}`, and the capability is `local-live-agent`.
+
 ### Local Live on the Apple Watch (plugin 0.48+)
 
 A Watch call on Local Live uses the same server, key and model address. The
@@ -904,7 +1014,7 @@ lists `local_live` once Local Live is available for the profile and the
 dashboard serves Hermes' chats.
 
 A Watch whose start says `"approvals": true` answers Hermes' approval
-requests on its own card (plugin 0.48.4+, capability
+requests on its own card (plugin 0.50.1+, capability
 `watch-local-live-approvals`). Any other Watch is told to answer in the chat,
 as before.
 

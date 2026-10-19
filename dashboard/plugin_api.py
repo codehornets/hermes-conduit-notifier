@@ -42,6 +42,7 @@ import atexit
 import base64
 import collections
 import contextvars
+import difflib
 import errno
 import functools
 import hashlib
@@ -82,7 +83,7 @@ import contextlib
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, WebSocket
 
@@ -1393,29 +1394,44 @@ def gpt_live_session_config(history: Optional[list], live: Dict[str, Any]) -> Di
     return config
 
 
+class _GPTLiveAnsweredError(TokenError):
+    """OpenAI answered 2xx but its answer couldn't be read: a session may have started."""
+
+
 def _post_sdp(url: str, headers: Dict[str, str], body: Dict[str, Any]) -> tuple:
     """POST the offer; returns (status, answer text, Location). No redirects: the bearer must not follow one."""
     request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
                                      headers={**headers, "Content-Type": "application/json"})
+    answered = False
+
+    def failed(message: str) -> TokenError:
+        # Once OpenAI answered 2xx, a session may have started: every later failure says so.
+        return (_GPTLiveAnsweredError if answered else TokenError)(502, message + GPT_LIVE_NO_FALLBACK)
+
     try:
         with _opener.open(request, timeout=GPT_LIVE_TIMEOUT_S) as response:
+            answered = 200 <= response.status < 300
             # An SDP answer is a few KB; one byte over the cap is refused, not buffered.
             answer = response.read(GPT_LIVE_MAX_ANSWER_BYTES + 1)
             if len(answer) > GPT_LIVE_MAX_ANSWER_BYTES:
-                raise TokenError(502, "GPT-Live returned an invalid WebRTC answer. " + GPT_LIVE_NO_FALLBACK)
+                raise failed("GPT-Live returned an invalid WebRTC answer. ")
             return response.status, answer.decode("utf-8", "replace"), response.headers.get("Location", "")
     except urllib.error.HTTPError as exc:
         # The body can echo account details; only the status goes back to Conduit.
         status = exc.code
         exc.close()
         return status, "", ""
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        logger.warning("GPT-Live session request could not reach OpenAI: %s", getattr(exc, "reason", exc))
-        raise TokenError(502, "GPT-Live connection failed. " + GPT_LIVE_NO_FALLBACK)
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        # http.client.HTTPException covers a chunked body cut off mid-read (IncompleteRead).
+        if answered:
+            logger.warning("GPT-Live could not read OpenAI's answer after a 2xx: %s", type(exc).__name__)
+        else:
+            logger.warning("GPT-Live session request could not reach OpenAI: %s", getattr(exc, "reason", exc))
+        raise failed("GPT-Live connection failed. ")
     except ValueError as exc:
         # A header value the request can't carry (a non-Latin-1 token, say): the type only, never the value.
         logger.warning("GPT-Live could not build its session request: %s", type(exc).__name__)
-        raise TokenError(502, "GPT-Live connection failed. " + GPT_LIVE_NO_FALLBACK)
+        raise failed("GPT-Live connection failed. ")
 
 
 def _valid_answer(sdp: Any, call_id: Any) -> bool:
@@ -1501,9 +1517,11 @@ def _api_gpt_live_exchange(sdp: str, history: Optional[list], live: Dict[str, An
         status, text, _location = post(f"{base_url}/live/sessions", {"Authorization": f"Bearer {key}"},
                                        {"session": config, "transport": {"type": "webrtc", "sdp": sdp}})
     except TokenError as exc:
-        # Said for this path, whatever the shared transport's own wording.
-        raise TokenError(exc.status, "GPT-Live on the API key could not connect, or its answer was invalid. "
-                                     + GPT_LIVE_NO_SUBSCRIPTION)
+        # Said for this path, whatever the shared transport's own wording. An answer
+        # that failed after a 2xx keeps its daily slot, like an invalid one below.
+        raise (_GPTLiveAPIAnsweredError if isinstance(exc, _GPTLiveAnsweredError) else TokenError)(
+            exc.status, "GPT-Live on the API key could not connect, or its answer was invalid. "
+                        + GPT_LIVE_NO_SUBSCRIPTION)
     if not 200 <= status < 300:
         logger.warning("GPT-Live API session was rejected: HTTP %s", status)
         if status == 401:
@@ -2567,13 +2585,16 @@ async def _speech_server_socket(ws: WebSocket, relay: Callable[..., Any]) -> Non
 
 async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any], url: str, key: str,
                                intercept: Optional[Callable[[str], Any]] = None,
-                               send_lock: Optional[asyncio.Lock] = None) -> None:
+                               send_lock: Optional[asyncio.Lock] = None,
+                               read_back: Optional["_LocalLiveReadBack"] = None) -> None:
     """One utterance's relay, from dialing the speech server to forwarding its close.
 
     ``intercept`` sees each text frame from Conduit first and returns True for
     one meant for the plugin, which then isn't forwarded (Local Live's turn
     frames). ``send_lock`` is held for each frame sent to Conduit, when
-    something else sends on the same socket.
+    something else sends on the same socket. ``read_back`` runs a Local Live
+    call's turns when the server turns out to only read text back: it sees
+    the text frames both ways.
     """
     send_lock = send_lock or asyncio.Lock()
     try:
@@ -2586,6 +2607,8 @@ async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any],
         logger.warning("Could not reach the speech server: %s", type(exc).__name__)
         await refuse(SPEECH_SERVER_CLOSE_UNREACHABLE, "Could not reach the speech server from the Hermes host")
         return
+    if read_back is not None:
+        read_back.attach(upstream.send, upstream.close)
 
     async def client_to_server() -> None:
         while True:
@@ -2599,12 +2622,18 @@ async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any],
             if text is not None:
                 if intercept is not None and await intercept(text):
                     continue
+                if read_back is not None and await read_back.from_client(text):
+                    continue
                 await upstream.send(text)
             elif data is not None:
                 await upstream.send(data)
 
     async def server_to_client() -> None:
         async for frame in upstream:
+            if read_back is not None and isinstance(frame, str):
+                frame = await read_back.from_server(frame)
+                if frame is None:
+                    continue
             async with send_lock:
                 if isinstance(frame, str):
                     await ws.send_text(frame)
@@ -2621,6 +2650,8 @@ async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any],
     try:
         done, _ = await asyncio.wait({outbound, inbound}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        if read_back is not None:
+            read_back.close()
         for task in (outbound, inbound):
             task.cancel()
         with contextlib.suppress(Exception):
@@ -2683,7 +2714,9 @@ async def _speech_server_relay(ws: WebSocket, refuse: Callable[[int, str], Any],
 LOCAL_LIVE_MOUNT = "/api/plugins/conduit_push"
 LOCAL_LIVE_MODEL_PATH = "/local-live/v1"
 LOCAL_LIVE_TOKEN_PATHS = (LOCAL_LIVE_MOUNT + LOCAL_LIVE_MODEL_PATH + "/chat/completions",
-                          LOCAL_LIVE_MOUNT + LOCAL_LIVE_MODEL_PATH + "/models")
+                          LOCAL_LIVE_MOUNT + LOCAL_LIVE_MODEL_PATH + "/models",
+                          LOCAL_LIVE_MOUNT + LOCAL_LIVE_MODEL_PATH + "/tools",
+                          LOCAL_LIVE_MOUNT + LOCAL_LIVE_MODEL_PATH + "/tools/call")
 LOCAL_LIVE_FILE = "conduit-local-live.json"
 LOCAL_LIVE_KEY_PREFIX = "cll1"
 LOCAL_LIVE_PROVIDER_NAME = "conduit-local-live"
@@ -3016,6 +3049,10 @@ class _LocalLiveCall:
         self.turns: Dict[str, _LocalLiveTurn] = {}
         self.numbers = itertools.count(1)
         self.closed = False
+        # Agent mode (conduit.agent from the phone): a fast front model
+        # answers the call and hands the work to Hermes through the call's
+        # tools. None keeps one Hermes turn per utterance.
+        self.agent: Optional[_LocalLiveAgent] = None
 
     async def send(self, payload: Dict[str, Any]) -> bool:
         if self.closed:
@@ -3057,6 +3094,9 @@ class _LocalLiveCall:
         kind = frame.get("type") if isinstance(frame, dict) else None
         if not isinstance(kind, str) or not kind.startswith("conduit."):
             return False
+        if kind.startswith(("conduit.agent", "conduit.tool.")):
+            await self._agent_frame(kind, frame)
+            return True
         turn = self.turns.get(str(frame.get("turn_id") or ""))
         if turn is None:
             return True
@@ -3097,11 +3137,33 @@ class _LocalLiveCall:
             return True
         return any(words == wanted and now - at < LOCAL_LIVE_RETRY_WINDOW_S for words, at in self.read_lately)
 
+    async def _agent_frame(self, kind: str, frame: Dict[str, Any]) -> None:
+        if kind == "conduit.agent":
+            # A connection's setup, sent again on each reconnect: the
+            # conversation so far stays.
+            agent = _LocalLiveAgent.configured(frame, previous=self.agent)
+            self.agent = agent
+            await self.send({"type": "conduit.agent.ready", "tools": len(agent.tools)})
+        elif self.agent is None:
+            return
+        elif kind == "conduit.agent.note":
+            self.agent.note(frame.get("text"))
+        elif kind == "conduit.tool.result":
+            call_id = str(frame.get("call_id") or "")
+            output = frame.get("output")
+            output = output if isinstance(output, str) else json.dumps(output if output is not None else {})
+            if not self.agent.resolve(call_id, output) and frame.get("speak") is True and call_id:
+                # Nothing waits for it any more (the front model moved on or
+                # gave up): the phone says it as an update of its own.
+                await self.send({"type": "conduit.tool.late", "call_id": call_id})
+
     def close(self) -> None:
         self.closed = True
         for turn in list(self.turns.values()):
             turn.frames.put_nowait(("done", ""))
         self.turns.clear()
+        if self.agent is not None:
+            self.agent.close()
 
 
 _local_live_calls: Dict[str, List[Any]] = {}
@@ -3224,6 +3286,8 @@ def local_live_status(
         "model_name": LOCAL_LIVE_MODEL_ID,
         "api_key": local_live_key(profile) if auth_ready else None,
         "speech_server": server,
+        # Agent mode's fast model; without one, Hermes answers each turn.
+        "front_model": local_live_front_model_status(),
         "in_call": (_local_live_active_call(profile or "") is not None) if in_call is None else in_call,
         "last_request_at": (_local_live_last_request.get(_local_live_profile_key(profile))
                             if last_request_at is None else last_request_at),
@@ -3278,9 +3342,20 @@ async def local_live_socket(ws: WebSocket) -> None:
 
     async def relay(refuse: Callable[[int, str], Any], url: str, key: str, profile: Optional[str]) -> None:
         call = _LocalLiveCall(ws, _local_live_profile_key(profile), speaks=ws.query_params.get("mode") == "speak")
+
+        async def to_phone(text: str) -> None:
+            async with call.send_lock:
+                await ws.send_text(text)
+
+        async def fail(reason: str) -> None:
+            await refuse(SPEECH_SERVER_CLOSE_REFUSED, reason)
+
+        # A live call's turns, should its server only read text back.
+        read_back = None if call.speaks else _LocalLiveReadBack(call, to_phone, fail)
         _local_live_register(call)
         try:
-            await _speech_server_relay(ws, refuse, url, key, intercept=call.intercept, send_lock=call.send_lock)
+            await _speech_server_relay(ws, refuse, url, key, intercept=call.intercept, send_lock=call.send_lock,
+                                       read_back=read_back)
         finally:
             call.close()
             _local_live_unregister(call)
@@ -3357,35 +3432,58 @@ async def post_local_live_chat_completions(request: Request) -> Any:
     completion_id = f"chatcmpl-conduit-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     call, speaks = _local_live_route(profile, text)
-    turn = await call.start_turn(text) if call is not None and text and not speaks else None
+    # Agent mode: the call's front model answers, unless it isn't set up
+    # (then Hermes answers each turn, as before). The readiness check is
+    # always the phone's own turn.
+    agent = getattr(call, "agent", None) if call is not None and not speaks else None
+    target = await _local_live_front_target(profile) \
+        if agent is not None and text and not text.startswith(LOCAL_LIVE_READY_PREFIX) else None
+    turn = await call.start_turn(text) if call is not None and text and not speaks and target is None else None
+
+    async def turn_words() -> Any:
+        """The phone's turn reply as it streams."""
+        deadline = time.monotonic() + LOCAL_LIVE_TURN_MAX_S
+        while True:
+            remaining = min(LOCAL_LIVE_TURN_IDLE_S, deadline - time.monotonic())
+            if remaining <= 0:
+                return
+            try:
+                kind, delta = await asyncio.wait_for(turn.frames.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return
+            if kind == "done":
+                return
+            # A keepalive (the call waits on the user) says nothing.
+            yield "" if kind == "keepalive" else delta
 
     async def words() -> Any:
         """The reply's text as the phone streams it; a fixed line with no call."""
+        nonlocal turn
         if speaks:
             # Read back word for word: the words are the reply already.
             if text:
                 yield text
             return
-        if turn is None:
-            # With a call open, an empty request (a warmup mid-call) gets
-            # nothing to say, not the no-call line.
-            if call is None:
-                yield LOCAL_LIVE_NO_CALL_REPLY
-            return
-        deadline = time.monotonic() + LOCAL_LIVE_TURN_MAX_S
         try:
-            while True:
-                remaining = min(LOCAL_LIVE_TURN_IDLE_S, deadline - time.monotonic())
-                if remaining <= 0:
-                    return
+            if target is not None:
                 try:
-                    kind, delta = await asyncio.wait_for(turn.frames.get(), timeout=remaining)
-                except asyncio.TimeoutError:
+                    async with contextlib.aclosing(agent.reply(call, text, target)) as replies:
+                        async for delta in replies:
+                            yield delta
                     return
-                if kind == "done":
-                    return
-                # A keepalive (the call waits on the user) says nothing.
-                yield "" if kind == "keepalive" else delta
+                except _LocalLiveFrontUnavailable:
+                    # The fast model is down: this utterance goes to Hermes.
+                    yield LOCAL_LIVE_FRONT_UNREACHABLE_REPLY + " "
+                    turn = await call.start_turn(text)
+            if turn is None:
+                # With a call open, an empty request (a warmup mid-call) gets
+                # nothing to say, not the no-call line.
+                if call is None:
+                    yield LOCAL_LIVE_NO_CALL_REPLY
+                return
+            async with contextlib.aclosing(turn_words()) as deltas:
+                async for delta in deltas:
+                    yield delta
         finally:
             # The server stopped listening (the user talked over the reply)
             # or the reply ended: either way the phone hears it's over.
@@ -3403,9 +3501,10 @@ async def post_local_live_chat_completions(request: Request) -> Any:
     async def events() -> Any:
         try:
             yield _local_live_chunk(completion_id, created, {"role": "assistant"})
-            async for delta in words():
-                # An SSE comment keeps a stream that's waiting on the user open.
-                yield _local_live_chunk(completion_id, created, {"content": delta}) if delta else ": keepalive\n\n"
+            async with contextlib.aclosing(words()) as deltas:
+                async for delta in deltas:
+                    # An SSE comment keeps a stream that's waiting on the user open.
+                    yield _local_live_chunk(completion_id, created, {"content": delta}) if delta else ": keepalive\n\n"
             yield _local_live_chunk(completion_id, created, {}, finish="stop")
             yield "data: [DONE]\n\n"
         finally:
@@ -3415,6 +3514,1218 @@ async def post_local_live_chat_completions(request: Request) -> Any:
                 _local_live_spawn(call.cancel_turn(turn))
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+
+
+# --- Local Live on a read-back speech server ----------------------------------
+#
+# Some speech servers only listen and read aloud: a response reads back the
+# user text it's given, with no model behind it (what Classic voice's speak
+# socket relies on), and a session that asks for automatic responses
+# (turn_detection.create_response true) is refused. The farm's fleet voice
+# adapter is one. Such a server never asks the model address for a reply, so
+# on a Local Live call the plugin drives the turns itself, on the call's relay:
+#
+#   server: conversation.item.input_audio_transcription.completed
+#     -> the call's turn (call.start_turn), as the model address starts one
+#   the turn's reply, as it streams, in sentences
+#     -> one read-back response.create per sentence (inline input)
+#   server: input_audio_buffer.speech_started -> the reply stops (barge-in)
+#
+# The call's own side doesn't change: the phone's or the Watch's
+# LocalLiveSession sends the same session.update and readiness check, and
+# sees one response per reply, as from a server that answers by itself. The
+# plugin finds out from the server's answer to that session.update: a server
+# that refuses create_response for that reason gets the same session.update
+# with automatic responses off, and the call goes on in read-back.
+
+# A sentence goes to the server once this long (the first of a reply at any
+# length, so the reply starts sooner); shorter ones join the next.
+LOCAL_LIVE_READ_BACK_SENTENCE_CHARS = 40
+LOCAL_LIVE_READ_BACK_MAX_SENTENCE_CHARS = 400
+# Text that waits this long with no sentence end goes anyway.
+LOCAL_LIVE_READ_BACK_FLUSH_S = 1.2
+LOCAL_LIVE_READ_BACK_TICK_S = 0.25
+# A response the server goes quiet on this long (not started, or no audio
+# since) is given up on.
+LOCAL_LIVE_READ_BACK_RESPONSE_TIMEOUT_S = 30.0
+# A cancelled response the server says nothing more about in this long is
+# over: a server may drop one it hadn't started without a word.
+LOCAL_LIVE_READ_BACK_CANCEL_TIMEOUT_S = 2.0
+# Speech heard before the reply says anything holds its first sentence until
+# the words are transcribed, at most this long.
+LOCAL_LIVE_READ_BACK_HOLD_S = 10.0
+# A sentence whose spoken transcript matches it this little was answered by a
+# server with a model of its own; sentences shorter than this many words (or
+# with digits, which a server may say in words) don't count, and it takes
+# this many misses in a row to end the call.
+LOCAL_LIVE_READ_BACK_MIN_MATCH = 0.6
+LOCAL_LIVE_READ_BACK_CHECK_WORDS = 5
+LOCAL_LIVE_READ_BACK_MISSES = 2
+LOCAL_LIVE_NOT_READ_BACK = ("Your speech server doesn't read text back as it's given, "
+                            "so it can't speak Hermes' replies in a Local Live call")
+# How a read-back server refuses automatic responses: the error's code, or
+# the session field it names.
+_LOCAL_LIVE_READ_BACK_REFUSAL_CODES = ("realtime_live_unavailable",)
+_LOCAL_LIVE_READ_BACK_REFUSAL_PARAMS = ("session.audio.input.turn_detection.create_response",
+                                        "session.turn_detection.create_response")
+_LOCAL_LIVE_READ_BACK_AUDIO = ('"response.output_audio.delta"', '"response.audio.delta"')
+_LOCAL_LIVE_READ_BACK_CLIENT_KINDS = ('"session.update"', '"conversation.item.create"', '"response.create"',
+                                      '"response.cancel"')
+_LOCAL_LIVE_READ_BACK_TRANSCRIPT_DELTAS = ("response.output_audio_transcript.delta", "response.audio_transcript.delta")
+_LOCAL_LIVE_READ_BACK_TRANSCRIPT_DONE = ("response.output_audio_transcript.done", "response.audio_transcript.done")
+_LOCAL_LIVE_READ_BACK_WORD = re.compile(r"[\w']+")
+
+
+class _ReadBackSentences:
+    """A reply's spoken text, as it streams, in sentences for a read-back
+    server: the first as soon as it ends, the rest at least
+    LOCAL_LIVE_READ_BACK_SENTENCE_CHARS long (shorter ones join the next),
+    none past LOCAL_LIVE_READ_BACK_MAX_SENTENCE_CHARS. The text is already
+    what's to be said (the phone's and the Watch's turns leave out what's
+    written to be seen)."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.clock = clock
+        self.raw = ""
+        self.held = ""
+        self.fed_at: Optional[float] = None
+        self.emitted = 0
+
+    def feed(self, text: str) -> List[str]:
+        self.fed_at = self.clock()
+        self.raw += text
+        out: List[str] = []
+        limit = LOCAL_LIVE_READ_BACK_MAX_SENTENCE_CHARS
+        while True:
+            match = _LOCAL_LIVE_WATCH_BOUNDARY.search(self.raw)
+            if match is not None and match.end() <= limit:
+                chunk, self.raw = self.raw[:match.end()], self.raw[match.end():]
+                self._take(chunk, out)
+            elif len(self.raw) > limit:
+                # A sentence too long to wait for its end: cut on a space.
+                cut = self.raw.rfind(" ", 0, limit)
+                cut = cut if cut > 0 else limit
+                chunk, self.raw = self.raw[:cut], self.raw[cut:]
+                self._take(chunk, out, whole=True)
+            else:
+                break
+        return out
+
+    def tick(self) -> List[str]:
+        """What has waited LOCAL_LIVE_READ_BACK_FLUSH_S since the last text
+        with no sentence end (asked only while nothing else is to be said)."""
+        out: List[str] = []
+        if self.fed_at is None or self.clock() - self.fed_at < LOCAL_LIVE_READ_BACK_FLUSH_S:
+            return out
+        cut = self.raw.rfind(" ")
+        if cut > 0:
+            chunk, self.raw = self.raw[:cut], self.raw[cut:]
+            self._take(chunk, out, whole=True)
+        self._release(out)
+        self.fed_at = None
+        return out
+
+    def finish(self) -> List[str]:
+        out: List[str] = []
+        if self.raw:
+            chunk, self.raw = self.raw, ""
+            self._take(chunk, out, whole=True)
+        self._release(out)
+        self.fed_at = None
+        return out
+
+    def _release(self, out: List[str]) -> None:
+        if self.held:
+            out.append(self.held)
+            self.held = ""
+            self.emitted += 1
+
+    def _take(self, chunk: str, out: List[str], whole: bool = False) -> None:
+        text = " ".join(chunk.split())
+        if not text:
+            return
+        self.held = f"{self.held} {text}" if self.held else text
+        wanted = 1 if self.emitted == 0 else LOCAL_LIVE_READ_BACK_SENTENCE_CHARS
+        ends = whole or self.held[-1] in ".!?…:;\"')]"
+        if (len(self.held) >= wanted and ends) or len(self.held) >= LOCAL_LIVE_READ_BACK_MAX_SENTENCE_CHARS:
+            self._release(out)
+
+
+def _local_live_read_back_matches(said: str, asked: str) -> Optional[bool]:
+    """Whether the server's transcript of a response is the sentence it was
+    given; None when the sentence can't tell (short, or with digits)."""
+    said_words = _LOCAL_LIVE_READ_BACK_WORD.findall(said.lower())
+    asked_words = _LOCAL_LIVE_READ_BACK_WORD.findall(asked.lower())
+    if len(asked_words) < LOCAL_LIVE_READ_BACK_CHECK_WORDS or any(ch.isdigit() for ch in asked):
+        return None
+    return difflib.SequenceMatcher(None, said_words, asked_words).ratio() >= LOCAL_LIVE_READ_BACK_MIN_MATCH
+
+
+def _local_live_turn_detections(update: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The session.update's turn detection blocks (the GA one and the beta
+    one) that ask for automatic responses."""
+    session = update.get("session")
+    if not isinstance(session, dict):
+        return []
+    audio = session.get("audio")
+    audio_input = audio.get("input") if isinstance(audio, dict) else None
+    blocks = (audio_input.get("turn_detection") if isinstance(audio_input, dict) else None,
+              session.get("turn_detection"))
+    return [block for block in blocks if isinstance(block, dict) and block.get("create_response", True) is not False]
+
+
+def _local_live_turn_detection(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The first turn detection that asks for automatic responses; None when none does."""
+    detections = _local_live_turn_detections(update)
+    return detections[0] if detections else None
+
+
+def _local_live_read_back_update(update: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """The call's session.update with automatic responses off, and whether
+    it wanted the reply to stop when the user speaks."""
+    copy = json.loads(json.dumps(update))
+    detections = _local_live_turn_detections(copy)
+    interrupts = all(block.get("interrupt_response", True) is not False for block in detections)
+    for block in detections:
+        block["create_response"] = False
+        block["interrupt_response"] = False
+    return copy, interrupts
+
+
+def _local_live_refuses_live(event: Dict[str, Any]) -> bool:
+    """Whether an error is a read-back server refusing automatic responses."""
+    error = event.get("error") if isinstance(event.get("error"), dict) else event
+    return (error.get("code") in _LOCAL_LIVE_READ_BACK_REFUSAL_CODES
+            or error.get("param") in _LOCAL_LIVE_READ_BACK_REFUSAL_PARAMS)
+
+
+def _local_live_item_words(item: Any) -> Optional[str]:
+    """A user message item's text (joined as _local_live_user_text joins a
+    request's); None for any other item."""
+    if not isinstance(item, dict) or item.get("role") != "user":
+        return None
+    content = item.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [part["text"] for part in content if isinstance(part, dict)
+             and part.get("type") in ("text", "input_text") and isinstance(part.get("text"), str)]
+    return " ".join(" ".join(parts).split())[:LOCAL_LIVE_MAX_TURN_CHARS]
+
+
+def _local_live_read_back_response(status: Optional[str], response_id: str) -> str:
+    """A response event for the call: created (status None) or done."""
+    response: Dict[str, Any] = {"id": response_id, "object": "realtime.response",
+                                "status": status or "in_progress", "output": []}
+    return json.dumps({"type": "response.done" if status else "response.created", "response": response})
+
+
+class _LocalLiveReadBack:
+    """One Local Live connection's turns on a read-back speech server, run by
+    the plugin between the call and the server (see above).
+
+    ``from_client`` and ``from_server`` see each text frame first; a frame
+    either goes on (unchanged, or changed) or stays here. ``to_client`` and
+    ``to_server`` send frames of its own, in order with the relayed ones;
+    ``fail`` ends the call with a reason. Everything runs on the relay's loop.
+    """
+
+    def __init__(self, call: Any, to_client: Callable[[str], Awaitable[None]],
+                 fail: Callable[[str], Awaitable[None]], clock: Callable[[], float] = time.monotonic) -> None:
+        self.call = call
+        self.to_client = to_client
+        self.fail = fail
+        self.clock = clock
+        self.to_server: Optional[Callable[[str], Awaitable[None]]] = None
+        self.close_server: Optional[Callable[[], Awaitable[None]]] = None
+        # Read-back is on: the server refused automatic responses.
+        self.on = False
+        # The call's session.update, until the server answers it.
+        self.update: Optional[Dict[str, Any]] = None
+        self.interrupts = True
+        # A typed turn's words, until its response.create.
+        self.typed: Optional[str] = None
+        # The call's open turn, and the task speaking its reply.
+        self.turn: Any = None
+        self.follower: Optional["asyncio.Task[None]"] = None
+        # The open turn's reply is all queued (or there's no turn).
+        self.turn_over = True
+        self.sentences: deque = deque()
+        # The sentence of the server's response in progress, and whether the
+        # server has started it.
+        self.speaking: Optional[str] = None
+        self.started = False
+        # When the server last sent anything for it.
+        self.heard_at = 0.0
+        # That response was cancelled: its audio and transcript stay here.
+        self.muting = False
+        # The server is busy with a response this didn't ask for: the next
+        # sentence waits for its end.
+        self.blocked = False
+        self.watchdog: Optional[asyncio.TimerHandle] = None
+        # The reply the call sees: open from its turn until it ends, as one
+        # response however many sentences it takes.
+        self.reply_open = False
+        self.reply_id: Optional[str] = None
+        self.reply_sentences = 0
+        # Something of the reply went to the server: speech over it stops it.
+        self.reply_said = False
+        # The user started speaking before the reply said anything: it waits
+        # for their words (or for nothing to come of them).
+        self.held = False
+        self.hold_timer: Optional[asyncio.TimerHandle] = None
+        # The call ended here (the server isn't reading back): nothing more
+        # of the server's goes on.
+        self.ended = False
+        # The response in progress is the reply's second sentence or later:
+        # its transcript starts with a space.
+        self.spaced = False
+        self.misses = 0
+        # Bumped by each new turn: a start that another overtook while it
+        # waited for the call lets its own turn go.
+        self.generation = 0
+        self.closed = False
+
+    def attach(self, to_server: Callable[[str], Awaitable[None]],
+               close_server: Optional[Callable[[], Awaitable[None]]] = None) -> None:
+        self.to_server = to_server
+        self.close_server = close_server
+
+    def close(self) -> None:
+        self.closed = True
+        self._release()
+        if self.follower is not None:
+            self.follower.cancel()
+            self.follower = None
+        if self.watchdog is not None:
+            self.watchdog.cancel()
+            self.watchdog = None
+
+    # The call's frames.
+
+    async def from_client(self, text: str) -> bool:
+        """True for a frame that stays here (a turn this runs instead)."""
+        if self.closed or not any(kind in text for kind in _LOCAL_LIVE_READ_BACK_CLIENT_KINDS):
+            return False
+        try:
+            frame = json.loads(text)
+        except ValueError:
+            return False
+        kind = frame.get("type") if isinstance(frame, dict) else None
+        if kind == "session.update":
+            if self.on:
+                await self._send_update(frame)
+                return True
+            if _local_live_turn_detection(frame) is not None:
+                self.update = frame
+            return False
+        if not self.on:
+            return False
+        if kind == "conversation.item.create":
+            words = _local_live_item_words(frame.get("item"))
+            if words is None:
+                return False
+            # A typed turn: its response.create follows.
+            self.typed = words
+            return True
+        if kind == "response.create":
+            response = frame.get("response") if isinstance(frame.get("response"), dict) else {}
+            inline = response.get("input")
+            if isinstance(inline, list):
+                # The readiness check's marker, asked out of band.
+                words = " ".join(word for word in (_local_live_item_words(item) for item in inline) if word)
+            else:
+                words = self.typed or ""
+            self.typed = None
+            await self._start(words[:LOCAL_LIVE_MAX_TURN_CHARS])
+            return True
+        if kind == "response.cancel":
+            await self._stop(cancel_turn=True)
+            return True
+        return False
+
+    # The server's frames.
+
+    async def from_server(self, text: str) -> Optional[str]:
+        """The frame to pass on to the call, or None for one that stays here."""
+        if self.ended:
+            return None
+        if self.closed:
+            return text
+        if any(kind in text for kind in _LOCAL_LIVE_READ_BACK_AUDIO):
+            if not self.on:
+                return text
+            if self.muting or self.speaking is None:
+                return None
+            self.heard_at = self.clock()
+            return text
+        if not self.on and self.update is None:
+            return text
+        try:
+            event = json.loads(text)
+        except ValueError:
+            return text
+        kind = event.get("type") if isinstance(event, dict) else None
+        if self.update is not None:
+            if kind == "error" and _local_live_refuses_live(event):
+                update, self.update = self.update, None
+                self.on = True
+                logger.info("Local Live: the speech server only reads text back; the plugin runs the call's turns")
+                await self._send_update(update)
+                return None
+            if kind in ("session.updated", "error"):
+                self.update = None
+        if not self.on:
+            return text
+        if kind == "conversation.item.input_audio_transcription.completed":
+            words = " ".join(str(event.get("transcript") or "").split())
+            # The call shows the words before Hermes' turn for them starts.
+            await self._tell(text)
+            if words:
+                await self._start(words[:LOCAL_LIVE_MAX_TURN_CHARS])
+            elif self.held:
+                # Nothing came of the sound: the reply goes on.
+                self._release()
+                await self._pump()
+            return None
+        if kind == "conversation.item.input_audio_transcription.failed" and self.held:
+            await self._tell(text)
+            self._release()
+            await self._pump()
+            return None
+        if kind == "input_audio_buffer.speech_started":
+            await self._tell(text)
+            # The user talks over the reply: it stops, and its turn goes. While
+            # nothing of it has been said yet (Hermes still at work), only
+            # words make a new turn: a cough doesn't cost the reply.
+            if self.interrupts and self.reply_open:
+                if (self.speaking is not None and not self.muting) or self.reply_said:
+                    await self._stop(cancel_turn=True)
+                else:
+                    self._hold()
+            return None
+        if kind == "response.created":
+            if self.speaking is None or self.muting:
+                if self.speaking is not None:
+                    self.started = True
+                    # Cancelled before it started: its end should follow soon.
+                    self._arm_watchdog(LOCAL_LIVE_READ_BACK_CANCEL_TIMEOUT_S)
+                return None
+            self.started = True
+            self.heard_at = self.clock()
+            if self.reply_id is None:
+                response = event.get("response") if isinstance(event.get("response"), dict) else {}
+                self.reply_id = str(response.get("id") or f"resp_conduit_{uuid.uuid4().hex[:16]}")
+                return text
+            return None
+        if kind in _LOCAL_LIVE_READ_BACK_TRANSCRIPT_DELTAS:
+            if self.muting or self.speaking is None:
+                return None
+            self.heard_at = self.clock()
+            if self.spaced and isinstance(event.get("delta"), str):
+                self.spaced = False
+                event["delta"] = " " + event["delta"]
+                return json.dumps(event)
+            return text
+        if kind in _LOCAL_LIVE_READ_BACK_TRANSCRIPT_DONE:
+            if self.muting or self.speaking is None:
+                return None
+            said = event.get("transcript")
+            if isinstance(said, str):
+                verdict = _local_live_read_back_matches(said, self.speaking)
+                if verdict is False:
+                    self.misses += 1
+                    if self.misses >= LOCAL_LIVE_READ_BACK_MISSES:
+                        logger.warning("Local Live: the speech server didn't read Hermes' reply back; ending the call")
+                        self.ended = True
+                        self.close()
+                        await self.fail(LOCAL_LIVE_NOT_READ_BACK)
+                        # The relay ends with the server's side.
+                        if self.close_server is not None:
+                            with contextlib.suppress(Exception):
+                                await self.close_server()
+                        return None
+                elif verdict:
+                    self.misses = 0
+                if self.reply_sentences > 1:
+                    event["transcript"] = " " + said
+                    return json.dumps(event)
+            return text
+        if kind == "response.done":
+            self._response_over()
+            await self._pump()
+            return None
+        if kind == "error":
+            error = event.get("error") if isinstance(event.get("error"), dict) else {}
+            code = str(error.get("code") or "")
+            if "cancel" in code:
+                # A cancel that found nothing running (a server may say so).
+                return None
+            if self.speaking is not None and not self.started:
+                # The server's answer to the response.create just sent.
+                busy = code == "conversation_already_has_active_response"
+                if busy and not self.muting:
+                    self.sentences.appendleft(self.speaking)
+                    # Counted again when it's sent again.
+                    self.reply_sentences -= 1
+                elif not busy:
+                    logger.info("Local Live: the speech server refused a read-back sentence (%s)",
+                                (code or "error")[:64])
+                self._response_over()
+                if busy:
+                    # Its own response's end frees it; or this gives up waiting.
+                    self.blocked = True
+                    self._arm_watchdog(LOCAL_LIVE_READ_BACK_RESPONSE_TIMEOUT_S)
+                await self._pump()
+                return None
+            if self.muting:
+                return None
+            return text
+        if kind in ("response.output_item.added", "response.output_item.done", "response.output_audio.done",
+                    "response.audio.done", "response.content_part.added", "response.content_part.done"):
+            return None if self.muting or self.speaking is None else text
+        return text
+
+    # Turns.
+
+    async def _start(self, words: str) -> None:
+        """A new turn for ``words``: the reply before it stops being spoken
+        (the call's start_turn lets its turn go)."""
+        await self._stop(cancel_turn=False)
+        generation = self.generation
+        self.reply_open = True
+        self.turn_over = False
+        turn = await self.call.start_turn(words) if words else None
+        if self.closed or generation != self.generation:
+            if turn is not None:
+                await self.call.cancel_turn(turn)
+            return
+        if turn is None:
+            self.turn_over = True
+            await self._pump()
+            return
+        self.turn = turn
+        follower = self.follower = asyncio.ensure_future(self._follow(turn))
+        _local_live_tasks.add(follower)
+        follower.add_done_callback(_local_live_task_done)
+
+    async def _stop(self, cancel_turn: bool) -> None:
+        """The reply stops: nothing more of it is said."""
+        # A start still waiting on the call is overtaken.
+        self.generation += 1
+        self._release()
+        if self.follower is not None:
+            self.follower.cancel()
+            self.follower = None
+        self.sentences.clear()
+        if self.speaking is not None and not self.muting:
+            self.muting = True
+            # A server may drop a response it hadn't started without a word.
+            self._arm_watchdog(LOCAL_LIVE_READ_BACK_CANCEL_TIMEOUT_S if not self.started
+                               else LOCAL_LIVE_READ_BACK_RESPONSE_TIMEOUT_S)
+            await self._send_server(json.dumps({"type": "response.cancel"}))
+        turn, self.turn = self.turn, None
+        self.turn_over = True
+        if cancel_turn and turn is not None:
+            await self.call.cancel_turn(turn)
+        await self._end_reply("cancelled")
+
+    async def _follow(self, turn: Any) -> None:
+        """The turn's reply, sentence by sentence, as it streams."""
+        sentences = _ReadBackSentences(self.clock)
+        deadline = self.clock() + LOCAL_LIVE_TURN_MAX_S
+        heard = self.clock()
+        while True:
+            now = self.clock()
+            if now >= deadline or now - heard >= LOCAL_LIVE_TURN_IDLE_S:
+                break
+            try:
+                kind, delta = await asyncio.wait_for(turn.frames.get(), LOCAL_LIVE_READ_BACK_TICK_S)
+            except asyncio.TimeoutError:
+                if self.speaking is None and not self.sentences:
+                    await self._queue(sentences.tick())
+                continue
+            if kind == "done":
+                break
+            heard = self.clock()
+            await self._queue(sentences.feed(delta))
+        await self._queue(sentences.finish())
+        if self.turn is turn:
+            self.turn = None
+            self.follower = None
+            self.turn_over = True
+            # A turn that timed out is let go; a finished one is gone already.
+            await self.call.cancel_turn(turn)
+            await self._pump()
+
+    async def _queue(self, sentences: List[str]) -> None:
+        if sentences:
+            self.sentences.extend(sentences)
+            await self._pump()
+
+    async def _pump(self) -> None:
+        """The next sentence to the server once it's free, or the reply's end."""
+        if self.closed or self.speaking is not None or self.blocked or self.held:
+            return
+        if self.sentences:
+            sentence = self.sentences.popleft()
+            self.speaking, self.started = sentence, False
+            self.reply_sentences += 1
+            self.reply_said = True
+            self.spaced = self.reply_sentences > 1
+            self.heard_at = self.clock()
+            self._arm_watchdog(LOCAL_LIVE_READ_BACK_RESPONSE_TIMEOUT_S)
+            item = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": sentence}]}
+            await self._send_server(json.dumps({"type": "response.create",
+                                                "response": {"conversation": "none", "input": [item]}}))
+            return
+        if self.turn_over:
+            await self._end_reply("completed")
+
+    async def _end_reply(self, status: str) -> None:
+        if not self.reply_open:
+            return
+        self.reply_open = False
+        reply_id, self.reply_id = self.reply_id, None
+        self.reply_sentences = 0
+        self.reply_said = False
+        self.spaced = False
+        frames = []
+        if reply_id is None:
+            # Nothing was said (an empty reply, or the readiness check's):
+            # the call still sees a response begin and end.
+            reply_id = f"resp_conduit_{uuid.uuid4().hex[:16]}"
+            frames.append(_local_live_read_back_response(None, reply_id))
+        frames.append(_local_live_read_back_response(status, reply_id))
+        # Both or neither, even when the task saying them is cancelled.
+        await asyncio.shield(self._tell(*frames))
+
+    async def _tell(self, *frames: str) -> None:
+        """Frames for the call; a call that's gone hears them no more."""
+        for frame in frames:
+            try:
+                await self.to_client(frame)
+            except Exception:  # noqa: BLE001 — the relay sees the closed socket itself
+                return
+
+    def _hold(self) -> None:
+        """Holds the reply's first sentence while the user may be speaking."""
+        self._release()
+        self.held = True
+
+        def expire() -> None:
+            self.hold_timer = None
+            if self.held and not self.closed:
+                self.held = False
+                _local_live_spawn(self._pump())
+
+        self.hold_timer = asyncio.get_running_loop().call_later(LOCAL_LIVE_READ_BACK_HOLD_S, expire)
+
+    def _release(self) -> None:
+        self.held = False
+        if self.hold_timer is not None:
+            self.hold_timer.cancel()
+            self.hold_timer = None
+
+    def _response_over(self) -> None:
+        self.speaking, self.started = None, False
+        self.muting = False
+        self.blocked = False
+        if self.watchdog is not None:
+            self.watchdog.cancel()
+            self.watchdog = None
+
+    def _arm_watchdog(self, timeout: float) -> None:
+        """Gives up on the server's response (or its being busy) once it has
+        gone quiet for ``timeout``: a response still sending audio isn't
+        quiet, however long its sentence."""
+        if self.watchdog is not None:
+            self.watchdog.cancel()
+
+        def expire() -> None:
+            self.watchdog = None
+            if self.closed:
+                return
+            quiet = self.clock() - self.heard_at
+            if self.started and not self.muting and not self.blocked and quiet < timeout:
+                self.watchdog = asyncio.get_running_loop().call_later(timeout - quiet, expire)
+                return
+            logger.info("Local Live: the speech server went quiet on a read-back response; going on")
+            self._response_over()
+            _local_live_spawn(self._pump())
+
+        self.watchdog = asyncio.get_running_loop().call_later(timeout, expire)
+
+    async def _send_update(self, update: Dict[str, Any]) -> None:
+        changed, self.interrupts = _local_live_read_back_update(update)
+        await self._send_server(json.dumps(changed))
+
+    async def _send_server(self, text: str) -> None:
+        if self.to_server is not None and not self.closed:
+            with contextlib.suppress(Exception):
+                await self.to_server(text)
+
+
+# --- Local Live agent mode: a fast front model in front of Hermes ------------
+#
+# One Hermes turn per utterance is slow to start talking (a full agent turn,
+# often 8-15 s). In agent mode a quick model of the user's choosing holds the
+# conversation and hands real work to Hermes as background jobs, like
+# GPT-Live, Gemini and Grok do:
+#
+#   phone -> plugin: conduit.agent {instructions, tools}   (on connecting)
+#   speech server -> /local-live/v1/chat/completions       (each utterance)
+#   plugin -> front model (voice.local_live.front_model), streamed back
+#   front model calls a tool -> plugin -> phone: conduit.tool.call
+#   phone runs it (start_job, list_jobs, cancel_job, ...) -> conduit.tool.result
+#
+# The phone owns the tools and the jobs, exactly as for Grok Live: it starts
+# a job in the call's chat and answers at once, and a job's outcome comes
+# back later as a typed turn the phone sends while the call is quiet, which
+# the speech server asks this route about like any utterance. The speech
+# server never sees a tool (HF speech-to-speech errors on tool_choice).
+#
+# With no front model configured the call goes on as before: one Hermes turn
+# per utterance, through conduit.turn. An engine that runs its own front
+# model (Pipecat behind the relay, say) uses the same tools through
+# /local-live/v1/tools and /local-live/v1/tools/call with the Local Live key.
+
+LOCAL_LIVE_READY_PREFIX = "conduit-ready-"
+LOCAL_LIVE_AGENT_MAX_INSTRUCTIONS = 64_000
+LOCAL_LIVE_AGENT_MAX_TOOLS = 64
+LOCAL_LIVE_AGENT_MAX_NOTE_CHARS = 4_000
+# Messages kept for the front model: the call's recent conversation, tool
+# calls included. Older ones go first, a user message always leads.
+LOCAL_LIVE_AGENT_MAX_HISTORY = 60
+LOCAL_LIVE_AGENT_MAX_HISTORY_CHARS = 60_000
+LOCAL_LIVE_AGENT_MAX_TOOL_OUTPUT_CHARS = 16_000
+# Tool rounds in one reply: a model that keeps calling tools stops here.
+LOCAL_LIVE_AGENT_MAX_ROUNDS = 5
+# How long one tool call waits for the phone. start_job answers once the
+# job runs; a web lookup takes a few seconds.
+LOCAL_LIVE_AGENT_TOOL_TIMEOUT_S = 30.0
+# To connect, and between chunks of the front model's stream.
+LOCAL_LIVE_FRONT_TIMEOUT_S = 30.0
+LOCAL_LIVE_FRONT_MAX_LINE_BYTES = 1024 * 1024
+LOCAL_LIVE_FRONT_UNREACHABLE_REPLY = "I can't reach my quick model right now, so I'll pass that to Hermes."
+LOCAL_LIVE_AGENT_SPEECH_HINT = (
+    "\nEverything you write is spoken aloud by a speech server as it streams: plain spoken sentences only, "
+    "no markdown, lists, code, emoji or links. Keep replies short unless the user asks for more.")
+_LOCAL_LIVE_TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_local_live_front_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="conduit-local-live-front")
+_local_live_front_opener = urllib.request.build_opener(_NoRedirect)
+# Plain http only reaches private hosts; like the pairing claim, it skips any
+# proxy so the key never crosses one in cleartext.
+_local_live_front_direct_opener = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+
+
+def _local_live_front_model_settings() -> Dict[str, Any]:
+    """The profile's ``voice.local_live.front_model`` block (profile-scoped), or {}."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+    except ImportError:
+        return {}
+    except Exception as exc:
+        logger.warning("Local Live could not read the Hermes config: %s", type(exc).__name__)
+        raise TokenError(503, f"The Hermes host could not read its config ({type(exc).__name__}).")
+    voice = config.get("voice") if isinstance(config, dict) else None
+    local = voice.get("local_live") if isinstance(voice, dict) else None
+    front = local.get("front_model") if isinstance(local, dict) else None
+    return front if isinstance(front, dict) else {}
+
+
+def local_live_front_model_url(raw: Any) -> str:
+    """The configured base URL as its chat-completions address.
+
+    Any OpenAI-compatible server: ``http://box:8080/v1`` asks
+    ``http://box:8080/v1/chat/completions``. Plain http only reaches private
+    hosts, since the key travels with every request.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise TokenError(503, "No fast model is set for Local Live (voice.local_live.front_model.base_url).")
+    if "://" not in text:
+        text = "http://" + text
+    try:
+        parts = urllib.parse.urlsplit(text)
+        port = parts.port
+    except ValueError:
+        raise TokenError(503, "The fast model's address is not valid.")
+    scheme = parts.scheme.lower()
+    host = parts.hostname or ""
+    if scheme not in ("http", "https") or not host or parts.username or parts.password or parts.fragment \
+            or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in text):
+        raise TokenError(503, "The fast model's address must look like http://host:8080/v1.")
+    if scheme == "http" and not _speech_server_host_is_private(host):
+        raise TokenError(503, f"{host} is a public address, so the fast model needs https://.")
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    path = parts.path.rstrip("/")
+    if not path.endswith("/chat/completions"):
+        path += "/chat/completions"
+    return urllib.parse.urlunsplit((scheme, netloc, path, parts.query, ""))
+
+
+def local_live_front_model_target(settings: Optional[Dict[str, Any]] = None) -> Tuple[str, str, str]:
+    """(url, model, key) for this profile's front model; TokenError(503) when unset or invalid."""
+    if settings is None:
+        settings = _local_live_front_model_settings()
+    url = local_live_front_model_url(settings.get("base_url"))
+    model = str(settings.get("model") or "").strip()
+    if not model:
+        raise TokenError(503, "Local Live's fast model has no model name (voice.local_live.front_model.model).")
+    try:
+        key = _speech_server_key(settings)
+    except TokenError:
+        raise TokenError(503, "The fast model's key file (voice.local_live.front_model.api_key_file) can't be used.")
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in key + model):
+        raise TokenError(503, "The fast model's key or name contains a control character.")
+    return url, model, key
+
+
+def local_live_front_model_status() -> Dict[str, Any]:
+    """What Conduit's Local settings show about the front model."""
+    try:
+        settings = _local_live_front_model_settings()
+    except TokenError as exc:
+        return {"configured": False, "available": False, "base_url": None, "model": None, "has_key": False,
+                "reason": str(exc)}
+    base_url = str(settings.get("base_url") or "").strip() or None
+    model = str(settings.get("model") or "").strip() or None
+    has_key = bool(str(settings.get("api_key") or "").strip() or str(settings.get("api_key_file") or "").strip())
+    configured = base_url is not None or model is not None
+    try:
+        local_live_front_model_target(settings)
+    except TokenError as exc:
+        return {"configured": configured, "available": False, "base_url": base_url, "model": model,
+                "has_key": has_key, "reason": str(exc) if configured else None}
+    return {"configured": True, "available": True, "base_url": base_url, "model": model, "has_key": has_key,
+            "reason": None}
+
+
+def _local_live_agent_tool(raw: Any) -> Optional[Dict[str, Any]]:
+    """A tool as chat completions takes it, from either the Realtime shape
+    ({type, name, description, parameters}) or the chat one ({type, function})."""
+    if not isinstance(raw, dict):
+        return None
+    function = raw.get("function") if isinstance(raw.get("function"), dict) else raw
+    name = function.get("name")
+    if not isinstance(name, str) or not _LOCAL_LIVE_TOOL_NAME.fullmatch(name):
+        return None
+    parameters = function.get("parameters")
+    tool: Dict[str, Any] = {"name": name,
+                            "parameters": parameters if isinstance(parameters, dict) else {"type": "object",
+                                                                                           "properties": {}}}
+    if isinstance(function.get("description"), str):
+        tool["description"] = function["description"]
+    return {"type": "function", "function": tool}
+
+
+class _LocalLiveAgent:
+    """One call's front-model conversation and the tool calls it waits on."""
+
+    def __init__(self, instructions: str, tools: List[Dict[str, Any]]) -> None:
+        self.instructions = instructions
+        self.tools = tools
+        self.history: List[Dict[str, Any]] = []
+        self.waiters: Dict[str, "asyncio.Future[str]"] = {}
+        # Bumped by each new reply: an older one stops at its next step.
+        self.generation = 0
+        self.numbers = itertools.count(1)
+
+    @classmethod
+    def configured(cls, frame: Dict[str, Any], previous: Optional["_LocalLiveAgent"] = None) -> "_LocalLiveAgent":
+        instructions = frame.get("instructions")
+        instructions = instructions[:LOCAL_LIVE_AGENT_MAX_INSTRUCTIONS] if isinstance(instructions, str) else ""
+        raw_tools = frame.get("tools") if isinstance(frame.get("tools"), list) else []
+        tools, names = [], set()
+        for raw in raw_tools[:LOCAL_LIVE_AGENT_MAX_TOOLS]:
+            tool = _local_live_agent_tool(raw)
+            if tool is not None and tool["function"]["name"] not in names:
+                names.add(tool["function"]["name"])
+                tools.append(tool)
+        agent = cls(instructions, tools)
+        if previous is not None:
+            agent.history = previous.history
+            agent.numbers = previous.numbers
+            previous.close()
+        return agent
+
+    def note(self, text: Any) -> None:
+        """Context the front model keeps without answering it (a turn typed
+        in the attached chat)."""
+        if isinstance(text, str) and text.strip():
+            self._append({"role": "user", "content": text.strip()[:LOCAL_LIVE_AGENT_MAX_NOTE_CHARS]})
+
+    def messages(self) -> List[Dict[str, Any]]:
+        system = (self.instructions or "You are a helpful voice assistant.") + LOCAL_LIVE_AGENT_SPEECH_HINT
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
+        # Every tool call needs its result next, or the server refuses the
+        # conversation: one the user talked over gets a stand-in.
+        owed: List[str] = []
+        for message in self.history:
+            if message.get("role") == "tool":
+                if message.get("tool_call_id") in owed:
+                    owed.remove(message["tool_call_id"])
+                    messages.append(message)
+                continue
+            messages.extend(self._stand_ins(owed))
+            owed = [item["id"] for item in message.get("tool_calls") or []]
+            messages.append(message)
+        messages.extend(self._stand_ins(owed))
+        return messages
+
+    @staticmethod
+    def _stand_ins(owed: List[str]) -> List[Dict[str, Any]]:
+        return [{"role": "tool", "tool_call_id": call_id,
+                 "content": json.dumps({"status": "interrupted", "note": "The user spoke before this answered."})}
+                for call_id in owed]
+
+    def _append(self, message: Dict[str, Any]) -> None:
+        self.history.append(message)
+        total = sum(len(json.dumps(m)) for m in self.history)
+        while self.history and (len(self.history) > LOCAL_LIVE_AGENT_MAX_HISTORY
+                                or total > LOCAL_LIVE_AGENT_MAX_HISTORY_CHARS):
+            total -= len(json.dumps(self.history.pop(0)))
+            # Never start on a tool result or an assistant's tool calls whose
+            # user message went: the server would refuse the conversation.
+            while self.history and self.history[0].get("role") != "user":
+                total -= len(json.dumps(self.history.pop(0)))
+
+    def resolve(self, call_id: str, output: str) -> bool:
+        waiter = self.waiters.pop(call_id, None)
+        if waiter is None or waiter.done():
+            return False
+        waiter.set_result(output[:LOCAL_LIVE_AGENT_MAX_TOOL_OUTPUT_CHARS])
+        return True
+
+    def close(self) -> None:
+        self.generation += 1
+        for waiter in self.waiters.values():
+            if not waiter.done():
+                waiter.cancel()
+        self.waiters.clear()
+
+    async def run_tool(self, call: Any, name: str, arguments: str, call_id: Optional[str] = None) -> str:
+        """Asks the phone to run one tool; its output, or an error the model reads."""
+        call_id = call_id or f"ll{next(self.numbers)}"
+        waiter: "asyncio.Future[str]" = asyncio.get_running_loop().create_future()
+        self.waiters[call_id] = waiter
+        sent = await call.send({"type": "conduit.tool.call", "call_id": call_id, "name": name,
+                                "arguments": arguments or "{}"})
+        if not sent:
+            self.waiters.pop(call_id, None)
+            return json.dumps({"error": "Conduit isn't connected, so the tool couldn't run."})
+        try:
+            return await asyncio.wait_for(asyncio.shield(waiter), timeout=LOCAL_LIVE_AGENT_TOOL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # Kept waiting: a late answer still reaches the phone as an update.
+            self.waiters.pop(call_id, None)
+            return json.dumps({"status": "still_running",
+                               "note": "No answer yet. If it comes, it arrives later as its own message."})
+        except asyncio.CancelledError:
+            if waiter.cancelled():
+                return json.dumps({"error": "The call ended."})
+            # The reply was dropped (the user talked over it): a later
+            # answer is the phone's to say.
+            self.waiters.pop(call_id, None)
+            raise
+
+    def _drop_unanswered(self, text: str) -> None:
+        if self.history and self.history[-1] == {"role": "user", "content": text}:
+            self.history.pop()
+
+    async def reply(self, call: Any, text: str, target: Tuple[str, str, str]) -> Any:
+        """The front model's spoken answer to ``text``, as it streams. Raises
+        _LocalLiveFrontUnavailable when the model failed before saying anything."""
+        self.generation += 1
+        generation = self.generation
+        self._append({"role": "user", "content": text})
+        said_anything = False
+        budget = LOCAL_LIVE_MAX_REPLY_CHARS
+        for round_number in range(LOCAL_LIVE_AGENT_MAX_ROUNDS):
+            spoken: List[str] = []
+            tool_calls: Dict[int, Dict[str, Any]] = {}
+            completed = False
+            try:
+                async with contextlib.aclosing(_local_live_front_stream(target, self.messages(), self.tools)) as stream:
+                    async for kind, value in stream:
+                        if generation != self.generation:
+                            # A reconnect took over: the new connection
+                            # starts with a conversation that alternates.
+                            if not said_anything and not tool_calls:
+                                self._drop_unanswered(text)
+                            return
+                        if kind == "text":
+                            # A model that never stops talking is cut off
+                            # like an over-long Hermes reply.
+                            value = value[:budget]
+                            budget -= len(value)
+                            spoken.append(value)
+                            said_anything = True
+                            yield value
+                            if budget <= 0:
+                                return
+                        elif kind == "tool_call":
+                            slot = tool_calls.setdefault(value["index"], {"id": "", "name": "", "arguments": ""})
+                            slot["id"] = value.get("id") or slot["id"]
+                            slot["name"] = value.get("name") or slot["name"]
+                            slot["arguments"] += value.get("arguments") or ""
+                completed = True
+                for index, slot in tool_calls.items():
+                    slot["id"] = slot["id"] or f"call_{generation}_{index}"
+            except _LocalLiveFrontUnavailable:
+                if said_anything:
+                    return
+                self._drop_unanswered(text)
+                raise
+            finally:
+                # What was said stays in the conversation, even when the user
+                # talked over it and the stream was dropped.
+                if spoken or (completed and tool_calls):
+                    message: Dict[str, Any] = {"role": "assistant", "content": "".join(spoken)}
+                    if completed and tool_calls:
+                        message["tool_calls"] = [
+                            {"id": slot["id"], "type": "function",
+                             "function": {"name": slot["name"], "arguments": slot["arguments"] or "{}"}}
+                            for _, slot in sorted(tool_calls.items()) if slot["name"]]
+                        if not message["tool_calls"]:
+                            del message["tool_calls"]
+                    self._append(message)
+            calls = [slot for _, slot in sorted(tool_calls.items()) if slot["name"]]
+            if not calls:
+                if round_number == 0 and not said_anything:
+                    # An empty answer (a wrong address that answers with a
+                    # web page, say) is a failure too: Hermes takes it.
+                    self._drop_unanswered(text)
+                    raise _LocalLiveFrontUnavailable("The fast model gave no answer")
+                return
+            for slot in calls:
+                if generation != self.generation:
+                    return
+                output = await self.run_tool(call, slot["name"], slot["arguments"])
+                self._append({"role": "tool", "tool_call_id": slot["id"], "content": output})
+            if generation != self.generation:
+                return
+
+
+class _LocalLiveFrontUnavailable(Exception):
+    """The front model couldn't be asked (unreachable, refused, broken stream)."""
+
+
+class _ThinkFilter:
+    """Drops <think>…</think> from a streamed reply: reasoning models put
+    their thinking there, and the speech server would read it out."""
+
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self) -> None:
+        self.thinking = False
+        self.pending = ""
+
+    def feed(self, text: str) -> str:
+        self.pending += text
+        out: List[str] = []
+        while self.pending:
+            tag = self.CLOSE if self.thinking else self.OPEN
+            at = self.pending.find(tag)
+            if at >= 0:
+                if not self.thinking:
+                    out.append(self.pending[:at])
+                self.pending = self.pending[at + len(tag):]
+                self.thinking = not self.thinking
+                continue
+            # Keep a tail that could be the start of the tag.
+            keep = next((n for n in range(len(tag) - 1, 0, -1) if self.pending.endswith(tag[:n])), 0)
+            if not self.thinking:
+                out.append(self.pending[:len(self.pending) - keep])
+            self.pending = self.pending[len(self.pending) - keep:]
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        rest, self.pending = ("" if self.thinking else self.pending), ""
+        return rest
+
+
+async def _local_live_front_stream(target: Tuple[str, str, str], messages: List[Dict[str, Any]],
+                                   tools: List[Dict[str, Any]]) -> Any:
+    """("text", words) and ("tool_call", {index, id, name, arguments}) from
+    the front model as they arrive. The request runs on a worker thread
+    (urllib), which stops at its next line once this generator closes."""
+    url, model, key = target
+    body: Dict[str, Any] = {"model": model, "messages": messages, "stream": True}
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    loop = asyncio.get_running_loop()
+    queue: "asyncio.Queue[Tuple[str, Any]]" = asyncio.Queue()
+    stop = threading.Event()
+
+    def put(item: Tuple[str, Any]) -> None:
+        if not stop.is_set():
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+
+    def ask(payload: Dict[str, Any]) -> Optional[int]:
+        """Streams one request into the queue; the HTTP status of a refusal."""
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers,
+                                         method="POST")
+        try:
+            opener = _local_live_front_direct_opener if url.startswith("http:") else _local_live_front_opener
+            response = opener.open(request, timeout=LOCAL_LIVE_FRONT_TIMEOUT_S)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            return exc.code
+        with response:
+            if "json" in (response.headers.get("Content-Type") or "") and \
+                    "event-stream" not in (response.headers.get("Content-Type") or ""):
+                # A server that ignored "stream": one whole answer.
+                put(("whole", response.read(LOCAL_LIVE_FRONT_MAX_LINE_BYTES * 4)))
+                return None
+            while not stop.is_set():
+                line = response.readline(LOCAL_LIVE_FRONT_MAX_LINE_BYTES)
+                if not line:
+                    break
+                text = line.decode("utf-8", "replace").strip()
+                if not text.startswith("data:"):
+                    continue
+                data = text[5:].strip()
+                if data == "[DONE]":
+                    break
+                put(("data", data))
+        return None
+
+    def run() -> None:
+        try:
+            status = ask(body)
+            if status == 400 and tools:
+                # A server without tool support refuses the request: talk
+                # without them rather than not at all.
+                logger.info("Local Live's fast model refused tools; answering without them")
+                status = ask({k: v for k, v in body.items() if k not in ("tools", "tool_choice")})
+            put(("status", status) if status is not None else ("end", None))
+        except Exception as exc:  # noqa: BLE001 — any failure ends the stream
+            put(("error", type(exc).__name__))
+
+    _local_live_front_executor.submit(run)
+    think = _ThinkFilter()
+    try:
+        while True:
+            kind, value = await queue.get()
+            if kind == "end":
+                rest = think.flush()
+                if rest:
+                    yield "text", rest
+                return
+            if kind == "status":
+                logger.warning("Local Live's fast model refused the request: HTTP %s", value)
+                raise _LocalLiveFrontUnavailable(f"HTTP {value}")
+            if kind == "error":
+                logger.warning("Local Live couldn't reach its fast model: %s", value)
+                raise _LocalLiveFrontUnavailable(value)
+            if kind == "whole":
+                try:
+                    choice = json.loads(value)["choices"][0]["message"]
+                except (ValueError, KeyError, IndexError, TypeError):
+                    raise _LocalLiveFrontUnavailable("unreadable answer")
+                if not isinstance(choice, dict):
+                    raise _LocalLiveFrontUnavailable("unreadable answer")
+                content = choice.get("content")
+                words = think.feed(content if isinstance(content, str) else "") + think.flush()
+                if words:
+                    yield "text", words
+                items = choice.get("tool_calls")
+                for index, item in enumerate(items if isinstance(items, list) else []):
+                    if not isinstance(item, dict):
+                        continue
+                    function = item.get("function") if isinstance(item.get("function"), dict) else {}
+                    yield "tool_call", {"index": index, "id": item.get("id"), "name": function.get("name"),
+                                        "arguments": function.get("arguments") or ""}
+                continue
+            try:
+                chunk = json.loads(value)
+                delta = chunk["choices"][0].get("delta") or {}
+            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                continue
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                words = think.feed(content)
+                if words:
+                    yield "text", words
+            items = delta.get("tool_calls")
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                function = item.get("function") if isinstance(item.get("function"), dict) else {}
+                index = item.get("index") if isinstance(item.get("index"), int) else 0
+                arguments = function.get("arguments")
+                yield "tool_call", {"index": index, "id": item.get("id"), "name": function.get("name"),
+                                    "arguments": arguments if isinstance(arguments, str)
+                                    else (json.dumps(arguments) if arguments is not None else "")}
+    finally:
+        stop.set()
+
+
+async def _local_live_front_target(profile: str) -> Optional[Tuple[str, str, str]]:
+    """The front model to ask, or None (not set up: Hermes answers each turn)."""
+    try:
+        return await _run_scoped(profile, local_live_front_model_target, _speech_server_executor)
+    except TokenError:
+        return None
+    except Exception:  # noqa: BLE001 — a broken config falls back to Hermes turns
+        logger.warning("Local Live couldn't read its fast model's settings", exc_info=True)
+        return None
+
+
+@router.get("/local-live/v1/tools")
+async def get_local_live_tools(request: Request, response: Response) -> Dict[str, Any]:
+    """The tools the profile's live call offers, for an engine that runs its
+    own front model."""
+    response.headers["Cache-Control"] = "no-store"
+    _local_live_start_auth()
+    profile = _local_live_request_profile(request)
+    _local_live_acquire(profile)
+    call = _local_live_active_call(profile)
+    agent = getattr(call, "agent", None) if call is not None else None
+    return {"in_call": call is not None, "instructions": agent.instructions if agent else None,
+            "tools": agent.tools if agent else []}
+
+
+@router.post("/local-live/v1/tools/call")
+async def post_local_live_tool_call(request: Request, response: Response) -> Dict[str, Any]:
+    """Runs one of the call's tools on the phone: {name, arguments} ->
+    {output}. start_job answers once the job runs; its outcome reaches the
+    engine later as a conversation item and response.create on the relay."""
+    response.headers["Cache-Control"] = "no-store"
+    no_store = {"Cache-Control": "no-store"}
+    _local_live_start_auth()
+    profile = _local_live_request_profile(request)
+    body = await _read_json_body(request, LOCAL_LIVE_MAX_BODY_BYTES)
+    name = body.get("name") if isinstance(body, dict) else None
+    if not isinstance(name, str) or not _LOCAL_LIVE_TOOL_NAME.fullmatch(name):
+        raise HTTPException(status_code=400, detail="Missing or invalid 'name'", headers=no_store)
+    arguments = body.get("arguments")
+    if isinstance(arguments, dict):
+        arguments = json.dumps(arguments)
+    elif arguments is None:
+        arguments = "{}"
+    elif not isinstance(arguments, str):
+        raise HTTPException(status_code=400, detail="'arguments' must be an object or a JSON string", headers=no_store)
+    _local_live_acquire(profile)
+    call = _local_live_active_call(profile)
+    agent = getattr(call, "agent", None) if call is not None else None
+    if call is None or agent is None:
+        raise HTTPException(status_code=409, detail=LOCAL_LIVE_NO_CALL_REPLY, headers=no_store)
+    if not any(tool["function"]["name"] == name for tool in agent.tools):
+        raise HTTPException(status_code=404, detail=f"This call has no tool named {name}", headers=no_store)
+    return {"output": await agent.run_tool(call, name, arguments)}
+
 
 
 # --- Voice transcripts -------------------------------------------------------
@@ -10226,8 +11537,10 @@ class _LocalLiveWatchCall:
         self.turns: Dict[str, Tuple[_LocalLiveTurn, asyncio.AbstractEventLoop, bool]] = {}
         self.numbers = itertools.count(1)
         self.closed = False
-        # As _LocalLiveCall's: turns never overlap. Only used on the
-        # dashboard's loop, where turns start.
+        # As _LocalLiveCall's: turns never overlap. Used on the loop the
+        # turns start on: the dashboard's for the model address, the
+        # bridge's for a read-back server (which never calls the model
+        # address), never both for one call.
         self.turn_lock = asyncio.Lock()
 
     def take_words(self, text: str) -> bool:
@@ -10338,6 +11651,10 @@ class _LocalLiveWatchSession(_WatchAudioSession):
         # This call shows Hermes' requests on the Watch's card: the Watch
         # asked, and Hermes waits for an answer (a timeout above 0).
         self.cards = False
+        # The call's turns, should its server only read text back.
+        self.read_back: Optional[_LocalLiveReadBack] = None
+        # Why read-back ended the call: a refusal, so the Watch doesn't redial.
+        self.read_back_failure: Optional[WatchAudioFailure] = None
 
     async def run(self) -> None:
         profile = self.profile
@@ -10395,6 +11712,8 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             call = self.call = _LocalLiveWatchCall(self, _local_live_profile_key(profile))
             _local_live_register(call)
             pacer = self.pacer = _WatchAudioPacer(self.send, LOCAL_LIVE_WATCH_RATE)
+            read_back = self.read_back = _LocalLiveReadBack(call, self._to_watch_event, self._fail)
+            read_back.attach(upstream.send)
             # Set first: the Watch answers "started" with its session.update.
             self.upstream = upstream
             await self.bridge.control(self.stream, {
@@ -10408,6 +11727,8 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             reader = asyncio.ensure_future(self._read(upstream, pacer))
             tasks = [reader, pacing]
             await _first_done(None, self.stopping.wait(), reader)
+            if self.read_back_failure is not None:
+                raise self.read_back_failure
             if reader.done() and not self.stopping.is_set():
                 code, reason = _forwardable_close(getattr(upstream, "close_code", None),
                                                   str(getattr(upstream, "close_reason", "") or ""))
@@ -10422,6 +11743,8 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             if self.approval_timer is not None:
                 self.approval_timer.cancel()
                 self.approval_timer = None
+            if self.read_back is not None:
+                self.read_back.close()
             if call is not None:
                 _local_live_unregister(call)
                 call.close()
@@ -10483,6 +11806,10 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             async for message in upstream:
                 if not isinstance(message, str):
                     continue
+                if self.read_back is not None:
+                    message = await self.read_back.from_server(message)
+                    if message is None:
+                        continue
                 try:
                     event = json.loads(message)
                 except ValueError:
@@ -10642,6 +11969,20 @@ class _LocalLiveWatchSession(_WatchAudioSession):
         # The next one, or this one again when the answer didn't get there.
         await self._show_approval()
 
+    async def _to_watch_event(self, text: str) -> None:
+        """A server event (or one the read-back turns make) for the Watch, as
+        _read passes them on."""
+        pacer = self.pacer
+        if pacer is None:
+            return
+        if '"input_audio_buffer.speech_started"' in text:
+            pacer.interrupt()
+        pacer.event(text)
+
+    async def _fail(self, reason: str) -> None:
+        self.read_back_failure = WatchAudioFailure("refused", reason)
+        self.stop(reason)
+
     async def to_watch(self, payload: Dict[str, Any]) -> bool:
         """An event for the Watch, from any loop; False once it can't go."""
         loop = self.loop
@@ -10684,6 +12025,8 @@ class _LocalLiveWatchSession(_WatchAudioSession):
                 elif kind == "conduit.approval.answer" and self.cards and not self.finished:
                     _local_live_spawn(self._answer_approval(frame))
                 return
+        if self.read_back is not None and await self.read_back.from_client(text):
+            return
         with contextlib.suppress(Exception):
             await upstream.send(text)
 
@@ -12273,6 +13616,7 @@ ROUTE_CAPABILITIES = (
     "watch-audio",
     "watch-local-live",
     "watch-local-live-approvals",
+    "local-live-read-back",
     "desktop-views",
     "hermes-calls",
     "hermes-call-presence",
@@ -12293,6 +13637,7 @@ ROUTE_CAPABILITIES = (
     "room-files",
     "room-images",
     "speech-server",
+    "local-live-agent",
     "artifacts",
     "local-live",
 )
