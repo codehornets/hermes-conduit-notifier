@@ -3453,7 +3453,8 @@ async def post_local_live_chat_completions(request: Request) -> Any:
                 return
             if kind == "done":
                 return
-            yield delta
+            # A keepalive (the call waits on the user) says nothing.
+            yield "" if kind == "keepalive" else delta
 
     async def words() -> Any:
         """The reply's text as the phone streams it; a fixed line with no call."""
@@ -3502,7 +3503,8 @@ async def post_local_live_chat_completions(request: Request) -> Any:
             yield _local_live_chunk(completion_id, created, {"role": "assistant"})
             async with contextlib.aclosing(words()) as deltas:
                 async for delta in deltas:
-                    yield _local_live_chunk(completion_id, created, {"content": delta})
+                    # An SSE comment keeps a stream that's waiting on the user open.
+                    yield _local_live_chunk(completion_id, created, {"content": delta}) if delta else ": keepalive\n\n"
             yield _local_live_chunk(completion_id, created, {}, finish="stop")
             yield "data: [DONE]\n\n"
         finally:
@@ -10822,6 +10824,22 @@ LOCAL_LIVE_WATCH_SURFACE = "voice-live"
 LOCAL_LIVE_WATCH_FAILURE_LINE = "Hermes couldn't take that just now."
 LOCAL_LIVE_WATCH_ERROR_LINE = "Hermes ran into a problem with that."
 LOCAL_LIVE_WATCH_NEEDS_INPUT_LINE = "Hermes needs your answer in the chat before it can go on."
+# A Watch that answers approvals itself (its start says approvals: true) is
+# shown Hermes' requests, and the call says so once a reply.
+LOCAL_LIVE_WATCH_APPROVAL_LINE = "Hermes needs your approval. It's on your Watch."
+LOCAL_LIVE_WATCH_APPROVAL_CHOICES = ("once", "deny")
+# The command a card shows; a longer one is offered deny only (approving it
+# would approve what the card didn't show).
+LOCAL_LIVE_WATCH_APPROVAL_COMMAND_CHARS = 2_000
+# Hermes denies an approval nobody answers after its own timeout
+# (approvals.timeout) without saying so: the Watch's card goes then, this
+# much early (the request reaches the plugin a little after Hermes starts
+# waiting). This is the timeout when Hermes' can't be read.
+LOCAL_LIVE_WATCH_APPROVAL_TIMEOUT_S = 300.0
+LOCAL_LIVE_WATCH_APPROVAL_MARGIN_S = 1.0
+# While the call waits on an approval, its open turn hears from the plugin
+# this often, so the model address doesn't let it go.
+LOCAL_LIVE_WATCH_APPROVAL_KEEPALIVE_S = 20.0
 LOCAL_LIVE_WATCH_STEERED_LINE = "Hermes added this to the reply already running in the chat."
 LOCAL_LIVE_WATCH_QUEUED_LINE = "Hermes queued this in the chat. Its reply will appear there."
 LOCAL_LIVE_WATCH_CODE_NOTE = "I've put the code in the chat."
@@ -10845,6 +10863,18 @@ _LOCAL_LIVE_WATCH_RULE = re.compile(r"[-=*_|:\s]{3,}")
 LOCAL_LIVE_WATCH_MAX_SENTENCE_CHARS = 400
 
 _local_live_watch_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="conduit-watch-local-live")
+
+
+def _hermes_approval_timeout() -> float:
+    """Hermes' own approval timeout (approvals.timeout), else its default.
+    Call in the profile's scope."""
+    try:
+        from tools.approval import _get_approval_timeout
+        value = float(_get_approval_timeout())
+    except Exception:  # noqa: BLE001 — an older or different Hermes
+        return LOCAL_LIVE_WATCH_APPROVAL_TIMEOUT_S
+    # Zero or less: Hermes denies at once, so no card is worth showing.
+    return max(0.0, value)
 
 
 def _watch_chats_can_load() -> bool:
@@ -11036,6 +11066,16 @@ class _WatchCallChat:
         self.listener: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self.voice_turn = True
         self.closed = False
+        # Hermes' pending approval requests, oldest first: kept here, not by
+        # a stream's session, so one Hermes asks between two streams of the
+        # call still counts. Under approvals_lock; on_approvals hears of each
+        # change (from Hermes' threads).
+        self.approvals: deque = deque()
+        self.approvals_lock = threading.Lock()
+        self.on_approvals: Optional[Callable[[], None]] = None
+        # An answer is on its way to Hermes: Hermes answers its oldest, so
+        # no other is taken (or shown) until it's back, for any stream.
+        self.answering = False
 
     @property
     def public_id(self) -> str:
@@ -11079,12 +11119,87 @@ class _WatchCallChat:
             return
         params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
         sid = params.get("session_id") if isinstance(params.get("session_id"), str) else ""
-        if method != "event" or not sid or sid not in (self.session_id, self.stored_session_id):
+        if method not in ("event", "approval") or not sid or sid not in (self.session_id, self.stored_session_id):
             return
-        payload = params.get("payload") if isinstance(params.get("payload"), dict) else {}
+        if method == "approval":
+            # A Hermes that asks as a server request (as Watch jobs see it):
+            # its fields sit beside session_id, and a request.cancel names
+            # it by its id.
+            kind, payload = "approval.request", {**params, "server_request_id": _rpc_id(obj.get("id"))}
+        else:
+            payload = params.get("payload") if isinstance(params.get("payload"), dict) else {}
+            kind = str(params.get("type") or "")
+        if self._track_approval(kind, payload):
+            changed = self.on_approvals
+            if changed is not None:
+                changed()
         listener = self.listener
         if listener is not None:
-            listener(str(params.get("type") or ""), payload)
+            listener(kind, payload)
+
+    def _track_approval(self, kind: str, payload: Dict[str, Any]) -> bool:
+        """Keeps Hermes' pending approvals; True when they changed."""
+        if kind == "approval.request":
+            def text(key: str, limit: int) -> str:
+                value = payload.get(key)
+                return value.strip()[:limit] if isinstance(value, str) else ""
+
+            command = str(payload.get("command") or "").strip()
+            with self.approvals_lock:
+                self.approvals.append({
+                    "id": secrets.token_hex(8), "request_id": text("request_id", 128), "at": time.monotonic(),
+                    "server_request_id": text("server_request_id", 128),
+                    "command": command[:LOCAL_LIVE_WATCH_APPROVAL_COMMAND_CHARS],
+                    "cut": len(command) > LOCAL_LIVE_WATCH_APPROVAL_COMMAND_CHARS,
+                    "description": text("description", 500) or "Approval required",
+                })
+            return True
+        if kind == "request.cancel":
+            # Hermes withdrew one server request (answered elsewhere, timed
+            # out): only that one goes; an event-asked request has no id here.
+            wanted = _rpc_id(payload.get("id"))
+            with self.approvals_lock:
+                kept = [entry for entry in self.approvals if not wanted or entry["server_request_id"] != wanted]
+                changed = len(kept) != len(self.approvals)
+                if changed:
+                    self.approvals = deque(kept)
+            return changed
+        if kind == "approval.cancelled":
+            ids = payload.get("request_ids")
+            if ids is not None and not isinstance(ids, list):
+                # Names its requests in a way this can't read: none is dropped
+                # on a guess (Hermes' timeout and the turn's end still clear them).
+                return False
+            with self.approvals_lock:
+                if ids:
+                    kept = [entry for entry in self.approvals if entry["request_id"] not in ids]
+                else:
+                    kept = []
+                changed = len(kept) != len(self.approvals)
+                if changed:
+                    self.approvals = deque(kept)
+            return changed
+        if kind in ("message.complete", "error"):
+            # The turn ended: none is pending any more.
+            with self.approvals_lock:
+                had = bool(self.approvals)
+                self.approvals.clear()
+            return had
+        return False
+
+    def respond(self, choice: str, request_id: str) -> Optional[bool]:
+        """Whether Hermes resolved it; None when the answer didn't get there."""
+        params: Dict[str, Any] = {"session_id": self.session_id, "choice": choice}
+        if request_id:
+            params["request_id"] = request_id
+        try:
+            return bool(self.rpc("approval.respond", params).get("resolved"))
+        except WatchJobError as exc:
+            logger.info("Answering a Watch call's approval failed: %s", exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 — Hermes' own failure: not taken, so shown again
+            logger.info("Answering a Watch call's approval failed: %s", type(exc).__name__)
+            return None
 
     def open(self) -> None:
         params: Dict[str, Any] = {"cols": 96, "source": "desktop", "title": LOCAL_LIVE_WATCH_TITLE}
@@ -11133,6 +11248,7 @@ class _WatchCallChat:
             return
         self.closed = True
         self.listener = None
+        self.on_approvals = None
         if self.session_id:
             try:
                 self.rpc("session.close", {"session_id": self.session_id})
@@ -11187,6 +11303,10 @@ class _LocalLiveWatchTurns:
         self.generation = 0
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="conduit-watch-local-live-turn")
         self.closed = False
+        # The Watch answers approvals itself: the call says the card is there
+        # (once a reply) and keeps the turn open for what Hermes says after.
+        self.watch_approvals = False
+        self.approval_told = False
 
     def start(self, turn_id: str, text: str, deliver: Callable[[str, str], None]) -> None:
         with self.lock:
@@ -11197,6 +11317,7 @@ class _LocalLiveWatchTurns:
             # whatever is still open here has nobody waiting for it.
             self.turn = (turn_id, deliver)
             self.spoke = False
+            self.approval_told = False
             self.spoken = _SpokenText()
             self.generation += 1
             generation = self.generation
@@ -11342,6 +11463,11 @@ class _LocalLiveWatchTurns:
                 self.reply = None
                 if self.turn is not None:
                     self._say(LOCAL_LIVE_WATCH_ERROR_LINE, self.turn[0], self.generation)
+            elif kind == "approval.request" and self.watch_approvals:
+                # Answered on the Watch's card: the reply goes on after it.
+                if self.turn is not None and not self.approval_told:
+                    self.approval_told = True
+                    self._interject(LOCAL_LIVE_WATCH_APPROVAL_LINE)
             elif kind in _LOCAL_LIVE_WATCH_QUESTIONS:
                 # Hermes waits on the user: the call says where to answer,
                 # and the reply is still followed for the turn after.
@@ -11357,6 +11483,20 @@ class _LocalLiveWatchTurns:
         spoken = self.spoken.feed(text)
         if spoken:
             self.turn[1]("delta", spoken + " ")
+
+    def _interject(self, line: str) -> None:
+        """A line of the call's own in the reply, which then goes on. It
+        isn't the reply: one that comes whole at its end is still said."""
+        if self.turn is None:
+            return
+        rest = self.spoken.finish()
+        self.turn[1]("delta", (rest + " " if rest else "") + line + " ")
+
+    def keepalive(self) -> None:
+        """The open turn is still wanted (the call waits on the user)."""
+        with self.lock:
+            if self.turn is not None:
+                self.turn[1]("keepalive", "")
 
     def _say(self, line: str, turn_id: str, generation: int) -> None:
         """A line of the call's own instead of Hermes' reply."""
@@ -11460,6 +11600,8 @@ class _LocalLiveWatchCall:
                 text = text[:min(LOCAL_LIVE_MAX_DELTA_CHARS, LOCAL_LIVE_MAX_REPLY_CHARS - turn.chars)]
                 turn.chars += len(text)
                 turn.frames.put_nowait(("delta", text))
+        elif kind == "keepalive":
+            turn.frames.put_nowait(("keepalive", ""))
         else:
             self.turns.pop(turn_id, None)
             turn.frames.put_nowait(("done", ""))
@@ -11496,6 +11638,19 @@ class _LocalLiveWatchSession(_WatchAudioSession):
         self.call: Optional[_LocalLiveWatchCall] = None
         self.runner: Optional[_LocalLiveWatchTurns] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
+        # The Watch answers Hermes' approvals itself (approvals: true in its
+        # start): the oldest pending one is on its card, by id and choices.
+        self.watch_approvals = self.request.get("approvals") is True
+        self.shown_approval: Optional[Tuple[str, Tuple[str, ...]]] = None
+        self.approval_timeout = LOCAL_LIVE_WATCH_APPROVAL_TIMEOUT_S
+        self.approval_timer: Optional[asyncio.TimerHandle] = None
+        self.approval_show_lock = asyncio.Lock()
+        self.chat: Optional[_WatchCallChat] = None
+        # run() is over: its cards and answers are done too.
+        self.finished = False
+        # This call shows Hermes' requests on the Watch's card: the Watch
+        # asked, and Hermes waits for an answer (a timeout above 0).
+        self.cards = False
         # The call's turns, should its server only read text back.
         self.read_back: Optional[_LocalLiveReadBack] = None
         # Why read-back ended the call: a refusal, so the Watch doesn't redial.
@@ -11539,6 +11694,20 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             # After the server answered: a call that can't reach it opens no chat.
             chat, resumed = await self._chat(server)
             runner = self.runner = _LocalLiveWatchTurns(chat)
+            self.chat = chat
+            if self.watch_approvals:
+                with contextlib.suppress(Exception):
+                    self.approval_timeout = await asyncio.wait_for(
+                        _run_scoped(profile, _hermes_approval_timeout, _speech_server_executor),
+                        timeout=SPEECH_SERVER_SETUP_TIMEOUT_S)
+                # A Hermes that denies at once (a timeout of 0) has no card
+                # to show, nor a line to point to one.
+                self.cards = self.approval_timeout > 0
+                runner.watch_approvals = self.cards
+                if self.cards:
+                    chat.on_approvals = self._approvals_changed
+            # Last: a resumed chat's events reach a runner that already knows
+            # where its approvals go.
             chat.listener = runner.observe
             call = self.call = _LocalLiveWatchCall(self, _local_live_profile_key(profile))
             _local_live_register(call)
@@ -11552,6 +11721,8 @@ class _LocalLiveWatchSession(_WatchAudioSession):
                 "input_rate": LOCAL_LIVE_WATCH_RATE, "output_rate": LOCAL_LIVE_WATCH_RATE,
                 "session_id": chat.public_id, "resumed": resumed,
             })
+            # A rejoin while Hermes waits on an approval: shown again.
+            await self._show_approval()
             pacing = asyncio.ensure_future(pacer.run())
             reader = asyncio.ensure_future(self._read(upstream, pacer))
             tasks = [reader, pacing]
@@ -11565,6 +11736,13 @@ class _LocalLiveWatchSession(_WatchAudioSession):
                                          else "The connection to the speech server was lost")
         finally:
             self.upstream = None
+            # No more cards from here, however this ended.
+            self.finished = True
+            if self.chat is not None and self.chat.on_approvals == self._approvals_changed:
+                self.chat.on_approvals = None
+            if self.approval_timer is not None:
+                self.approval_timer.cancel()
+                self.approval_timer = None
             if self.read_back is not None:
                 self.read_back.close()
             if call is not None:
@@ -11648,6 +11826,149 @@ class _LocalLiveWatchSession(_WatchAudioSession):
                     pacer.interrupt()
                 pacer.event(message)
 
+    # Approvals on the Watch
+
+    def _approvals_changed(self) -> None:
+        """From Hermes' threads: the chat's pending approvals changed."""
+        loop = self.loop
+        if loop is None or self.stopping.is_set() or self.finished:
+            return
+        with contextlib.suppress(RuntimeError):  # the bridge's loop already closed
+            loop.call_soon_threadsafe(lambda: _local_live_spawn(self._show_approval()))
+
+    def _approval_choices(self, approvals: List[Dict[str, Any]]) -> Tuple[str, ...]:
+        """Once only while exactly one is pending and shown whole: Hermes
+        approves its oldest, and its queue can drop one the plugin never hears
+        of (answered in Conduit), so with more the card might not be it."""
+        if len(approvals) == 1 and not approvals[0].get("cut"):
+            return LOCAL_LIVE_WATCH_APPROVAL_CHOICES
+        return ("deny",)
+
+    def _approval_margin(self) -> float:
+        return min(LOCAL_LIVE_WATCH_APPROVAL_MARGIN_S, self.approval_timeout / 10)
+
+    def _purge_expired_approvals(self) -> None:
+        """Drops the requests past Hermes' timeout (before an answer is checked)."""
+        self._pending_approvals()
+
+    def _pending_approvals(self) -> List[Dict[str, Any]]:
+        """The chat's pending approvals, those past Hermes' timeout dropped."""
+        chat = self.chat
+        if chat is None:
+            return []
+        now = time.monotonic()
+        limit = self.approval_timeout - self._approval_margin()
+        with chat.approvals_lock:
+            while chat.approvals and not chat.answering and now - chat.approvals[0]["at"] > limit:
+                chat.approvals.popleft()
+            return list(chat.approvals)
+
+    async def _show_approval(self) -> None:
+        """The oldest pending approval on the Watch's card, or the card gone.
+        One look at a time: a look that waited on the Watch never sends a
+        card another has already taken away."""
+        async with self.approval_show_lock:
+            await self._show_approval_now()
+
+    async def _show_approval_now(self) -> None:
+        if not self.cards or self.stopping.is_set() or self.finished or self.chat is None:
+            return
+        approvals = self._pending_approvals()
+        if self.approval_timer is not None:
+            self.approval_timer.cancel()
+            self.approval_timer = None
+        # What the Watch was told is only recorded once it's sent: a send
+        # that didn't go is sent again at the next look.
+        if not approvals:
+            if self.shown_approval is not None and await self.to_watch(
+                    {"type": "conduit.approval.gone", "id": self.shown_approval[0]}):
+                self.shown_approval = None
+            return
+        # The turn waits on the user: kept open while it does.
+        if self.runner is not None:
+            self.runner.keepalive()
+        oldest = approvals[0]
+        # Looked at again when Hermes gives up on it, and to keep the turn
+        # open. One already past it waits on its answer (in flight): no
+        # sooner than the keepalive then.
+        expires = self.approval_timeout - self._approval_margin() - (time.monotonic() - oldest["at"])
+        wait = (min(expires + 0.05, LOCAL_LIVE_WATCH_APPROVAL_KEEPALIVE_S) if expires > 0
+                else LOCAL_LIVE_WATCH_APPROVAL_KEEPALIVE_S)
+        if self.chat.answering:
+            # Hermes is taking an answer: the next card waits for it, and
+            # the answer's end looks again.
+            return
+        if not self.finished:
+            self.approval_timer = asyncio.get_running_loop().call_later(
+                wait, lambda: _local_live_spawn(self._show_approval()))
+        choices = self._approval_choices(approvals)
+        card = (oldest["id"], choices)
+        if self.shown_approval == card:
+            return
+        if self.shown_approval is not None and self.shown_approval[0] != oldest["id"]:
+            if not await self.to_watch({"type": "conduit.approval.gone", "id": self.shown_approval[0]}):
+                return
+            self.shown_approval = None
+        sent = await self.to_watch({"type": "conduit.approval", "id": oldest["id"], "command": oldest["command"],
+                                    "description": oldest["description"], "choices": list(choices),
+                                    "pending": len(approvals), "cut": bool(oldest.get("cut"))})
+        if sent:
+            # Not otherwise: the Watch still holds the card it had, so the
+            # next look sends this again, or takes that one away.
+            self.shown_approval = card
+
+    async def _answer_approval(self, frame: Dict[str, Any]) -> None:
+        """The Watch's answer: only to the card it was shown (the oldest, the
+        one Hermes answers), and only with a choice that card offered."""
+        chat = self.chat
+        if chat is None or not self.cards or self.stopping.is_set() or self.finished:
+            return
+        self._purge_expired_approvals()
+        choice = frame.get("choice")
+        with chat.approvals_lock:
+            approvals = list(chat.approvals)
+            oldest = approvals[0] if approvals else None
+            # The same card's answer again while Hermes takes the first (a
+            # second tap): nothing to say, the first one's done follows.
+            repeat = chat.answering and oldest is not None and frame.get("id") == oldest["id"]
+            # One answer at a time, to the card shown: a second tap or a
+            # rejoined stream's answer would reach Hermes' next request.
+            taken = (oldest is not None and not chat.answering and frame.get("id") == oldest["id"]
+                     and choice in self._approval_choices(approvals))
+            if taken:
+                chat.answering = True
+        if repeat:
+            return
+        if not taken:
+            await self.to_watch({"type": "conduit.approval.done", "id": str(frame.get("id") or "")[:64],
+                                 "resolved": False})
+            await self._show_approval()
+            return
+        try:
+            resolved = await asyncio.get_running_loop().run_in_executor(
+                _local_live_watch_executor, chat.respond, choice, oldest["request_id"])
+        except Exception as exc:  # noqa: BLE001 — not taken: the Watch hears so, and is shown it again
+            logger.info("A Watch call's approval answer didn't reach Hermes: %s", type(exc).__name__)
+            resolved = None
+        finally:
+            with chat.approvals_lock:
+                chat.answering = False
+        if resolved is not None:
+            # Answered, or gone in Hermes (timed out): either way not pending.
+            with chat.approvals_lock:
+                if chat.approvals and chat.approvals[0] is oldest:
+                    chat.approvals.popleft()
+        self.shown_approval = None
+        if self.finished:
+            # A stream that took over meanwhile shows the next card now.
+            notify = chat.on_approvals
+            if notify is not None:
+                notify()
+            return
+        await self.to_watch({"type": "conduit.approval.done", "id": oldest["id"], "resolved": bool(resolved)})
+        # The next one, or this one again when the answer didn't get there.
+        await self._show_approval()
+
     async def _to_watch_event(self, text: str) -> None:
         """A server event (or one the read-back turns make) for the Watch, as
         _read passes them on."""
@@ -11665,7 +11986,7 @@ class _LocalLiveWatchSession(_WatchAudioSession):
     async def to_watch(self, payload: Dict[str, Any]) -> bool:
         """An event for the Watch, from any loop; False once it can't go."""
         loop = self.loop
-        if loop is None or self.stopping.is_set():
+        if loop is None or self.stopping.is_set() or self.finished:
             return False
         data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         try:
@@ -11701,6 +12022,8 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             if isinstance(kind, str) and kind.startswith("conduit."):
                 if kind.startswith("conduit.turn.") and self.call is not None:
                     self.call.watch_frame(frame)
+                elif kind == "conduit.approval.answer" and self.cards and not self.finished:
+                    _local_live_spawn(self._answer_approval(frame))
                 return
         if self.read_back is not None and await self.read_back.from_client(text):
             return
@@ -13292,6 +13615,7 @@ ROUTE_CAPABILITIES = (
     "watch-chats",
     "watch-audio",
     "watch-local-live",
+    "watch-local-live-approvals",
     "local-live-read-back",
     "desktop-views",
     "hermes-calls",

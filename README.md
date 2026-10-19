@@ -1013,6 +1013,39 @@ that chat. The grant's end closes the chat; it stays in Hermes' history.
 lists `local_live` once Local Live is available for the profile and the
 dashboard serves Hermes' chats.
 
+A Watch whose start says `"approvals": true` answers Hermes' approval
+requests on its own card (plugin 0.50.1+, capability
+`watch-local-live-approvals`). Any other Watch is told to answer in the chat,
+as before.
+
+- Host to Watch, as events on the call's stream:
+  - `{"type": "conduit.approval", "id", "command", "description", "choices", "pending", "cut"}`
+    shows the chat's oldest pending request. Hermes answers its oldest
+    first, so requests come one at a time.
+  - `conduit.approval.gone` (with its `id`) takes the card away. That happens
+    when Hermes withdraws the request (`approval.cancelled`, or a
+    `request.cancel` naming it when Hermes asked by server request), the
+    turn ends, or Hermes' own approval timeout (`approvals.timeout`) passes.
+  - `conduit.approval.done` (`id`, `resolved`) answers the Watch's answer.
+- Watch to host: `{"type": "conduit.approval.answer", "id", "choice"}`, where
+  `choice` is one the card offered. It goes to Hermes as `approval.respond`.
+- `choices` is `["once", "deny"]` only while exactly one request is pending
+  and its command is shown whole (up to 2,000 characters). Otherwise it is
+  `["deny"]`, because Hermes' queue can drop a request the plugin never
+  hears of (one answered in Conduit), so with more pending the card might
+  not be Hermes' oldest.
+- The call says "Hermes needs your approval. It's on your Watch." once a
+  reply, and the turn stays open: what Hermes says after the answer is
+  spoken too. While the card waits, the plugin keeps the turn alive (an SSE
+  comment on the model address every 20 s), up to Hermes' own timeout. A
+  server that asks the model address without streaming can't be kept so,
+  and a turn never lasts past 10 minutes.
+- One answer at a time: a second tap, or a rejoined Watch's answer, isn't
+  taken, and the next card waits, until Hermes has the first.
+- The requests are kept by the call's chat, so a Watch that rejoins on the
+  same grant is shown the one still pending, even one Hermes asked between
+  the two streams.
+
 ## Voice call transcripts
 
 Gemini Live, GPT-Live and Grok Live calls never run a Hermes turn, so nothing records
