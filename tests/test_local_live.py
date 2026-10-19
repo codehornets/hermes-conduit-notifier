@@ -619,6 +619,508 @@ def test_the_total_key_check_budget_backs_up_every_profile(monkeypatch):
     assert api.local_live_profile_for_key(None) is None
 
 
+# --- Read-back speech servers ---------------------------------------------------
+#
+# A server that only transcribes and reads text back (the farm's voice
+# adapter): it refuses automatic responses, and the plugin runs the call's
+# turns on the relay.
+
+import queue as _queue
+
+from starlette.websockets import WebSocketDisconnect
+
+LIVE_UPDATE = {"type": "session.update", "session": {"type": "realtime", "audio": {"input": {
+    "format": {"type": "audio/pcm", "rate": 24000},
+    "turn_detection": {"type": "server_vad", "create_response": True, "interrupt_response": True}}}}}
+PCM = base64.b64encode(b"\x10\x27" * 240).decode()
+
+
+def _check(marker):
+    return {"type": "response.create", "response": {"conversation": "none", "input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": marker}]}]}}
+
+
+class ReadBackUpstream:
+    """The farm voice adapter's realtime socket, as far as the relay sees it:
+    automatic responses refused, each response the text it's given, read back."""
+
+    def __init__(self, refuses=True, says=None):
+        self.refuses = refuses
+        # What its transcripts say instead of the text (a server with a model).
+        self.says = says
+        self.hold = False
+        self.held = None
+        # Holds a response without starting it, and drops it on a cancel
+        # without a word (the adapter can, on Python 3.12+).
+        self.unstarted = False
+        # Answers the next response.create this many times with busy.
+        self.busy = 0
+        # Streams a response's audio over this long before its end.
+        self.stream_s = 0.0
+        self.sent = []
+        self.events = _queue.Queue()
+        self.close_code = 1000
+        self.close_reason = ""
+        self.count = 0
+
+    def push(self, event):
+        self.events.put(json.dumps(event))
+
+    def creates(self):
+        return [frame for frame in self.sent if isinstance(frame, dict) and frame.get("type") == "response.create"]
+
+    def spoken(self):
+        return [api._local_live_item_words(frame["response"]["input"][0]) for frame in self.creates()]
+
+    async def send(self, frame):
+        if frame == "finish":
+            self.events.put(None)
+            return
+        event = json.loads(frame)
+        self.sent.append(event)
+        kind = event.get("type")
+        if kind == "session.update":
+            detection = api._local_live_turn_detection(event)
+            if detection is not None and self.refuses:
+                self.push({"type": "error", "error": {"type": "invalid_request_error",
+                                                      "code": "realtime_live_unavailable",
+                                                      "param": "session.audio.input.turn_detection.create_response",
+                                                      "message": "This speech server reads text aloud only."}})
+            else:
+                self.push({"type": "session.updated", "session": event["session"]})
+        elif kind == "response.create":
+            if self.busy:
+                self.busy -= 1
+                self.push({"type": "error", "error": {"code": "conversation_already_has_active_response"}})
+                # The response it was busy with ends.
+                self.push({"type": "response.done", "response": {"id": "other", "status": "completed"}})
+                return
+            self.count += 1
+            rid = f"resp{self.count}"
+            text = api._local_live_item_words((event.get("response") or {}).get("input", [None])[0]) or ""
+            if self.unstarted:
+                self.held = (rid, text)
+                return
+            self.push({"type": "response.created", "response": {"id": rid, "status": "in_progress"}})
+            if self.hold:
+                self.held = (rid, text)
+                return
+            if self.stream_s:
+                threading.Thread(target=self._stream, args=(rid, text), daemon=True).start()
+                return
+            self._speak(rid, text)
+        elif kind == "response.cancel" and self.unstarted:
+            self.held = None
+        elif kind == "response.cancel" and self.held is not None:
+            rid, _ = self.held
+            self.held = None
+            # Audio already on its way when the cancel lands.
+            self.push({"type": "response.output_audio.delta", "response_id": rid, "delta": PCM})
+            self.push({"type": "response.done", "response": {"id": rid, "status": "cancelled"}})
+
+    def _stream(self, rid, text):
+        self.push({"type": "response.output_audio_transcript.delta", "response_id": rid, "delta": text})
+        end = time.monotonic() + self.stream_s
+        while time.monotonic() < end:
+            self.push({"type": "response.output_audio.delta", "response_id": rid, "delta": PCM})
+            time.sleep(0.05)
+        self.push({"type": "response.output_audio_transcript.done", "response_id": rid, "transcript": text})
+        self.push({"type": "response.done", "response": {"id": rid, "status": "completed"}})
+
+    def _speak(self, rid, text):
+        said = self.says or text
+        self.push({"type": "response.output_audio_transcript.delta", "response_id": rid, "delta": said})
+        self.push({"type": "response.output_audio.delta", "response_id": rid, "delta": PCM})
+        self.push({"type": "response.output_audio_transcript.done", "response_id": rid, "transcript": said})
+        self.push({"type": "response.done", "response": {"id": rid, "status": "completed"}})
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        while True:
+            try:
+                frame = self.events.get_nowait()
+            except _queue.Empty:
+                await asyncio.sleep(0.005)
+                continue
+            if frame is None:
+                raise StopAsyncIteration
+            return frame
+
+    async def close(self):
+        self.events.put(None)
+
+
+def _next(ws, kind):
+    """Frames from the relay until one of ``kind``, which it returns with the ones before."""
+    seen = []
+    while True:
+        frame = json.loads(ws.receive_text())
+        seen.append(frame)
+        if frame.get("type") == kind:
+            return frame, seen
+
+
+def _finish(ws):
+    """Ends the server's side, then waits for the relay to close the call's."""
+    ws.send_text("finish")
+    with contextlib.suppress(Exception):
+        while True:
+            ws.receive_text()
+
+
+def _ready(ws, upstream, greeting=None):
+    ws.send_text(json.dumps(LIVE_UPDATE))
+    updated, seen = _next(ws, "session.updated")
+    assert [frame["type"] for frame in seen] == ["session.updated"]
+    marker = "conduit-ready-1234"
+    ws.send_text(json.dumps(_check(marker)))
+    ask, _ = _next(ws, "conduit.turn")
+    assert ask["text"] == marker
+    if greeting:
+        ws.send_text(json.dumps({"type": "conduit.turn.delta", "turn_id": ask["turn_id"], "text": greeting}))
+    ws.send_text(json.dumps({"type": "conduit.turn.done", "turn_id": ask["turn_id"]}))
+    done, seen = _next(ws, "response.done")
+    return seen
+
+
+def test_a_read_back_server_gets_automatic_responses_off_and_the_call_never_sees_the_refusal(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream()
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        seen = _ready(ws, upstream)
+        _finish(ws)
+    # The check's ask went to the phone, which answered it with nothing: the
+    # call still sees its response begin and end, and the server said nothing.
+    assert [frame["type"] for frame in seen] == ["response.created", "response.done"]
+    assert seen[-1]["response"]["status"] == "completed"
+    updates = [frame for frame in upstream.sent if frame["type"] == "session.update"]
+    assert updates[0] == LIVE_UPDATE
+    detection = updates[1]["session"]["audio"]["input"]["turn_detection"]
+    assert detection == {"type": "server_vad", "create_response": False, "interrupt_response": False}
+    assert updates[1]["session"]["audio"]["input"]["format"] == LIVE_UPDATE["session"]["audio"]["input"]["format"]
+    assert upstream.creates() == []
+
+
+def test_the_greeting_is_read_back_as_the_checks_reply(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream()
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        seen = _ready(ws, upstream, greeting="Hi, I'm listening.")
+        _finish(ws)
+    assert upstream.spoken() == ["Hi, I'm listening."]
+    assert [frame["type"] for frame in seen] == ["response.created", "response.output_audio_transcript.delta",
+                                                 "response.output_audio.delta",
+                                                 "response.output_audio_transcript.done", "response.done"]
+
+
+def test_a_spoken_turn_runs_on_the_phone_and_its_reply_is_read_back_a_sentence_at_a_time(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream()
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        upstream.push({"type": "input_audio_buffer.speech_started", "item_id": "item1"})
+        upstream.push({"type": "conversation.item.input_audio_transcription.completed", "item_id": "item1",
+                       "transcript": " Turn on   the lights "})
+        turn, seen = _next(ws, "conduit.turn")
+        # The words reach the call before its turn does.
+        assert [frame["type"] for frame in seen] == ["input_audio_buffer.speech_started",
+                                                     "conversation.item.input_audio_transcription.completed",
+                                                     "conduit.turn"]
+        assert turn["text"] == "Turn on the lights"
+        for delta in ("Done, the lights ", "are on. Is there anything else ", "you'd like me to do tonight?"):
+            ws.send_text(json.dumps({"type": "conduit.turn.delta", "turn_id": turn["turn_id"], "text": delta}))
+        ws.send_text(json.dumps({"type": "conduit.turn.done", "turn_id": turn["turn_id"]}))
+        done, seen = _next(ws, "response.done")
+        _finish(ws)
+    assert upstream.spoken() == ["Done, the lights are on.", "Is there anything else you'd like me to do tonight?"]
+    # One response for the whole reply, its transcript spaced between sentences.
+    kinds = [frame["type"] for frame in seen]
+    assert kinds.count("response.created") == 1 and kinds.count("response.done") == 1
+    assert "".join(frame["delta"] for frame in seen if frame["type"] == "response.output_audio_transcript.delta") == \
+        "Done, the lights are on. Is there anything else you'd like me to do tonight?"
+    assert kinds.count("response.output_audio.delta") == 2
+    assert done["response"]["status"] == "completed"
+    # Nothing the plugin keeps reaches the server.
+    assert not any(frame["type"].startswith("conduit.") for frame in upstream.sent)
+
+
+def test_speaking_over_the_reply_stops_it_and_lets_the_turn_go(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream()
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        upstream.hold = True
+        upstream.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": "Tell me a story"})
+        turn, _ = _next(ws, "conduit.turn")
+        ws.send_text(json.dumps({"type": "conduit.turn.delta", "turn_id": turn["turn_id"],
+                                 "text": "Once upon a time, there was a fox. "}))
+        _next(ws, "response.created")
+        upstream.push({"type": "input_audio_buffer.speech_started", "item_id": "item2"})
+        cancel, seen = _next(ws, "conduit.turn.cancel")
+        assert [frame["type"] for frame in seen] == ["input_audio_buffer.speech_started", "conduit.turn.cancel"]
+        assert cancel["turn_id"] == turn["turn_id"]
+        done, seen = _next(ws, "response.done")
+        assert done["response"]["status"] == "cancelled" and seen == [done]
+        # The cancelled response's late audio and end stay with the plugin;
+        # the next turn speaks.
+        upstream.hold = False
+        upstream.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": "Stop"})
+        turn, seen = _next(ws, "conduit.turn")
+        assert [frame["type"] for frame in seen] == ["conversation.item.input_audio_transcription.completed",
+                                                     "conduit.turn"]
+        ws.send_text(json.dumps({"type": "conduit.turn.delta", "turn_id": turn["turn_id"], "text": "Okay."}))
+        ws.send_text(json.dumps({"type": "conduit.turn.done", "turn_id": turn["turn_id"]}))
+        done, seen = _next(ws, "response.done")
+        _finish(ws)
+    assert {"type": "response.cancel"} in upstream.sent
+    assert upstream.spoken() == ["Once upon a time, there was a fox.", "Okay."]
+    assert [frame["type"] for frame in seen].count("response.output_audio.delta") == 1
+
+
+def test_a_typed_turn_is_run_by_the_plugin_not_read_back(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream()
+    item = {"type": "conversation.item.create",
+            "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "What time is it?"}]}}
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        ws.send_text(json.dumps(item))
+        ws.send_text(json.dumps({"type": "response.create"}))
+        turn, _ = _next(ws, "conduit.turn")
+        assert turn["text"] == "What time is it?"
+        ws.send_text(json.dumps({"type": "conduit.turn.delta", "turn_id": turn["turn_id"], "text": "Nine."}))
+        ws.send_text(json.dumps({"type": "conduit.turn.done", "turn_id": turn["turn_id"]}))
+        _next(ws, "response.done")
+        _finish(ws)
+    assert upstream.spoken() == ["Nine."]
+    assert not any(frame["type"] == "conversation.item.create" for frame in upstream.sent)
+
+
+def test_a_server_that_answers_by_itself_is_relayed_as_before(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream(refuses=False)
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        ws.send_text(json.dumps(LIVE_UPDATE))
+        _next(ws, "session.updated")
+        ws.send_text(json.dumps(_check("conduit-ready-5678")))
+        # The server's own response to the check: the plugin isn't in it.
+        _next(ws, "response.done")
+        _finish(ws)
+    assert upstream.sent[0] == LIVE_UPDATE and upstream.sent[1] == _check("conduit-ready-5678")
+    assert len(upstream.sent) == 2
+
+
+def test_a_server_that_doesnt_read_back_ends_the_call(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream(says="I am a model and I say what I like")
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        upstream.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": "Hello"})
+        turn, _ = _next(ws, "conduit.turn")
+        ws.send_text(json.dumps({"type": "conduit.turn.delta", "turn_id": turn["turn_id"],
+                                 "text": "Hello there, how are you doing today? I hope the weather is kind. "}))
+        ws.send_text(json.dumps({"type": "conduit.turn.done", "turn_id": turn["turn_id"]}))
+        with pytest.raises(WebSocketDisconnect) as closed:
+            while True:
+                ws.receive_text()
+    assert closed.value.code == api.SPEECH_SERVER_CLOSE_REFUSED
+    assert closed.value.reason == api.LOCAL_LIVE_NOT_READ_BACK
+    assert len(upstream.creates()) == 2
+
+
+def test_read_back_sentences_start_early_and_join_short_ones():
+    clock = [0.0]
+    sentences = api._ReadBackSentences(lambda: clock[0])
+    assert sentences.feed("Yes. ") == ["Yes."]
+    assert sentences.feed("It is. Short. ") == []
+    assert sentences.feed("And this one is long enough to go on its own. ") == \
+        ["It is. Short. And this one is long enough to go on its own."]
+    assert sentences.feed("Waiting for the rest") == []
+    clock[0] = api.LOCAL_LIVE_READ_BACK_FLUSH_S + 1
+    assert sentences.tick() == ["Waiting for the"]
+    assert sentences.finish() == ["rest"]
+    long = api._ReadBackSentences()
+    out = long.feed("word " * 120)
+    assert out and all(len(sentence) <= api.LOCAL_LIVE_READ_BACK_MAX_SENTENCE_CHARS for sentence in out)
+    assert api._ReadBackSentences().feed("It costs 3.50 today. ") == ["It costs 3.50 today."]
+
+
+def test_read_back_is_checked_only_on_sentences_that_can_tell():
+    assert api._local_live_read_back_matches("Hello there, how are you today?", "Hello there, how are you today?")
+    assert api._local_live_read_back_matches("Something else entirely here now", "Hello there, how are you today?") \
+        is False
+    assert api._local_live_read_back_matches("Hi.", "Hi there.") is None
+    assert api._local_live_read_back_matches("twenty one degrees and sunny out", "21 degrees and sunny out") is None
+
+
+def test_only_a_refusal_of_automatic_responses_turns_read_back_on():
+    assert api._local_live_refuses_live({"type": "error", "error": {"code": "realtime_live_unavailable"}})
+    assert api._local_live_refuses_live({"type": "error", "error": {
+        "param": "session.audio.input.turn_detection.create_response"}})
+    assert not api._local_live_refuses_live({"type": "error", "error": {"code": "invalid_api_key"}})
+    legacy = {"type": "session.update", "session": {"turn_detection": {"type": "server_vad"}}}
+    changed, interrupts = api._local_live_read_back_update(legacy)
+    assert changed["session"]["turn_detection"] == {"type": "server_vad", "create_response": False,
+                                                    "interrupt_response": False}
+    assert interrupts and legacy["session"]["turn_detection"] == {"type": "server_vad"}
+    off = {"type": "session.update", "session": {"turn_detection": {"create_response": False}}}
+    assert api._local_live_turn_detection(off) is None
+
+
+def _say(ws, turn, *deltas, done=True):
+    for delta in deltas:
+        ws.send_text(json.dumps({"type": "conduit.turn.delta", "turn_id": turn["turn_id"], "text": delta}))
+    if done:
+        ws.send_text(json.dumps({"type": "conduit.turn.done", "turn_id": turn["turn_id"]}))
+
+
+def _heard(upstream, words):
+    upstream.push({"type": "conversation.item.input_audio_transcription.completed", "transcript": words})
+
+
+def test_a_cough_while_hermes_works_doesnt_cost_the_reply(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream()
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        _heard(upstream, "What's on today?")
+        turn, _ = _next(ws, "conduit.turn")
+        # Nothing said yet: the noise is shown, the turn stays.
+        upstream.push({"type": "input_audio_buffer.speech_started", "item_id": "cough"})
+        _heard(upstream, "")
+        _, seen = _next(ws, "conversation.item.input_audio_transcription.completed")
+        assert [frame["type"] for frame in seen] == ["input_audio_buffer.speech_started",
+                                                     "conversation.item.input_audio_transcription.completed"]
+        _say(ws, turn, "Two meetings and a dentist appointment at four.")
+        done, seen = _next(ws, "response.done")
+        _finish(ws)
+    assert done["response"]["status"] == "completed"
+    assert not any(frame["type"] == "conduit.turn.cancel" for frame in seen)
+    assert upstream.spoken() == ["Two meetings and a dentist appointment at four."]
+
+
+def test_new_words_while_the_reply_speaks_start_a_new_turn(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream()
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        upstream.hold = True
+        _heard(upstream, "Tell me a story")
+        first, _ = _next(ws, "conduit.turn")
+        _say(ws, first, "Once upon a time, there was a fox. ", done=False)
+        _next(ws, "response.created")
+        upstream.hold = False
+        # No speech_started (a server that doesn't send it): the words alone.
+        _heard(upstream, "Actually, what time is it?")
+        second, seen = _next(ws, "conduit.turn")
+        kinds = [frame["type"] for frame in seen]
+        # The words show, the reply ends, and its turn gives way to theirs.
+        assert kinds == ["conversation.item.input_audio_transcription.completed", "response.done",
+                         "conduit.turn.cancel", "conduit.turn"]
+        assert seen[1]["response"]["status"] == "cancelled" and seen[2]["turn_id"] == first["turn_id"]
+        _say(ws, second, "Nine.")
+        _next(ws, "response.done")
+        _finish(ws)
+    assert upstream.spoken() == ["Once upon a time, there was a fox.", "Nine."]
+
+
+def test_a_cancel_the_server_drops_silently_holds_the_next_reply_only_briefly(client, hermes, server, monkeypatch):
+    monkeypatch.setattr(api, "LOCAL_LIVE_READ_BACK_CANCEL_TIMEOUT_S", 0.2)
+    server.upstream = upstream = ReadBackUpstream()
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        upstream.unstarted = True
+        _heard(upstream, "Tell me a story")
+        first, _ = _next(ws, "conduit.turn")
+        _say(ws, first, "Once upon a time. ", done=False)
+        _wait_for(lambda: len(upstream.creates()) == 1)
+        upstream.push({"type": "input_audio_buffer.speech_started"})
+        _next(ws, "conduit.turn.cancel")
+        upstream.unstarted = False
+        _heard(upstream, "Stop")
+        second, _ = _next(ws, "conduit.turn")
+        started = time.monotonic()
+        _say(ws, second, "Okay.")
+        _next(ws, "response.done")
+        waited = time.monotonic() - started
+        _finish(ws)
+    assert upstream.spoken() == ["Once upon a time.", "Okay."]
+    assert waited < 5
+
+
+def test_a_busy_server_gets_the_sentence_again_once_free(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream()
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        upstream.busy = 1
+        _heard(upstream, "Hi")
+        turn, _ = _next(ws, "conduit.turn")
+        _say(ws, turn, "Hello there.")
+        _, seen = _next(ws, "response.done")
+        _finish(ws)
+    # Asked twice: refused while busy, then read back.
+    assert upstream.spoken() == ["Hello there.", "Hello there."]
+    deltas = [frame["delta"] for frame in seen if frame["type"] == "response.output_audio_transcript.delta"]
+    assert deltas == ["Hello there."]
+    assert not any(frame["type"] == "error" for frame in seen)
+
+
+def test_a_long_sentence_still_playing_isnt_given_up_on(client, hermes, server, monkeypatch):
+    monkeypatch.setattr(api, "LOCAL_LIVE_READ_BACK_RESPONSE_TIMEOUT_S", 0.3)
+    server.upstream = upstream = ReadBackUpstream()
+    upstream.stream_s = 1.0
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        _heard(upstream, "Read me something long")
+        turn, _ = _next(ws, "conduit.turn")
+        _say(ws, turn, "This sentence takes a whole second to say. ", "And this one follows it.")
+        _, seen = _next(ws, "response.done")
+        _finish(ws)
+    # The second went only once the first was over: nothing of the first was cut.
+    assert upstream.spoken() == ["This sentence takes a whole second to say.", "And this one follows it."]
+    assert sum(1 for frame in seen if frame["type"] == "response.output_audio.delta") >= 20
+    assert not any(frame["type"] == "error" for frame in seen)
+
+
+def test_a_sentence_never_passes_the_cap():
+    out = api._ReadBackSentences().feed("Ok. " + "word " * 200 + "end. ")
+    assert out[0] == "Ok." and all(len(sentence) <= api.LOCAL_LIVE_READ_BACK_MAX_SENTENCE_CHARS for sentence in out)
+    assert " ".join(out) == " ".join(("Ok. " + "word " * 200 + "end.").split())
+
+
+def test_both_turn_detection_blocks_turn_automatic_responses_off():
+    both = {"type": "session.update", "session": {"turn_detection": {"type": "server_vad"},
+                                                  "audio": {"input": {"turn_detection": {"type": "server_vad",
+                                                                                         "interrupt_response": False}}}}}
+    changed, interrupts = api._local_live_read_back_update(both)
+    assert api._local_live_turn_detections(changed) == [] and interrupts is False
+
+
+def test_speech_before_the_reply_says_anything_holds_it_until_the_words_are_in(client, hermes, server):
+    server.upstream = upstream = ReadBackUpstream()
+    with client.websocket_connect(f"{BASE}/local-live/socket") as ws:
+        _ready(ws, upstream)
+        _heard(upstream, "Book a table")
+        first, _ = _next(ws, "conduit.turn")
+        upstream.push({"type": "input_audio_buffer.speech_started", "item_id": "more"})
+        _next(ws, "input_audio_buffer.speech_started")
+        # The reply's first sentence waits while the user may be speaking.
+        _say(ws, first, "Sure, for how many people? ", done=False)
+        time.sleep(0.3)
+        assert upstream.creates() == []
+        # Their words come: a new turn, and the held sentence is never said.
+        _heard(upstream, "for two at eight")
+        second, _ = _next(ws, "conduit.turn")
+        _say(ws, second, "Done, two at eight.")
+        _next(ws, "response.done")
+        # A sound that comes to nothing lets a held reply go on.
+        _heard(upstream, "Thanks")
+        third, _ = _next(ws, "conduit.turn")
+        upstream.push({"type": "input_audio_buffer.speech_started", "item_id": "noise"})
+        _next(ws, "input_audio_buffer.speech_started")
+        _say(ws, third, "You're welcome.")
+        time.sleep(0.3)
+        assert upstream.spoken() == ["Done, two at eight."]
+        upstream.push({"type": "conversation.item.input_audio_transcription.failed", "item_id": "noise",
+                       "error": {"code": "server_error"}})
+        _next(ws, "response.done")
+        _finish(ws)
+    assert upstream.spoken() == ["Done, two at eight.", "You're welcome."]
+
+
 # --- Agent mode: a fast front model ------------------------------------------------
 
 class FrontModel:

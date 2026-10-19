@@ -56,6 +56,8 @@ def test_every_capability_names_a_served_route_family():
         "watch-audio": "/watch-audio/",
         # Local Live on the Watch rides the audio bridge and its status route.
         "watch-local-live": "/watch-audio/",
+        # Read-back servers ride the Local Live socket and the Watch bridge.
+        "local-live-read-back": "/local-live/socket",
         "desktop-views": "/sessions/desktop-views",
         "hermes-calls": "/calls",
         "hermes-call-presence": "/calls/presence",
