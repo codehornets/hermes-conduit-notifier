@@ -9855,8 +9855,12 @@ class _WatchCallChat:
             return changed
         if kind == "approval.cancelled":
             ids = payload.get("request_ids")
+            if ids is not None and not isinstance(ids, list):
+                # Names its requests in a way this can't read: none is dropped
+                # on a guess (Hermes' timeout and the turn's end still clear them).
+                return False
             with self.approvals_lock:
-                if isinstance(ids, list) and ids:
+                if ids:
                     kept = [entry for entry in self.approvals if entry["request_id"] not in ids]
                 else:
                     kept = []
@@ -10373,7 +10377,6 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             # After the server answered: a call that can't reach it opens no chat.
             chat, resumed = await self._chat(server)
             runner = self.runner = _LocalLiveWatchTurns(chat)
-            chat.listener = runner.observe
             self.chat = chat
             if self.watch_approvals:
                 with contextlib.suppress(Exception):
@@ -10386,6 +10389,9 @@ class _LocalLiveWatchSession(_WatchAudioSession):
                 runner.watch_approvals = self.cards
                 if self.cards:
                     chat.on_approvals = self._approvals_changed
+            # Last: a resumed chat's events reach a runner that already knows
+            # where its approvals go.
+            chat.listener = runner.observe
             call = self.call = _LocalLiveWatchCall(self, _local_live_profile_key(profile))
             _local_live_register(call)
             pacer = self.pacer = _WatchAudioPacer(self.send, LOCAL_LIVE_WATCH_RATE)
@@ -10561,12 +10567,13 @@ class _LocalLiveWatchSession(_WatchAudioSession):
         expires = self.approval_timeout - self._approval_margin() - (time.monotonic() - oldest["at"])
         wait = (min(expires + 0.05, LOCAL_LIVE_WATCH_APPROVAL_KEEPALIVE_S) if expires > 0
                 else LOCAL_LIVE_WATCH_APPROVAL_KEEPALIVE_S)
+        if self.chat.answering:
+            # Hermes is taking an answer: the next card waits for it, and
+            # the answer's end looks again.
+            return
         if not self.finished:
             self.approval_timer = asyncio.get_running_loop().call_later(
                 wait, lambda: _local_live_spawn(self._show_approval()))
-        if self.chat.answering:
-            # Hermes is taking an answer: the next card waits for it.
-            return
         choices = self._approval_choices(approvals)
         card = (oldest["id"], choices)
         if self.shown_approval == card:
@@ -10613,6 +10620,9 @@ class _LocalLiveWatchSession(_WatchAudioSession):
         try:
             resolved = await asyncio.get_running_loop().run_in_executor(
                 _local_live_watch_executor, chat.respond, choice, oldest["request_id"])
+        except Exception as exc:  # noqa: BLE001 — not taken: the Watch hears so, and is shown it again
+            logger.info("A Watch call's approval answer didn't reach Hermes: %s", type(exc).__name__)
+            resolved = None
         finally:
             with chat.approvals_lock:
                 chat.answering = False

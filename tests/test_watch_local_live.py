@@ -1023,3 +1023,105 @@ def test_a_card_update_that_didnt_go_still_leaves_the_card_to_take_away(call):
         await bridge._end_session("test")
 
     _run(scenario())
+
+
+def test_an_answer_hermes_fails_on_is_not_taken_and_the_card_comes_back(call):
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval())
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        card = watch.events(socket, "conduit.approval")[0]
+
+        def broken(choice, request_id):
+            raise RuntimeError("the executor went away")
+
+        bridge.session.chat.respond = broken
+        await bridge._handle(watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "once"}))
+        await _until(lambda: watch.events(socket, "conduit.approval.done"))
+        assert watch.events(socket, "conduit.approval.done") == [
+            {"type": "conduit.approval.done", "id": card["id"], "resolved": False}]
+        await _until(lambda: len(watch.events(socket, "conduit.approval")) == 2)
+        assert watch.events(socket, "conduit.approval")[1]["id"] == card["id"]
+        assert not bridge.session.chat.answering
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_no_timer_runs_while_hermes_takes_an_answer(call):
+    gate = threading.Event()
+    respond = call.hermes.dispatch
+
+    def slow(request, transport=None):
+        if request["method"] == "approval.respond":
+            gate.wait(5)
+        return respond(request, transport)
+
+    call.hermes.dispatch = slow
+
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval("one", "r1"))
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        card = watch.events(socket, "conduit.approval")[0]
+        await bridge._handle(watch.event({"type": "conduit.approval.answer", "id": card["id"], "choice": "once"}))
+        await _until(lambda: bridge.session.chat.answering)
+        # Something changes meanwhile: a look, but no timer until the answer is back.
+        call.hermes.emit("approval.request", _approval("two", "r2"))
+        await _spawned_done(held=1)
+        assert bridge.session.approval_timer is None
+        gate.set()
+        await _until(lambda: watch.events(socket, "conduit.approval")[-1]["command"] == "two")
+        assert bridge.session.approval_timer is not None
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_cancel_that_names_its_requests_unreadably_drops_none(call):
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        call.hermes.emit("approval.request", _approval())
+        await _until(lambda: watch.events(socket, "conduit.approval"))
+        call.hermes.emit("approval.cancelled", {"request_ids": "req1"})
+        await _spawned_done()
+        assert watch.events(socket, "conduit.approval.gone") == []
+        assert len(bridge.session.chat.approvals) == 1
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_resumed_chats_runner_knows_about_the_card_before_it_hears_hermes(call, monkeypatch):
+    attached = []
+
+    class Chat(api._WatchCallChat):
+        @property
+        def listener(self):
+            return self.__dict__.get("_listener")
+
+        @listener.setter
+        def listener(self, value):
+            self.__dict__["_listener"] = value
+            if value is not None:
+                attached.append((value.__self__.watch_approvals, getattr(self, "on_approvals", None) is not None))
+
+    monkeypatch.setattr(api, "_WatchCallChat", Chat)
+
+    async def scenario():
+        bridge, socket, watch = await _approvals_call(call)
+        await bridge.session.call.start_turn("Clean up")
+        await _until(lambda: call.hermes.prompts())
+        await bridge._handle(bytes([0, 2]))  # the Watch's socket went
+        await _start(bridge, socket, Watch(), approvals=True, resume_session_id="stored1")
+        await bridge._end_session("test")
+
+    _run(scenario())
+    # Both the first stream and the rejoin attached the listener last.
+    assert attached == [(True, True), (True, True)]
