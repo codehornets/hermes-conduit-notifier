@@ -156,6 +156,25 @@ def test_a_private_place_hides_everything_but_itself(store, phone):
     assert stored["lat"] is None and stored["area"] is None and stored["precision"] == "places"
 
 
+def test_making_a_place_private_forgets_what_it_revealed(store, phone):
+    arrive = {"id": "e_home", "kind": "arrive", "place_id": "p_home", "at": "2026-10-13T06:50:00+01:00"}
+    store.ingest(phone.seal(phone.batch(fix=fix(place_id="p_home"), events=[arrive])))
+    # The user marks Home private: Conduit sends just the settings.
+    store.ingest(phone.seal(phone.batch(places=[{**PLACES[0], "private": True}, *PLACES[1:]])))
+    stored = store.snapshot()["fix"]
+    assert stored["place_id"] == "p_home" and stored["precision"] == "places"
+    assert (stored["lat"], stored["lon"], stored["accuracy_m"], stored["area"]) == (None, None, None, None)
+    assert stored["distances_m"] == {} and stored["speed_mps"] is None
+    assert store.history(DEVICE, 0, NOW + 1, 10)[0] == []
+
+
+def test_a_fix_elsewhere_keeps_its_detail_when_a_place_turns_private(store, phone):
+    store.ingest(phone.seal(phone.batch(fix=fix(place_id="p_work"))))
+    store.ingest(phone.seal(phone.batch(places=[{**PLACES[0], "private": True}, *PLACES[1:]])))
+    stored = store.snapshot()["fix"]
+    assert stored["lat"] == 51.532141 and stored["area"]["name"] == "Shoreditch" and stored["precision"] == "precise"
+
+
 def test_saved_places_never_carry_coordinates(store, phone):
     places = [{**PLACES[0], "lat": 51.5, "lon": -0.1}]
     with pytest.raises(location.LocationError) as error:
@@ -178,6 +197,46 @@ def test_pausing_forgets_the_latest_fix(store, phone):
     view = store.snapshot()
     assert view["fix"] is None
     assert location.sharing_paused(view["sharing"], NOW)
+
+
+def test_a_late_older_batch_never_undoes_a_pause(store, phone):
+    # Sent before the pause but arriving after it (a retry, or a replay).
+    older = phone.seal(phone.batch(sent_at="2026-10-13T06:58:30+01:00", fix=fix()))
+    store.ingest(phone.seal(phone.batch(sent_at="2026-10-13T06:59:30+01:00",
+                                        sharing=sharing(paused_until="2099-01-01T00:00:00+00:00"))))
+    result = store.ingest(older)
+    view = store.snapshot()
+    assert location.sharing_paused(view["sharing"], NOW)
+    assert view["fix"] is None
+    assert result["stale"] is True and result["fix"] is False
+
+
+def test_a_batch_stamped_in_the_future_doesnt_make_the_next_one_stale(store, phone):
+    clock = [NOW]
+    store.clock = lambda: clock[0]
+    store.ingest(phone.seal(phone.batch(sent_at="2026-10-13T20:00:00+01:00", fix=fix())))
+    clock[0] += 60
+    store.ingest(phone.seal(phone.batch(sent_at="2026-10-13T07:00:30+01:00",
+                                        sharing=sharing(paused_until="2099-01-01T00:00:00+00:00"))))
+    assert store.latest_place()["paused"] is True
+
+
+@pytest.mark.parametrize("version", ["1", "2"])
+def test_an_older_store_upgrades_and_still_takes_batches(store, phone, version):
+    import sqlite3
+    store.ingest(phone.seal(phone.batch(fix=fix())))
+    db = sqlite3.connect(store.path)
+    db.execute("ALTER TABLE devices DROP COLUMN last_sent")
+    if version == "1":
+        db.execute("DROP TABLE maps")
+    db.execute("UPDATE meta SET value=? WHERE key='schema'", (version,))
+    db.commit()
+    db.close()
+    assert store.snapshot()["fix"]["id"] == "f_message"
+    store.ingest(phone.seal(phone.batch(sent_at="2026-10-13T06:59:30+01:00",
+                                        sharing=sharing(paused_until="2099-01-01T00:00:00+00:00"))))
+    assert store.ingest(phone.seal(phone.batch(sent_at="2026-10-13T06:58:30+01:00", fix=fix())))["stale"] is True
+    assert store.snapshot()["fix"] is None
 
 
 def test_a_second_device_without_a_fix_doesnt_hide_the_first_ones(store, phone):
@@ -454,6 +513,28 @@ def test_history_reads_local_days(home):
     assert _call({"action": "history", "from": "2026-08-01"})["error"] == "malformed"
 
 
+# Europe/London's 25-hour day (clocks back) and 23-hour day (clocks forward).
+@pytest.mark.parametrize("now, day, inside, after", [
+    (datetime(2025, 10, 27, 12, 0, tzinfo=timezone.utc), "2025-10-26",
+     "2025-10-26T23:30:00+00:00", "2025-10-27T00:30:00+00:00"),
+    (datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc), "2026-03-29",
+     "2026-03-29T23:30:00+01:00", "2026-03-30T00:30:00+01:00"),
+])
+def test_history_days_follow_dst(tmp_path, monkeypatch, now, day, inside, after):
+    monkeypatch.setattr(tool, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(tool.session_titles, "title", lambda key: "Trip planning")
+    original = tool.LocationStore
+    monkeypatch.setattr(tool, "LocationStore", lambda path: original(path, clock=now.timestamp))
+    store = location.LocationStore(tmp_path, clock=now.timestamp)
+    phone = Phone()
+    phone.accept(store.register_key(phone.key_request()))
+    events = [{"id": "e_in", "kind": "arrive", "place_id": "p_home", "at": inside},
+              {"id": "e_next", "kind": "leave", "place_id": "p_home", "at": after}]
+    store.ingest(phone.seal(phone.batch(sent_at=now.isoformat(), events=events)))
+    answer = _call({"action": "history", "from": day, "to": day})
+    assert [entry["at"] for entry in answer["history"]] == [inside]
+
+
 class FakeScheduler:
     def __init__(self):
         self.jobs = {}
@@ -690,10 +771,35 @@ def test_routes_round_trip_and_start_rule_jobs(client):
     assert client.get(f"{BASE}/location/status").json()["stored"] is False
 
 
+def test_status_says_whether_hermes_can_ask_for_a_fresh_position(client, monkeypatch):
+    # Conduit's Location settings read `locate.available` to tell whether
+    # conduit_location's locate can reach this phone; it mirrors locate's own
+    # not_paired gate (background sharing is the phone's own setting).
+    pairing = client.home / "conduit-push.json"
+    monkeypatch.setattr(api, "_pairing_state_path", lambda: pairing)
+    assert client.get(f"{BASE}/location/status").json()["locate"] == {"available": False}
+    pairing.write_text(json.dumps({"credential": "c" * 32, "installation_id": "i" * 16}))
+    assert client.get(f"{BASE}/location/status").json()["locate"] == {"available": True}
+
+
 def test_ingest_refuses_an_oversized_body(client):
     response = client.post(f"{BASE}/location/ingest", content=b"x" * (api.LOCATION_MAX_INGEST_BODY_BYTES + 1),
                            headers={"content-type": "application/json"})
     assert response.status_code == 413
+
+
+def test_a_lost_key_refusal_carries_the_stores_code(client):
+    # Conduit sets up a new key when the host lost its old one; until now it
+    # had only the message to go on, which never named the code.
+    phone = Phone()
+    phone.accept(client.post(f"{BASE}/location/key", json=phone.key_request()).json())
+    sealed = phone.seal(phone.batch(fix=fix()))
+    for envelope, code in (({**sealed, "kid": "f" * 32}, "unknown_key"),
+                           ({**sealed, "batch_id": "batch-999999"}, "bad_seal")):
+        response = client.post(f"{BASE}/location/ingest", json=envelope)
+        assert response.status_code == 409 and response.headers["cache-control"] == "no-store"
+        body = response.json()
+        assert body["code"] == code and body["detail"] and code not in body["detail"]
 
 
 def test_a_rule_deleted_meanwhile_isnt_brought_back(store):

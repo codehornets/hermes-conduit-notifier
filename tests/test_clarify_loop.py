@@ -457,6 +457,45 @@ def test_consecutive_unknown_polls_stop_after_grace_window():
     assert len(fake.poll_ids) == 3, "polling must stop at the grace boundary"
 
 
+def test_a_poll_answer_that_is_not_an_object_is_tolerated_until_answered():
+    # A misbehaving relay or proxy answers 200 with a list, null or a string:
+    # an unproductive poll, like a transport error, not a crash.
+    fake = _FakeState([[], None, "ok", {"status": "answered", "answer": "Blue"}])
+    _install(fake)
+    original, release = _blocking_original("original result")
+    try:
+        result = loop.middleware(**_kwargs(original, {"question": "Q?"}))
+    finally:
+        release.set()
+    assert json.loads(result)["user_response"] == "Blue"
+    assert len(fake.poll_ids) == 4
+
+
+def test_poll_answers_that_are_never_objects_fall_back_after_grace_window():
+    fake = _FakeState([[], None, "ok", 7, ["answered"]])
+    _install(fake)
+
+    def original(args):
+        # Hermes' own prompt is answered once the relay has been given up on.
+        deadline = time.monotonic() + 5
+        while len(fake.poll_ids) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return "original result"
+
+    old_grace = loop.UNKNOWN_POLL_GRACE
+    loop.UNKNOWN_POLL_GRACE = 3
+    try:
+        result = loop.middleware(**_kwargs(original, {"question": "Q?"}))
+    finally:
+        loop.UNKNOWN_POLL_GRACE = old_grace
+    assert result == "original result"
+    assert len(fake.poll_ids) == 3, "polling stops at the grace boundary"
+    deadline = time.monotonic() + 5
+    while not fake.cancelled_ids and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(fake.cancelled_ids) == 1, "the parked decision is released"
+
+
 def test_persistent_transport_errors_stop_after_grace_window():
     # A persistently unreachable relay must not poll the full budget: errors
     # count against the same grace as unknowns.
@@ -538,8 +577,10 @@ def test_one_question_questions_array_is_batch_protocol_and_formats_batch_result
     parsed = json.loads(result)
     assert parsed == {
         "responses": [
-            {"question": "Which environment?", "choices_offered": ["staging", "prod"], "user_response": "staging"},
-        ]
+            {"question": "Which environment?", "choices_offered": ["staging", "prod"], "status": "answered",
+             "user_response": "staging"},
+        ],
+        "outcome": "submitted",
     }
     # Guard against "fixing" scalar by collapsing every single-question case:
     # a one-entry questions[] invocation pushes the BATCH wire shape.
@@ -637,9 +678,12 @@ def test_batch_push_preserves_every_question_and_relay_completion_wins():
     parsed = json.loads(result)
     assert parsed == {
         "responses": [
-            {"question": "Which environment?", "choices_offered": ["staging", "prod"], "user_response": "staging"},
-            {"question": "Which tests should run?", "choices_offered": ["unit", "ui"], "user_response": ["unit"]},
-        ]
+            {"question": "Which environment?", "choices_offered": ["staging", "prod"], "status": "answered",
+             "user_response": "staging"},
+            {"question": "Which tests should run?", "choices_offered": ["unit", "ui"], "status": "answered",
+             "user_response": ["unit"]},
+        ],
+        "outcome": "submitted",
     }
     # The completed decision must not be cancelled after the relay won.
     assert fake.cancelled_ids == []
@@ -660,8 +704,8 @@ def test_native_answer_wins_and_releases_the_batch_decision():
 
 def test_batch_legacy_collapsed_answer_formats_absences():
     # An old relay/pre-batch device answers only the collapsed copy: the
-    # result keeps every row, with unanswered questions as empty responses
-    # (upstream absence semantics), never a fake full-batch success.
+    # result keeps every row, with the other questions unanswered and a null
+    # response (upstream absence semantics), never a fake full-batch success.
     fake = _FakeState([{"status": "answered", "answer": "staging"}])
     _install(fake)
     original, release = _blocking_original()
@@ -670,7 +714,8 @@ def test_batch_legacy_collapsed_answer_formats_absences():
     finally:
         release.set()
     parsed = json.loads(result)
-    assert [row["user_response"] for row in parsed["responses"]] == ["staging", ""]
+    assert [(row["status"], row["user_response"]) for row in parsed["responses"]] == [
+        ("answered", "staging"), ("unanswered", None)]
     assert parsed["responses"][1]["question"] == "Which tests should run?"
 
 
@@ -815,3 +860,161 @@ def test_missing_redact_key_is_minted_once_and_reused(monkeypatch, tmp_path):
     client.send_now(event)
     assert sent[0]["event_id"] == sent[1]["event_id"] != event["event_id"]
     assert client.load_state()["redact_key"]
+
+
+def _client_racing(monkeypatch, tmp_path, name, meanwhile):
+    """A fresh client whose first key minting lets another process (``meanwhile``,
+    on a thread) change the pairing; returns the client and that thread."""
+    spec = importlib.util.spec_from_file_location(name, ROOT / "client.py")
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    monkeypatch.setattr(client, "state_path", lambda: tmp_path / "conduit-push.json")
+    other = threading.Thread(target=meanwhile, args=(client,))
+    real_token_hex = client.secrets.token_hex
+
+    def token_hex(size):
+        if not other.ident:
+            other.start()
+            other.join(0.5)  # done at once, unless the pairing is locked
+        return real_token_hex(size)
+
+    monkeypatch.setattr(client, "secrets", types.SimpleNamespace(token_hex=token_hex))
+    return client, other
+
+
+def _repair(client):
+    client.save_state({"relay_url": "https://relay", "credential": "new", "installation_id": "phone-B"})
+
+
+def test_the_redaction_switch_keeps_a_pairing_replaced_meanwhile(monkeypatch, tmp_path):
+    client, other = _client_racing(monkeypatch, tmp_path, "conduit_push._client_switch_repaired", _repair)
+    client.save_state({"relay_url": "https://relay", "credential": "old", "installation_id": "phone-A"})
+    assert client.set_redact_content(True) is True
+    other.join(5)
+    saved = client.load_state()
+    assert (saved["credential"], saved["installation_id"]) == ("new", "phone-B")
+
+
+def test_the_redaction_switch_doesnt_restore_a_pairing_removed_meanwhile(monkeypatch, tmp_path):
+    client, other = _client_racing(monkeypatch, tmp_path, "conduit_push._client_switch_unpaired",
+                                   lambda client: client.remove_state())
+    client.save_state({"relay_url": "https://relay", "credential": "revoked", "installation_id": "phone-A"})
+    client.set_redact_content(True)
+    other.join(5)
+    assert client.load_state() is None
+
+
+def test_a_minted_redact_key_doesnt_restore_a_pairing_replaced_meanwhile(monkeypatch, tmp_path):
+    client, other = _client_racing(monkeypatch, tmp_path, "conduit_push._client_key_repaired", _repair)
+    client.save_state({"relay_url": "https://relay", "credential": "old", "installation_id": "phone-A",
+                       "redact_content": True})
+    sent = []
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: sent.append(kwargs["payload"]) or {})
+    event = {"event_id": "approval:0123456789abcdef", "type": "approval.needed"}
+    client.send_now(event)
+    other.join(5)
+    saved = client.load_state()
+    assert (saved["credential"], saved["installation_id"]) == ("new", "phone-B")
+    assert sent[0]["event_id"] != event["event_id"], "this send is still re-keyed"
+
+
+# --- Relay answers in Hermes' clarify result shape ---------------------------
+
+RESULT_VECTOR = json.loads((ROOT / "tests" / "clarify_result_vector.json").read_text(encoding="utf-8"))
+
+
+def _relay_answers(args, answers):
+    fake = _FakeState([{"status": "answered", "answers": answers, "remaining": []}])
+    _install(fake)
+    original, release = _blocking_original("never used")
+    try:
+        return loop.middleware(**_kwargs(original, args)), fake
+    finally:
+        release.set()
+
+
+def test_the_local_result_matches_hermes_clarify_result():
+    # Each case's result was produced by Hermes' own tools.clarify_tool._result
+    # (see the vector's source); the fallback for a Hermes without it must
+    # answer byte for byte the same.
+    for case in RESULT_VECTOR["cases"]:
+        assert loop._local_result(case["normalized"], case["reply"]) == case["result"], case["name"]
+
+
+def test_relay_answers_are_built_by_hermes_clarify_result_when_it_exists(monkeypatch):
+    seen = []
+
+    def hermes_result(normalized, reply):
+        seen.append((normalized, reply))
+        return "built by hermes"
+
+    monkeypatch.setattr(sys.modules["tools.clarify_tool"], "_result", hermes_result, raising=False)
+    result, _ = _relay_answers(_batch_args(), {"q0": "staging", "q1": '["unit", "ui"]'})
+    assert result == "built by hermes"
+    [(normalized, reply)] = seen
+    assert normalized == [
+        {"qid": "q0", "question": "Which environment?", "choices_offered": ["staging", "prod"], "multi_select": False},
+        {"qid": "q1", "question": "Which tests should run?", "choices_offered": ["unit", "ui"], "multi_select": True},
+    ]
+    assert reply == {"answers": {"q0": "staging", "q1": '["unit", "ui"]'}, "outcome": "submitted"}
+
+
+def test_a_relay_answered_batch_has_status_outcome_and_null_absences():
+    result, _ = _relay_answers({"questions": [
+        {"question": "Which environment?", "choices": ["staging", "prod"]},
+        {"question": "Name for the branch?"},
+    ]}, {"q0": "staging", "q1": "fix-login"})
+    assert json.loads(result) == {"responses": [
+        {"question": "Which environment?", "choices_offered": ["staging", "prod"], "status": "answered",
+         "user_response": "staging"},
+        {"question": "Name for the branch?", "choices_offered": None, "status": "answered",
+         "user_response": "fix-login"},
+    ], "outcome": "submitted"}
+
+
+def test_a_typed_multi_select_answer_is_one_item():
+    result, _ = _relay_answers(_batch_args(), {"q0": "staging", "q1": "unit, ui"})
+    assert json.loads(result)["responses"][1]["user_response"] == ["unit, ui"]
+
+
+LONG_CHOICE = "Rewrite the importer to stream rows in batches of 500 and keep the old path behind a flag"
+
+
+def test_a_card_label_cut_from_a_long_choice_answers_with_the_full_choice():
+    args = {"questions": [{"question": "How should we fix the import?", "choices": [LONG_CHOICE, "Leave it"]}]}
+    _, fake = _relay_answers(args, {"q0": "Leave it"})
+    label = fake.enqueued[0]["decision"]["questions"][0]["choices"][0]
+    assert label != LONG_CHOICE and len(label) == 80, "the card shows a cut label"
+    result, _ = _relay_answers(args, {"q0": label})
+    [row] = json.loads(result)["responses"]
+    assert row["user_response"] == LONG_CHOICE
+    assert row["user_response"] in row["choices_offered"]
+
+
+def test_a_cut_label_maps_back_on_the_relay_s_utf16_cut_and_in_multi_select():
+    emoji_choice = "🚀" * 50 + " launch"  # the relay cuts 80 UTF-16 units: 40 rockets
+    args = {"questions": [{"question": "Which?", "choices": [emoji_choice, LONG_CHOICE, "Leave it"],
+                           "multi_select": True}]}
+    answer = json.dumps(["🚀" * 40, LONG_CHOICE[:80], "Leave it"], ensure_ascii=False)
+    result, _ = _relay_answers(args, {"q0": answer})
+    assert json.loads(result)["responses"][0]["user_response"] == [emoji_choice, LONG_CHOICE, "Leave it"]
+
+
+def test_an_ambiguous_or_unknown_label_is_kept_as_typed():
+    twin = LONG_CHOICE + " (and log it)"
+    args = {"questions": [{"question": "How?", "choices": [LONG_CHOICE, twin]}]}
+    result, _ = _relay_answers(args, {"q0": LONG_CHOICE[:80]})
+    assert json.loads(result)["responses"][0]["user_response"] == LONG_CHOICE[:80]
+    result, _ = _relay_answers(args, {"q0": "Something else"})
+    assert json.loads(result)["responses"][0]["user_response"] == "Something else"
+
+
+def test_a_legacy_scalar_answer_maps_a_cut_label_back_too():
+    fake = _FakeState([{"status": "answered", "answer": LONG_CHOICE[:80]}])
+    _install(fake)
+    original, release = _blocking_original()
+    try:
+        result = loop.middleware(**_kwargs(original, {"question": "How?", "choices": [LONG_CHOICE, "Leave it"]}))
+    finally:
+        release.set()
+    assert json.loads(result)["user_response"] == LONG_CHOICE

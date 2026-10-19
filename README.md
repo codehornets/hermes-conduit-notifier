@@ -94,6 +94,8 @@ The iOS app controls which categories are enabled, whether notification previews
 - The credential is stored in the profile-aware Hermes home as `conduit-push.json` with mode `0600` on supported systems.
 - Authorization credentials are never written to logs or printed by `status`.
 - Hook callbacks enqueue bounded events; HTTPS delivery runs on a background worker and does not block the agent loop.
+- A delivery that fails on the way (no connection, a timeout, `408`, `429` or a `5xx` from the relay) is sent again with the same event ID after 1, 2 and 4 seconds, for at most about 30 seconds per event; the relay drops the repeats it already accepted. Other refusals are not retried. A `401` means the relay no longer knows this gateway (Conduit removed it, or the relay lost its data): the pairing is kept, and `status` says to pair again from Conduit until a delivery is accepted again.
+- Disabling or reloading the plugin (on a Hermes with plugin unload callbacks) stops its background work: notifications still queued and replies waiting for their turn's end are dropped, the delivery and Lock Screen threads end, and a call held until your call ends is kept for the next load instead of going out.
 - Event titles and bodies are length-limited before delivery.
 - Lock Screen previews are disabled by default in Hermes Conduit.
 - **End-to-end encryption** (plugin 0.5+, relay 0.5+, a Conduit build with encrypted notifications): Conduit creates a secret for each pairing on the phone and hands it to this profile over your Hermes dashboard connection, so it never passes through the relay. From then on every notification's title, body, profile, session and decision card is sealed with it (ChaCha20-Poly1305, keys derived with HKDF-SHA256), the phone decrypts it in a Notification Service Extension, and clarify answers come back sealed for this profile. The relay and APNs see only routing data: the event type, opaque ids, a keyed thread token and timing. A pairing that has a key never sends plaintext content again, and only accepts clarify answers sealed by the phone. `hermes conduit-push status` shows whether it's on; Conduit turns it on by itself when it connects to this host. Run `hermes conduit-push test --corrupt` to check that the phone shows only generic text for a push it can't verify. The secret is only as private in transit as your dashboard connection (HTTPS or a private tunnel is recommended).
@@ -124,9 +126,15 @@ cp .env.example .env
 mkdir -p secrets
 cp /path/to/AuthKey_XXXXXX.p8 secrets/apns-production.p8
 
-# 3. Build and run
+# 3. Create the data directory, owned by the image's node user (uid 1000)
+mkdir -p data
+sudo chown 1000:1000 data
+
+# 4. Build and run
 docker compose up -d
 ```
+
+Skip step 3 and Docker creates `data/` owned by root on a Linux host. The relay runs as `node`, can't write there, and exits at startup naming the directory. Docker Desktop on macOS maps ownership through its file sharing, which hides this.
 
 The relay listens on port 9120. Put it behind an HTTPS reverse proxy (the relay validates that `PUBLIC_URL` uses HTTPS). If the proxy sends `X-Forwarded-For`, set `TRUST_PROXY` to the number of proxies in front of the relay (`1` for one): the relay rate-limits by the address the outermost trusted proxy appended, never by an entry the client sent itself. That holds only when every request comes through the proxy, so don't publish port 9120 or share its network with anything else. `APNS_MODE`, `APNS_CAPTURE_PATH` and `APNS_VOIP_FAILURE` are test settings; a relay refuses to start with them.
 
@@ -231,7 +239,9 @@ reach Conduit on the iPhone. Calls and answers are sealed with a per-call key
 the relay never sees (ChaCha20-Poly1305, bound to the grant, call id and
 direction), so the relay only forwards ciphertext. Grants live in memory,
 last at most 30 minutes and 120 calls, and a restart drops them; the Watch
-then falls back to the iPhone. A relay holding its maximum of grants answers a
+then falls back to the iPhone. Revoking a gateway, or deactivating its
+installation, closes its grants at once, with their waiting calls, host polls
+and audio bridges. A relay holding its maximum of grants answers a
 new one with 503 `watch_grant_capacity`, and that call's lookups go through
 the iPhone.
 
@@ -439,6 +449,11 @@ the FULL batch to Conduit instead of collapsing it to the first question:
   whole clarify) tells Conduit to retire the entire pushed card. An
   unknown qid on a live decision is `400 invalid_question_id`, not a
   missing decision.
+- An answer is kept whole or refused, never cut: plaintext is trimmed and
+  may be up to 2,000 characters, a sealed answer (`e2e1.…`, encrypted
+  pairings) up to 11,000. A longer one is `413 answer_too_large` and the
+  question stays open; a sealed answer too short to hold its tag is
+  `400 invalid_answer`.
 - The structured decision and the notification are independent: when the
   card cannot be delivered (decision_cards disabled, or an oversized batch
   stripped by the APNs size guard, or APNs rejecting the send), the
@@ -490,8 +505,9 @@ also bound how large a flood can make that file.
 
 When any limit is full, a new clarify event receives HTTP `429`
 `decision_capacity_exceeded`. The relay sends no push and does not consume the
-event ID. Retrying is caller-chosen: the shipped plugin logs the rejection and
-does not retry automatically; a caller may explicitly retry the same event ID
+event ID. The shipped plugin sends a `429` again a few times within about 30
+seconds (the same event ID, like any other transient failure), then logs the
+rejection and gives up; a caller may explicitly retry the same event ID
 after capacity becomes available and before the event is accepted. Hermes'
 native clarify path remains available, and existing decisions remain
 answerable, pollable, and cancellable.
@@ -1184,7 +1200,9 @@ known by, and the sessions it continues from or spawned are read too), `kind` (`
 `links`), `q` (words in the name, chat title, path or URL), `limit` (up to
 200) and `before` (the previous page's `next_before`; `null` once the history
 is read to its start). A request reads a bounded window of rows, so a page can
-come back short with a `next_before` to keep going. With `session_id` (plugin
+come back short with a `next_before` to keep going. One message adds at most 200
+artifacts to a page (a page ends after the message that fills it, so it can
+run past `limit`); the rest of a message naming more than that isn't listed. With `session_id` (plugin
 0.43.2+) only that chat's own rows are read, so a chat under a long history
 of other chats, cron runs say, lists in one request. Capability `artifacts`.
 
@@ -1472,14 +1490,16 @@ in the exchange (0.45.1+), so a phone that draws the cards leaves it out.
 - **Sourced facts only.** The phone adds address, category, phone, website,
   travel time and Look Around from Apple Maps when it draws a card; the
   schema has no fields for them. A rating, hours, price or photo needs a
-  `source`, or it's dropped.
+  `source`, or it's dropped; a place's or person's photo also needs an https
+  `url`.
 - **Kept in history.** The tool's answer carries the normalized cards
   (`{"ok": true, "cards": [...]}`), so the chat's history keeps them and
   Conduit draws them whenever the chat is opened. With no call screen, a
   Conduit that says `chat-cards` in its exchange's `features` still gets
   the tool, and the card shows in the chat only. A turn that isn't from
-  Conduit (Desktop, a messaging app, the terminal) is refused with
-  `not_conduit`.
+  Conduit (Desktop, or a messaging app through Hermes' gateway) is refused
+  with `not_conduit`. A classic `hermes` terminal turn can't be told apart
+  yet (Hermes doesn't bind its platform for tools), so it isn't refused.
 - **Live calls.** A saved call's assistant turn can carry `cards`
   (`POST /voice/sessions`): kept with a chat's call and returned by
   `GET /voice/chat-calls`; in a call saved as its own row, written as their
@@ -1498,9 +1518,11 @@ keep only that field.
   a `url` if any), shown on the card. A forecast needs one or it's dropped;
   without one, the other cards read as Hermes' own.
 - **Only where they're drawn.** A Conduit says `info-cards` in its
-  exchange's `features` when it draws them. Without it, the tool leaves
-  them out (`unsupported_cards` when nothing else is left), so an older
-  build never gets a card it would show as nothing. Each phone's exchange
+  exchange's `features` when it draws them. Unless every Conduit that
+  draws cards (`show-cards` or `chat-cards`) and exchanged with the profile
+  in the last 30 days says it, the tool leaves them out (`unsupported_cards`
+  when nothing else is left): the chat keeps the cards, and an older build
+  opening it would show them as nothing. Each phone's exchange
   also leaves out the cards it can't draw and shows the Markdown instead.
 
 ### Media, contact and live cards (plugin 0.47+)
@@ -1522,6 +1544,7 @@ keep only that field.
   card with the same live name again in the conversation replaces the
   earlier one, on the call screen and in the chat, so Hermes keeps a
   delivery, a score or a job's progress up to date by showing it again.
+  Cards shown beside the earlier one stay.
 - A Conduit says `media-cards` and `live-cards` in its exchange when it
   draws them; the same gating as information cards applies.
 
@@ -1552,6 +1575,11 @@ workouts, body, vitals, fitness), with how far back to start.
   for a device id drops what the earlier key sent (the phone sends it all
   again), so a re-key can't be used to read a phone's data back; the same
   device key again keeps it, since only that phone can use it.
+- **Refusals.** A request the store refuses answers with its HTTP status
+  and `{"detail": "<message>", "code": "<word>"}`. `unknown_key` and
+  `bad_seal` (409) mean this host doesn't have the phone's key (the phone
+  sets up a new one); `too_many_devices` and `schema` (also 409) don't. The
+  location routes answer the same way. Other errors carry only `detail`.
 - **Summaries first.** Conduit sends the hourly and daily totals Apple
   Health computes on the phone (iPhone and Watch already merged), a summary
   per night of sleep, sleep stage segments and workouts. Raw readings go
@@ -1641,7 +1669,8 @@ marked private is reported only as "at a private place".
 - **Stored here only.** The profile's `conduit-location.sqlite3`, mode
   `0600`. History is kept as long as the user picks in Conduit (latest only,
   1, 7 by default, 30 or 365 days). `GET /location/status` reports counts,
-  never locations; `GET /location/reads` lists when the agent read location
+  never locations, and `locate.available` (whether `locate` can reach the
+  phone: this profile is paired for notifications); `GET /location/reads` lists when the agent read location
   (kept 30 days, without the locations); `POST /location/wipe` deletes one
   device's data and key, or everything with `{"all": true}`.
 - **Tool.** `conduit_location` (actions `now`, `locate`, `places`,
@@ -1696,7 +1725,9 @@ carrying `maps: {to, mode}`: Conduit opens Maps at once when the user is in
 that chat with Conduit open, and otherwise shows a Go button and a
 notification, answered by tap or by saying "go" in a call. Conduit says it
 can do this with `features: ["maps-navigate"]` in its present exchange;
-without it the tool returns an Apple Maps link for a text chat.
+without one that said so in the last 30 days the tool returns an Apple Maps
+link for a text chat. Only a Conduit that says so gets the Go prompt, and
+only its answer counts.
 
 The host has no map, so the user's iPhone answers. The tool stores the
 lookup sealed for that one phone (location's key, its own HKDF labels) and
@@ -1719,7 +1750,9 @@ Apple Maps from this host instead, without waking the phone: the relay hands
 paired hosts a short-lived Apple Maps Server API token (`POST
 /v1/maps/token`; one cached token for every host, so it doesn't identify
 one) and the plugin calls `maps-api.apple.com` itself, so the relay never
-sees a lookup. Each host uses at most 200 Apple calls a day. Saved places
+sees a lookup. Each host uses at most 200 Apple calls a day (a call counts
+once the relay has given a token, and a retry after Apple refuses the token
+doesn't count again). Saved places
 (their coordinates live on the phone) and transit routes need the phone;
 "me" on the host is the last shared fix at its detail. A user who turns on
 "Keep maps lookups on this iPhone" in Conduit turns the host engine off for
@@ -1923,7 +1956,9 @@ relay key. The host still opens no inbound route.
   Python; if that Python already has `aiortc`, it's used as it is.
   `runtime` reads `ready`, `preparing`, `failed` (with the reason) or
   `missing`, and `engines` in a grant lists `gpt_live` only once it's
-  ready.
+  ready. The helper writes to the plugin from its own thread, so a slow
+  Watch connection never stalls the WebRTC side: past 2 s of model audio
+  waiting, the oldest is dropped, and events are never dropped.
 - **Grok** connects to xAI the way the phone's Grok relay does. Grok sends
   a reply's audio faster than it plays, so the plugin paces it to the Watch
   at real time with a little lead, and drops what's left when the user

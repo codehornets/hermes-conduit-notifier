@@ -159,6 +159,21 @@ def test_the_turns_connection_comes_from_hermes_gateway_when_loaded(monkeypatch)
     assert sources.current_transport() is bound
 
 
+def test_the_turns_platform_comes_from_hermes_gateway_when_loaded(monkeypatch):
+    monkeypatch.delitem(sys.modules, "gateway.session_context", raising=False)
+    assert sources.current_platform() is None
+    context = types.ModuleType("gateway.session_context")
+    context.get_session_env = lambda name, default="": "telegram" if name == "HERMES_SESSION_PLATFORM" else default
+    monkeypatch.setitem(sys.modules, "gateway.session_context", context)
+    assert sources.current_platform() == "telegram"
+
+    def broken(*args):
+        raise RuntimeError("no session")
+
+    context.get_session_env = broken
+    assert sources.current_platform() is None
+
+
 # --- The reply-ready push ------------------------------------------------------
 
 
@@ -251,3 +266,22 @@ def test_a_bad_body_is_a_400(client):
 
 def test_watch_jobs_count_as_conduit():
     assert sources.turn_source("desktop", api._WatchJobTransport(None)) == "conduit"
+
+
+def test_an_unreadable_file_is_not_overwritten(tmp_path, monkeypatch):
+    store = Store(tmp_path)
+    store.set_notify("messaging", False)
+    store.set_notify("desktop", False)
+    saved = store.path.read_text(encoding="utf-8")
+    real = type(store.path).read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == store.path:
+            raise PermissionError("busy")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(store.path), "read_text", unreadable)
+    with pytest.raises(OSError):
+        store.set_notify("terminal", False)
+    monkeypatch.undo()
+    assert store.path.read_text(encoding="utf-8") == saved

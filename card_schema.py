@@ -27,7 +27,7 @@ test suites run, so the two can't drift:
 - then the schema's ``rules``: a card keeps only its type's fields and
   needs its type's own; a route only on a map whose places all survived,
   naming places in the list, from one to another; a place card keeps its
-  first place; a chart keeps the series that fit its labels (one, never
+  first place; a place's or person's photo needs an https url; a chart keeps the series that fit its labels (one, never
   negative, for a pie); a forecast needs a source and something to show,
   and drops a day whose low is above its high; a comparison recommends one
   option at most; media needs a source, and an image has no duration or
@@ -190,9 +190,9 @@ MEDIA_TYPES = ("media", "contact")
 LIVE_TYPES = ("status",)
 FEATURE_TYPES = {"info-cards": INFO_TYPES, "media-cards": MEDIA_TYPES, "live-cards": LIVE_TYPES}
 # A phone number's characters, and an address with nothing that could end a
-# link or a header early.
+# link or a header early, or add a header or recipient to its mailto: link.
 _PHONE = re.compile(r"^[0-9+\-(). ]+$")
-_EMAIL = re.compile(r"^[^@\s<>()\[\]\"'`,;:\\]+@[^@\s<>()\[\]\"'`,;:\\]+\.[^@\s<>()\[\]\"'`,;:\\.]+$")
+_EMAIL = re.compile(r"^[^@\s<>()\[\]\"'`,;:\\?#%&=]+@[^@\s<>()\[\]\"'`,;:\\?#%&=]+\.[^@\s<>()\[\]\"'`,;:\\?#%&=.]+$")
 
 
 def _apply_rules(card: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -247,6 +247,9 @@ def _apply_rules(card: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any] | 
                 del person["phone"]
             if "email" in person and not _EMAIL.match(person["email"]):
                 del person["email"]
+            # The phone loads photos over https only.
+            if "photo" in person and not _is_https(person["photo"]["url"]):
+                del person["photo"]
     return card
 
 
@@ -262,6 +265,10 @@ def _place_rules(card: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
     places = card["places"]
     if card["type"] == "place":
         card["places"] = places[:1]
+    # The phone loads photos over https only.
+    for place in card["places"]:
+        if "photo" in place and not _is_https(place["photo"]["url"]):
+            del place["photo"]
     route = card.pop("route", None)
     # Only a map carries a route (_TYPE_FIELDS), so this is for maps alone.
     if route is not None:
@@ -517,7 +524,8 @@ def _status_markdown(card: dict[str, Any]) -> list[str]:
         head += f" ({phase})"
     facts = []
     if "progress" in status:
-        facts.append(f"{round(status['progress'] * 100)}%")
+        # Done is complete, as Conduit draws it, whatever was last reported.
+        facts.append(f"{100 if status.get('phase') == 'done' else round(status['progress'] * 100)}%")
     if status.get("eta"):
         facts.append(_escape(status["eta"]))
     if facts:

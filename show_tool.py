@@ -29,14 +29,13 @@ from typing import Any, Callable
 from hermes_constants import get_hermes_home
 
 from . import card_schema, client, reply_sources
-from .present_store import MAX_CARD_MARKDOWN_CHARS, MAX_CARD_TITLE_CHARS, PresentError, PresentStore
+from .present_store import (CHAT_CARDS_FEATURE, MAX_CARD_MARKDOWN_CHARS, MAX_CARD_TITLE_CHARS, PresentError,
+                            PresentStore, clip_markdown)
 
 logger = logging.getLogger("hermes.plugins.conduit_push")
 
 TOOL_NAME = "conduit_show"
 TOOLSET = "conduit"
-
-CHAT_CARDS_FEATURE = "chat-cards"
 
 SCHEMA: dict[str, Any] = {
     "name": TOOL_NAME,
@@ -153,10 +152,12 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
     given_markdown = isinstance(markdown, str) and bool(markdown.strip())
     left_out: list[str] = []
     hidden = {kind for feature, kinds in card_schema.FEATURE_TYPES.items()
-              if any(card["type"] in kinds for card in cards) and not store.has_feature(feature) for kind in kinds}
+              if any(card["type"] in kinds for card in cards) and not store.has_feature_everywhere(feature)
+              for kind in kinds}
     if hidden:
-        # An older Conduit would draw nothing for them; Hermes hears which
-        # ones so it can say what they held.
+        # An older Conduit would draw nothing for them, and the chat keeps
+        # them for whichever of the user's Conduits opens it; Hermes hears
+        # which ones so it can say what they held.
         left_out = list(dict.fromkeys(card["type"] for card in cards if card["type"] in hidden))
         cards = [card for card in cards if card["type"] not in hidden]
         if not cards and not given_markdown:
@@ -190,15 +191,11 @@ def _with_left_out(note: str, left_out: list[str]) -> str:
 
 def _fallback(cards: list[dict[str, Any]]) -> str:
     """The cards' Markdown, cut at a line to fit a card."""
-    text = card_schema.fallback_markdown(cards)
-    if len(text) <= MAX_CARD_MARKDOWN_CHARS:
-        return text
-    cut = text[:MAX_CARD_MARKDOWN_CHARS]
-    return cut[:cut.rfind("\n")] if "\n" in cut else cut
+    return clip_markdown(card_schema.fallback_markdown(cards))
 
 
 def _turn_source() -> str | None:
     try:
-        return reply_sources.turn_source(None, reply_sources.current_transport())
+        return reply_sources.turn_source(reply_sources.current_platform(), reply_sources.current_transport())
     except Exception:  # noqa: BLE001 — a lookup that failed draws no cards
         return "unknown"

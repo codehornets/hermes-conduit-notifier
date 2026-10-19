@@ -23,6 +23,7 @@ the whole thing off for a while.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
 import threading
@@ -159,6 +160,11 @@ class LiveActivityReporter:
         # The relay has no Live Activity route: nothing is sent until then.
         self._paused_until = 0.0
         self._thread: threading.Thread | None = None
+        # stop() (the plugin was unloaded) ends the thread and keeps a new
+        # one from starting until start(); a thread from before a stop()
+        # exits even if start() ran meanwhile.
+        self._stopped = False
+        self._generation = 0
 
     # --- hook-facing ---------------------------------------------------
 
@@ -339,23 +345,45 @@ class LiveActivityReporter:
                 victim = next(key for key in self._turns if key != keep)
             self._turns.pop(victim)
 
+    def start(self) -> None:
+        with self._lock:
+            self._stopped = False
+
+    def stop(self, timeout: float = 1.0) -> None:
+        """Forgets every turn and ends the thread, waiting up to ``timeout``
+        for an update in flight."""
+        with self._lock:
+            self._stopped = True
+            self._generation += 1
+            self._turns.clear()
+            self._ended.clear()
+            thread, self._thread = self._thread, None
+            self._wake.notify_all()
+        if thread is not None:
+            thread.join(timeout)
+
     def _changed(self) -> None:
         # Called with the lock held.
-        if not self._start_thread:
+        if not self._start_thread or self._stopped:
             return
         if self._thread is None:
-            self._thread = threading.Thread(target=self._run, name="conduit-live-activity", daemon=True)
+            # Under the profile whose turn started it (see client.enqueue):
+            # each profile's plugin has its own reporter.
+            self._thread = threading.Thread(target=contextvars.copy_context().run, args=(self._run, self._generation),
+                                            name="conduit-live-activity", daemon=True)
             self._thread.start()
         self._wake.notify()
 
-    def _run(self) -> None:
-        while True:
+    def _run(self, generation: int = 0) -> None:
+        while generation == self._generation:
             try:
                 next_in = self.flush()
             except Exception:  # noqa: BLE001
                 logger.debug("Conduit Live Activity flush failed", exc_info=True)
                 next_in = BACKOFF_S
             with self._lock:
+                if generation != self._generation:
+                    return
                 if not any(turn.dirty for turn in self._turns.values()):
                     self._wake.wait(timeout=IDLE_FORGET_S)
                 elif next_in is not None:

@@ -61,6 +61,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
+from urllib.parse import urlsplit
 
 FILE_NAME = "conduit-phone.sqlite3"
 SCHEMA_VERSION = 2  # 2: alarms and contacts (plugin 0.30.0)
@@ -392,6 +393,21 @@ def _url(value: Any, field: str) -> str | None:
     text = clean_text(value, field, MAX_URL_CHARS)
     if text is not None and " " in text:
         raise PhoneError("malformed", f"{field} must be a URL")
+    return text
+
+
+def _write_url(value: Any, field: str) -> str | None:
+    """A change's link: Conduit keeps only an http or https one and applies
+    the rest of the change without anything else, so it's refused here."""
+    text = _url(value, field)
+    if text is None:
+        return None
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        parts = None
+    if parts is None or parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        raise PhoneError("malformed", f"{field} must be an http or https URL")
     return text
 
 
@@ -1338,7 +1354,16 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
     sent_epoch = int(sent_at.timestamp())
     stale = stored[0] is not None and sent_epoch < stored[0]
 
-    # Sharing turned off: forget what was kept, whatever the batch's age.
+    counts = {"events": 0, "reminders": 0, "deleted": 0}
+    if stale:
+        # An older batch (a retry that arrived late) never undoes a newer
+        # one: it neither widens nor narrows what the newer one said is
+        # shared. The phone resends only what changed, so nothing would put
+        # back what a stale batch took away.
+        db.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
+        return {**counts, "stale": True}
+
+    # Sharing turned off: forget what was kept.
     if sharing["calendar"] != "full":
         db.execute("DELETE FROM events WHERE device=?", (device_id,))
     if sharing["calendar"] == "off":
@@ -1367,14 +1392,6 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
         db.execute("UPDATE devices SET alarms=NULL, alarms_at=NULL WHERE id=?", (device_id,))
     if not sharing["contacts"]:
         db.execute("DELETE FROM contacts WHERE device=?", (device_id,))
-
-    counts = {"events": 0, "reminders": 0, "deleted": 0}
-    if stale:
-        # An older batch (a retry that arrived late) never undoes a newer
-        # one, and never widens what the newer one said is shared; it can
-        # only have narrowed it above, which the next batch restores.
-        db.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
-        return {**counts, "stale": True}
 
     if parsed_calendars is not None:
         db.execute("DELETE FROM calendars WHERE device=?", (device_id,))
@@ -1770,7 +1787,7 @@ def _check_fields(kind: str, fields: dict[str, Any], *, partial: bool) -> dict[s
             raise PhoneError("malformed", f"notes must be text of at most {MAX_NOTES_CHARS} characters")
         clean["notes"] = clean_notes(notes, "notes")
     if "url" in present or not partial:
-        clean["url"] = _url(present.get("url"), "url")
+        clean["url"] = _write_url(present.get("url"), "url")
     if kind.endswith("_event"):
         all_day = _bool(present.get("all_day"), "all_day", None if partial else False)
         if all_day is not None:

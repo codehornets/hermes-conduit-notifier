@@ -71,6 +71,10 @@ def dispatch(args: argparse.Namespace) -> int:
         except ValueError:
             print("Warning: this is not a usable https:// relay URL, so notifications can't be sent. "
                   "Pair again from Conduit, or run `hermes conduit-push unpair`.")
+        if state.get("relay_rejected_at"):
+            print(f"Warning: the relay refused this pairing's credential "
+                  f"(since {_printable(state['relay_rejected_at'])}), so notifications aren't arriving. "
+                  "Conduit removed this gateway or the relay lost its data: pair again from Conduit.")
         print(f"Redact content: {'on' if state.get('redact_content') else 'off'}")
         encryption = e2e_status(state)
         if encryption["enabled"]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import logging
 import threading
@@ -12,9 +13,9 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 
-from . import (call_tool, call_watches, calls, clarify_loop, conduit_first, cron_runs, desktop_selected, health_tool,
-               live_activity, location_tool, maps_tool, phone_tool, present_tool, reply_sources, settings_tool,
-               show_tool)
+from . import (call_tool, call_watches, calls, clarify_loop, client, conduit_first, cron_runs, desktop_selected,
+               health_tool, live_activity, location_tool, maps_tool, phone_tool, present_tool, reply_sources,
+               settings_tool, show_tool)
 from .session_titles import title as _session_title, titled as _titled
 from .client import enqueue
 from .events import approval_decision, clarification_text, event_id, is_silent_response, plain_text, push_event
@@ -47,6 +48,13 @@ PARENT_TURN_MAX_S = 6 * 3600.0
 def register(ctx: Any) -> None:
     global _profile
     _profile = ctx.profile_name
+    # Background work belongs to this load: unloading the plugin (disable,
+    # reload) stops it. A Hermes without on_unload keeps it until exit.
+    client.start()
+    calls.start()
+    live_activity.reporter.start()
+    if hasattr(ctx, "on_unload"):
+        ctx.on_unload(_unload)
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("post_llm_call", _post_llm_call)
     ctx.register_hook("on_session_end", _on_session_end)
@@ -151,7 +159,8 @@ def _post_llm_call(**kwargs: Any) -> None:
     response = kwargs.get("assistant_response")
     if _is_child(session_id):
         return
-    _quietly(live_activity.reporter.turn_ended, session_id, "done")
+    # The Lock Screen's end waits for on_session_end too: this hook also runs
+    # for a failed turn, and the first end the phone gets is the one it keeps.
     started = _take_turn_start(kwargs.get("turn_id"))
     # A cron run says nothing when the user muted its job or it answered
     # [SILENT] by Hermes' cron rule ("[SILENT] No changes" too).
@@ -176,8 +185,9 @@ def _post_llm_call(**kwargs: Any) -> None:
         _finish_ready(session_id, ready, send)
         return
     key = (session_id, turn_id)
-    # A Hermes that never reports the turn's end still gets its reply out.
-    timer = _later(READY_GRACE_S, lambda: _settle_ready(session_id, turn_id, "done"))
+    # A Hermes that never reports the turn's end still gets its reply out,
+    # and its Live Activity ended.
+    timer = _later(READY_GRACE_S, lambda: _turn_end_missed(session_id, turn_id))
     with _pending_lock:
         earlier = _pending_ready.pop(key, None)
         _pending_ready[key] = (ready, send, timer)
@@ -191,6 +201,11 @@ def _post_llm_call(**kwargs: Any) -> None:
     for old_session, (old_ready, old_send, old_timer) in overflow:
         _cancel(old_timer)
         _finish_ready(old_session, old_ready, old_send)
+
+
+def _turn_end_missed(session_id: str, turn_id: str) -> None:
+    if _settle_ready(session_id, turn_id, "done"):
+        _quietly(live_activity.reporter.turn_ended, session_id, "done")
 
 
 def _settle_ready(session_id: str, turn_id: Any, outcome: str) -> bool:
@@ -220,8 +235,25 @@ def _finish_ready(session_id: str, ready: dict[str, Any] | None, send: bool) -> 
         enqueue(ready)
 
 
+def _unload() -> None:
+    """Hermes unloads the plugin: replies held for a turn's end are
+    dropped with their timers, held calls stay stored for the next load, and
+    the delivery and Live Activity threads end (waiting about a second for
+    a send in progress). Nothing more goes to the relay from this load."""
+    with _pending_lock:
+        held = list(_pending_ready.values())
+        _pending_ready.clear()
+    for _ready, _send, timer in held:
+        _cancel(timer)
+    calls.stop()
+    deadline = time.monotonic() + 1.0
+    live_activity.reporter.stop(timeout=max(0.0, deadline - time.monotonic()))
+    client.stop(timeout=max(0.0, deadline - time.monotonic()))
+
+
 def _later(delay: float, work: Any) -> Any:
-    timer = threading.Timer(delay, work)
+    # Under the profile that set the timer (see client.enqueue).
+    timer = threading.Timer(delay, contextvars.copy_context().run, args=(work,))
     timer.daemon = True
     timer.start()
     return timer

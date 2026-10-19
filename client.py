@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import hmac
 import json
@@ -10,12 +11,14 @@ import os
 import queue
 import secrets
 import socket
+import ssl
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 try:
     import fcntl
@@ -38,9 +41,15 @@ DEFAULT_RELAY_URL = "https://push.milim.dev"
 # (no second hand-synchronized constant).
 USER_AGENT = f"Hermes-Conduit-Notifier/{PLUGIN_VERSION}"
 logger = logging.getLogger("hermes.plugins.conduit_push")
-_events: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=128)
+_events: queue.Queue[tuple[contextvars.Context, dict[str, Any]]] = queue.Queue(maxsize=128)
 _worker_started = False
+_worker: threading.Thread | None = None
 _worker_lock = threading.Lock()
+# Set while the plugin is unloaded (stop()): nothing more is queued or sent.
+# A worker from before a stop() exits even when start() ran meanwhile: it
+# belongs to an older generation.
+_stopped = threading.Event()
+_generation = 0
 
 
 def state_path() -> Path:
@@ -108,21 +117,40 @@ def _exclusive(handle: Any) -> Iterator[None]:
 
 def save_state(value: dict[str, Any]) -> None:
     path = state_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with state_file_lock(path):
-        _keep_provisioned_key(value, path)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        # Owner-only from creation: the file holds the relay credential and the
-        # pairing secret, so it's never readable by others, even for a moment
-        # or if the process dies before the rename.
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(value, separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.chmod(0o600)
-        temporary.replace(path)
-        path.chmod(0o600)
+        _write_state(value, path)
+
+
+def update_state(change: Callable[[dict[str, Any]], bool | None]) -> bool:
+    """Change the saved pairing in place: read, ``change`` and write it back
+    under the state lock, so a pairing another process replaced or removed
+    meanwhile is never written over. False when the profile isn't paired or
+    ``change`` returned False (nothing written)."""
+    path = state_path()
+    with state_file_lock(path):
+        state = load_state()
+        if not state or change(state) is False:
+            return False
+        _write_state(state, path)
+    return True
+
+
+def _write_state(value: dict[str, Any], path: Path) -> None:
+    # Callers hold state_file_lock (a second flock of it from the same
+    # process would wait on itself).
+    _keep_provisioned_key(value, path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    # Owner-only from creation: the file holds the relay credential and the
+    # pairing secret, so it's never readable by others, even for a moment
+    # or if the process dies before the rename.
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.chmod(0o600)
+    temporary.replace(path)
+    path.chmod(0o600)
 
 
 def _keep_provisioned_key(value: dict[str, Any], path: Path) -> None:
@@ -184,13 +212,15 @@ def claim_pairing(code: str, relay_url: str = DEFAULT_RELAY_URL, gateway_name: s
         "relay_url": paired_relay_url(body.get("relay_url"), base),
     }
     # Re-pairing over an existing pairing must not silently drop the
-    # profile's privacy choice.
-    previous = load_state() or {}
-    if previous.get("redact_content"):
-        state["redact_content"] = True
-    if previous.get("redact_key"):
-        state["redact_key"] = previous["redact_key"]
-    save_state(state)
+    # profile's privacy choice, even one switched on meanwhile.
+    path = state_path()
+    with state_file_lock(path):
+        previous = load_state() or {}
+        if previous.get("redact_content"):
+            state["redact_content"] = True
+        if previous.get("redact_key"):
+            state["redact_key"] = previous["redact_key"]
+        _write_state(state, path)
     return state
 
 
@@ -228,11 +258,15 @@ def enqueue(event: dict[str, Any]) -> bool:
     on this event, so a drop has to fall back to the native clarify path
     instead of polling an answer that can never arrive.
     """
-    if not load_state():
+    if _stopped.is_set() or not load_state():
         return False
     _start_worker()
     try:
-        _events.put_nowait(event)
+        # Hermes can serve several profiles in one process, each through a
+        # context variable for its home that a new thread doesn't inherit.
+        # The event goes out under the profile that accepted it here: its
+        # pairing, credential and encryption key, not the launch profile's.
+        _events.put_nowait((contextvars.copy_context(), event))
     except queue.Full:
         logger.warning("Conduit notification queue is full; dropping %s", event.get("type", "event"))
         return False
@@ -243,6 +277,10 @@ def send_now(event: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     state = load_state()
     if not state:
         raise RuntimeError("This Hermes profile is not paired with Conduit.")
+    return _send(event, state, timeout)
+
+
+def _send(event: dict[str, Any], state: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     return request_json(
         f"{state['relay_url'].rstrip('/')}/v1/events",
         method="POST",
@@ -257,15 +295,13 @@ def set_redact_content(enabled: bool) -> bool:
 
     Returns False when the profile is not paired (nothing to configure).
     """
-    state = load_state()
-    if not state:
-        return False
-    state["redact_content"] = bool(enabled)
-    if enabled and not state.get("redact_key"):
-        # Local-only key for re-keying event ids; never sent to the relay.
-        state["redact_key"] = secrets.token_hex(32)
-    save_state(state)
-    return True
+    def switch(state: dict[str, Any]) -> None:
+        state["redact_content"] = bool(enabled)
+        if enabled and not state.get("redact_key"):
+            # Local-only key for re-keying event ids; never sent to the relay.
+            state["redact_key"] = secrets.token_hex(32)
+
+    return update_state(switch)
 
 
 def build_outgoing(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
@@ -338,8 +374,21 @@ def _redact_key(state: dict[str, Any]) -> str:
     key = state.get("redact_key")
     if not key:
         key = secrets.token_hex(32)
+
+        def keep(current: dict[str, Any]) -> bool:
+            nonlocal key
+            # Only into the pairing this send read: one replaced or removed
+            # since keeps the key for this send alone.
+            if any(current.get(name) != state.get(name) for name in ("credential", "installation_id", "gateway_id")):
+                return False
+            if current.get("redact_key"):  # another process minted one first
+                key = current["redact_key"]
+                return False
+            current["redact_key"] = key
+            return True
+
+        update_state(keep)
         state["redact_key"] = key
-        save_state(state)
     return str(key)
 
 
@@ -536,22 +585,146 @@ def _request(
 
 
 def _start_worker() -> None:
-    global _worker_started
+    global _worker_started, _worker
     if _worker_started:
         return
     with _worker_lock:
-        if _worker_started:
+        if _worker_started or _stopped.is_set():
             return
-        threading.Thread(target=_delivery_worker, name="conduit-push", daemon=True).start()
+        _worker = threading.Thread(target=_delivery_worker, args=(_generation,), name="conduit-push", daemon=True)
+        _worker.start()
         _worker_started = True
 
 
-def _delivery_worker() -> None:
-    while True:
-        event = _events.get()
+def start() -> None:
+    """Lets events be queued again after stop() (the plugin was enabled
+    again without a fresh import)."""
+    _stopped.clear()
+
+
+def stop(timeout: float = 1.0) -> None:
+    """The plugin is being unloaded: events still queued are dropped, the
+    worker exits after the send in progress (its retries end), and later
+    enqueue() calls are refused. Waits up to ``timeout`` for the worker."""
+    global _worker_started, _worker, _generation
+    with _worker_lock:
+        _stopped.set()
+        _generation += 1
+        running, _worker, _worker_started = _worker, None, False
+        dropped = 0
+        while True:
+            try:
+                _events.get_nowait()
+            except queue.Empty:
+                break
+            _events.task_done()
+            dropped += 1
+        if running is not None:
+            _events.put_nowait(None)  # wakes the worker; the queue was just emptied
+    if dropped:
+        logger.info("Conduit dropped %d queued notification(s): the plugin was unloaded", dropped)
+    if running is not None:
+        running.join(timeout)
+
+
+# A delivery that fails on the way (no connection, a timeout, the relay busy
+# or failing) is sent again. That's safe: the relay keeps each accepted
+# event_id per pairing and answers a repeat as a duplicate, and an event's id
+# stays the same from one send to the next (redaction and encryption re-key it
+# the same way every time). One thread delivers everything, so the retries of
+# one event stop after RETRY_BUDGET seconds instead of holding up the rest.
+RETRY_DELAYS = (1.0, 2.0, 4.0)
+RETRY_BUDGET = 30.0
+
+
+def _delivery_worker(generation: int = 0) -> None:
+    while generation == _generation:
+        item = _events.get()
         try:
-            send_now(event)
-        except Exception as error:
+            if item is None:  # stop()'s wake-up
+                continue
+            if generation != _generation:
+                # Queued for the worker started after a stop(): hand it back.
+                _requeue(item)
+                continue
+            context, event = item
+            context.run(_deliver, event)
+        except Exception as error:  # the worker thread must outlive any one event
             logger.warning("Conduit notification delivery failed for %s: %s", event.get("type", "event"), error)
         finally:
             _events.task_done()
+
+
+def _requeue(item: Any) -> None:
+    try:
+        _events.put_nowait(item)
+    except queue.Full:
+        logger.warning("Conduit notification queue is full; dropping %s", item[1].get("type", "event"))
+
+
+def _pause(seconds: float) -> None:
+    # A stop() ends the wait (and _deliver then gives up).
+    _stopped.wait(seconds)
+
+
+def _deliver(event: dict[str, Any], *, sleep: Callable[[float], None] = _pause,
+             clock: Callable[[], float] = time.monotonic) -> bool:
+    started = clock()
+    for delay in (*RETRY_DELAYS, None):
+        if _stopped.is_set():
+            logger.info("Conduit notification dropped for %s: the plugin was unloaded", event.get("type", "event"))
+            return False
+        state = load_state()
+        if not state:
+            logger.warning("Conduit notification dropped for %s: this profile is no longer paired", event.get("type", "event"))
+            return False
+        try:
+            _send(event, state)
+        except Exception as error:
+            if delay is not None and _worth_retrying(error) and clock() - started + delay <= RETRY_BUDGET:
+                logger.info("Conduit notification delivery for %s will be retried: %s", event.get("type", "event"), error)
+                sleep(delay)
+                continue
+            logger.warning("Conduit notification delivery failed for %s: %s", event.get("type", "event"), error)
+            if isinstance(error, RelayRejected) and error.status == 401:
+                _mark_relay_rejected(state, True)
+            return False
+        if state.get("relay_rejected_at"):
+            _mark_relay_rejected(state, False)
+        return True
+    return False  # not reached: the last attempt has no delay
+
+
+def _worth_retrying(error: Exception) -> bool:
+    if isinstance(error, RelayRejected):
+        # 408/429 and the relay failing; any other answer would be the same.
+        return error.status in (408, 429) or 500 <= error.status <= 599
+    if isinstance(error, urllib.error.URLError):
+        # No connection, DNS, a reset: worth another go. A certificate the
+        # relay's name doesn't match won't fix itself in seconds.
+        return not isinstance(error.reason, ssl.SSLCertVerificationError)
+    return isinstance(error, (TimeoutError, ConnectionError))
+
+
+def _mark_relay_rejected(sent_with: dict[str, Any], rejected: bool) -> None:
+    """Records that the relay refused this pairing's credential (401), or that
+    it accepts it again. A 401 means the relay no longer knows the gateway:
+    the phone removed it, or the relay lost its data. The pairing is kept
+    (it holds the redaction key, and the relay may be restored), but
+    `status` tells the user to pair again. Only the pairing that was used is
+    marked: one replaced or removed meanwhile is left alone."""
+
+    def mark(current: dict[str, Any]) -> bool:
+        if any(current.get(name) != sent_with.get(name) for name in ("credential", "installation_id", "gateway_id")):
+            return False
+        if rejected:
+            if current.get("relay_rejected_at"):
+                return False
+            current["relay_rejected_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            return True
+        return current.pop("relay_rejected_at", None) is not None
+
+    try:
+        update_state(mark)
+    except OSError as error:
+        logger.warning("Conduit could not record the relay's answer for this pairing: %s", error)

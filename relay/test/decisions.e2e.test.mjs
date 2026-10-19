@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { createHash, generateKeyPairSync } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -878,7 +878,10 @@ async function bootFailure(name, extraEnv) {
   });
   let stderr = '';
   child.stderr.on('data', (chunk) => { stderr += chunk; });
+  // A relay that starts anyway fails the test instead of hanging it.
+  const guard = setTimeout(() => child.kill('SIGKILL'), 10_000);
   const code = await new Promise((resolve) => child.once('exit', resolve));
+  clearTimeout(guard);
   return { code, stderr };
 }
 
@@ -894,6 +897,21 @@ test('an invalid TRUST_PROXY stops the relay at boot', async () => {
   const { code, stderr } = await bootFailure('proxy-hops', { TRUST_PROXY: 'yes' });
   assert.notEqual(code, 0);
   assert.match(stderr, /TRUST_PROXY must be the number of reverse proxies/);
+});
+
+// A Compose bind mount Docker created is root's, and the relay runs as node:
+// it would otherwise answer /healthz and fail its first save.
+test('a data directory the relay cannot write stops it at boot', { skip: process.getuid?.() === 0 && 'root can write anywhere' }, async () => {
+  const locked = join(dir, 'locked-data');
+  mkdirSync(locked);
+  chmodSync(locked, 0o555);
+  try {
+    const { code, stderr } = await bootFailure('locked-data', { DATA_PATH: join(locked, 'relay.json') });
+    assert.equal(code, 1);
+    assert.match(stderr, /DATA_PATH directory .*locked-data is not writable/);
+  } finally {
+    chmodSync(locked, 0o755);
+  }
 });
 
 test('a client-sent X-Forwarded-For entry cannot pick its own rate-limit bucket', async () => {
@@ -2305,6 +2323,35 @@ test('encrypted clarify: question ids parked, card flag drives deliverability, s
   assert.equal(plain.status, 200);
   const afterPlain = await api(baseUrl, '/v1/decisions/conduit-push-e2e000000001', { credential: gatewayCredential });
   assert.equal(afterPlain.json.answers.q1, lookalike);
+
+  // An answer the relay can't keep whole is refused, never cut: a cut sealed
+  // answer no longer opens (the plugin would drop the whole poll after the
+  // phone was told "answered"), and a cut plaintext answer isn't what the
+  // user wrote. The question stays open for another try or surface.
+  const parked = await api(baseUrl, '/v1/events', { method: 'POST', credential: gatewayCredential, body: encrypted('conduit-push-e2e000000003', true, 'input:e2e00000000000000000000000000003') });
+  assert.equal(parked.status, 202);
+  const respond = (answer, questionId) => api(baseUrl, '/v1/decisions/conduit-push-e2e000000003/respond', {
+    method: 'POST',
+    credential: deviceCredential,
+    body: { answer, question_id: questionId },
+  });
+  const oversizedSealed = await respond(`e2e1.${kid}.AAAAAAAAAAAAAAAA.${'D'.repeat(11_200)}`, 'q0');
+  assert.equal(oversizedSealed.status, 413);
+  assert.equal(oversizedSealed.json.error, 'answer_too_large');
+  const malformedSealed = await respond(`e2e1.${kid}.AAAAAAAAAAAAAAAA.short`, 'q0');
+  assert.equal(malformedSealed.status, 400);
+  assert.equal(malformedSealed.json.error, 'invalid_answer');
+  const oversizedPlain = await respond(`${'x'.repeat(2000)}y`, 'q1');
+  assert.equal(oversizedPlain.status, 413);
+  assert.equal(oversizedPlain.json.error, 'answer_too_large');
+  const stillOpen = await api(baseUrl, '/v1/decisions/conduit-push-e2e000000003', { credential: gatewayCredential });
+  assert.deepEqual(stillOpen.json.remaining, ['q0', 'q1']);
+  assert.equal(stillOpen.json.answers?.q0, undefined);
+  // At the bound, and with surrounding whitespace trimmed first, it fits.
+  const atBound = await respond(`  ${'x'.repeat(2000)}\n`, 'q1');
+  assert.equal(atBound.status, 200);
+  const afterBound = await api(baseUrl, '/v1/decisions/conduit-push-e2e000000003', { credential: gatewayCredential });
+  assert.equal(afterBound.json.answers.q1, 'x'.repeat(2000));
 
   // The relay advertises the envelope protocol.
   const meta = await api(baseUrl, '/v1/meta', { credential: deviceCredential });

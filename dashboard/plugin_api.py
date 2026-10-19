@@ -123,11 +123,13 @@ SEARCH_MAX_BODY_BYTES = 16 * 1024
 
 
 class TokenError(Exception):
-    """A token request failed. ``status`` is the HTTP status to return to Conduit."""
+    """A token request failed. ``status`` is the HTTP status to return to Conduit;
+    ``code``, when set, is the store's short machine word for the refusal."""
 
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, code: Optional[str] = None) -> None:
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 def _env_value(key: str) -> Optional[str]:
@@ -2760,19 +2762,26 @@ def local_live_key(profile: Optional[str], rotate: bool = False) -> str:
         key = "" if rotate else _local_live_read_key()
         if key:
             return key
-        key = ".".join((LOCAL_LIVE_KEY_PREFIX, _local_live_profile_part(profile), secrets.token_urlsafe(32)))
         path = _local_live_key_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".conduit-local-live-")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"version": 1, "api_key": key, "created_at": int(time.time())}, handle)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise
+        # Another dashboard process on this home (`hermes dashboard` beside the
+        # desktop's `hermes serve`) may be making the first key too: only the
+        # last one written verifies, so the second takes the first's.
+        with _pairing_state_lock(path):
+            key = "" if rotate else _local_live_read_key()
+            if key:
+                return key
+            key = ".".join((LOCAL_LIVE_KEY_PREFIX, _local_live_profile_part(profile), secrets.token_urlsafe(32)))
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".conduit-local-live-")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump({"version": 1, "api_key": key, "created_at": int(time.time())}, handle)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
         # After the replace, so a verify that read the old file can't cache it
         # again (the generation it started under is gone).
         global _local_live_key_generation
@@ -5454,6 +5463,9 @@ def e2e_status(path: Any = None) -> Dict[str, Any]:
         "gateway_id": state.get("gateway_id"),
         "e2e": {"kid": kid} if isinstance(kid, str) and _E2E_KID.match(kid) else None,
         "crypto": crypto,
+        # The relay answered 401 to this pairing's last delivery (client.py):
+        # it no longer knows this gateway, so the phone should pair again.
+        "relay_rejected": bool(state.get("relay_rejected_at")),
     }
 
 
@@ -6229,7 +6241,7 @@ def _health_call(fn: Callable[[Any], Dict[str, Any]]) -> Dict[str, Any]:
     try:
         return fn(module.HealthStore(_calls_home()))
     except module.HealthError as exc:
-        raise TokenError(exc.status, str(exc))
+        raise TokenError(exc.status, str(exc), exc.code)
 
 
 async def _health_route(response: Response, profile: Optional[str], fn: Callable[[], Dict[str, Any]],
@@ -6238,12 +6250,25 @@ async def _health_route(response: Response, profile: Optional[str], fn: Callable
     try:
         return {"ok": True, **(await _run_scoped(profile, fn))}
     except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+        return _store_refusal(exc)
     except HTTPException as exc:
         exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
         raise
     except Exception as exc:
         raise _unexpected(name, exc, feature="Health sync")
+
+
+def _store_refusal(exc: TokenError) -> Any:
+    """A health or location store's refusal: ``detail`` is the message as
+    always, and ``code`` the store's word for it (``unknown_key``,
+    ``bad_seal``, ``too_many_devices``, ``schema``…), so Conduit can tell a
+    lost key from a full host without reading the message."""
+    if not exc.code:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=exc.status,
+                        headers={"Cache-Control": "no-store"})
 
 
 @router.get("/health/status")
@@ -6522,7 +6547,7 @@ def _location_call(fn: Callable[[Any], Dict[str, Any]]) -> Dict[str, Any]:
     try:
         return fn(module.LocationStore(_calls_home()))
     except module.LocationError as exc:
-        raise TokenError(exc.status, str(exc))
+        raise TokenError(exc.status, str(exc), exc.code)
     except sqlite3.DatabaseError:
         logger.warning("conduit_push: location store unreadable", exc_info=True)
         raise TokenError(503, "The location store on this host can't be read")
@@ -6534,7 +6559,7 @@ async def _location_route(response: Response, profile: Optional[str], fn: Callab
     try:
         return {"ok": True, **(await _run_scoped(profile, fn))}
     except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+        return _store_refusal(exc)
     except HTTPException as exc:
         exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
         raise
@@ -6606,8 +6631,11 @@ def _location_remove_rule(rule_id: str) -> Dict[str, Any]:
 @router.get("/location/status")
 async def get_location_status(response: Response, profile: Optional[str] = None,
                               device_id: Optional[str] = None) -> Dict[str, Any]:
+    # `locate` tells Conduit whether conduit_location can ask the phone for a
+    # fresh fix: the same pairing gate as the tool's own (not_paired).
     return await _location_route(response, profile, lambda: _location_call(lambda store: {
-        **store.status(device_id), "crypto": _location_store().crypto_available()}), "status")
+        **store.status(device_id), "crypto": _location_store().crypto_available(),
+        "locate": {"available": _load_pairing_state(_pairing_state_path()) is not None}}), "status")
 
 
 @router.post("/location/key")
@@ -12640,6 +12668,7 @@ ROUTE_CAPABILITIES = (
     "phone-alarms",
     "phone-contacts",
     "location-sync",
+    "location-locate",
     "pairing",
     "self-restart",
     "cron-notifications",
