@@ -126,9 +126,15 @@ cp .env.example .env
 mkdir -p secrets
 cp /path/to/AuthKey_XXXXXX.p8 secrets/apns-production.p8
 
-# 3. Build and run
+# 3. Create the data directory, owned by the image's node user (uid 1000)
+mkdir -p data
+sudo chown 1000:1000 data
+
+# 4. Build and run
 docker compose up -d
 ```
+
+Skip step 3 and Docker creates `data/` owned by root on a Linux host. The relay runs as `node`, can't write there, and exits at startup naming the directory. Docker Desktop on macOS maps ownership through its file sharing, which hides this.
 
 The relay listens on port 9120. Put it behind an HTTPS reverse proxy (the relay validates that `PUBLIC_URL` uses HTTPS). If the proxy sends `X-Forwarded-For`, set `TRUST_PROXY` to the number of proxies in front of the relay (`1` for one): the relay rate-limits by the address the outermost trusted proxy appended, never by an entry the client sent itself. That holds only when every request comes through the proxy, so don't publish port 9120 or share its network with anything else. `APNS_MODE`, `APNS_CAPTURE_PATH` and `APNS_VOIP_FAILURE` are test settings; a relay refuses to start with them.
 
@@ -443,6 +449,11 @@ the FULL batch to Conduit instead of collapsing it to the first question:
   whole clarify) tells Conduit to retire the entire pushed card. An
   unknown qid on a live decision is `400 invalid_question_id`, not a
   missing decision.
+- An answer is kept whole or refused, never cut: plaintext is trimmed and
+  may be up to 2,000 characters, a sealed answer (`e2e1.…`, encrypted
+  pairings) up to 11,000. A longer one is `413 answer_too_large` and the
+  question stays open; a sealed answer too short to hold its tag is
+  `400 invalid_answer`.
 - The structured decision and the notification are independent: when the
   card cannot be delivered (decision_cards disabled, or an oversized batch
   stripped by the APNs size guard, or APNs rejecting the send), the
@@ -1492,6 +1503,7 @@ keep only that field.
   card with the same live name again in the conversation replaces the
   earlier one, on the call screen and in the chat, so Hermes keeps a
   delivery, a score or a job's progress up to date by showing it again.
+  Cards shown beside the earlier one stay.
 - A Conduit says `media-cards` and `live-cards` in its exchange when it
   draws them; the same gating as information cards applies.
 
@@ -1522,6 +1534,11 @@ workouts, body, vitals, fitness), with how far back to start.
   for a device id drops what the earlier key sent (the phone sends it all
   again), so a re-key can't be used to read a phone's data back; the same
   device key again keeps it, since only that phone can use it.
+- **Refusals.** A request the store refuses answers with its HTTP status
+  and `{"detail": "<message>", "code": "<word>"}`. `unknown_key` and
+  `bad_seal` (409) mean this host doesn't have the phone's key (the phone
+  sets up a new one); `too_many_devices` and `schema` (also 409) don't. The
+  location routes answer the same way. Other errors carry only `detail`.
 - **Summaries first.** Conduit sends the hourly and daily totals Apple
   Health computes on the phone (iPhone and Watch already merged), a summary
   per night of sleep, sleep stage segments and workouts. Raw readings go
@@ -1611,7 +1628,8 @@ marked private is reported only as "at a private place".
 - **Stored here only.** The profile's `conduit-location.sqlite3`, mode
   `0600`. History is kept as long as the user picks in Conduit (latest only,
   1, 7 by default, 30 or 365 days). `GET /location/status` reports counts,
-  never locations; `GET /location/reads` lists when the agent read location
+  never locations, and `locate.available` (whether `locate` can reach the
+  phone: this profile is paired for notifications); `GET /location/reads` lists when the agent read location
   (kept 30 days, without the locations); `POST /location/wipe` deletes one
   device's data and key, or everything with `{"all": true}`.
 - **Tool.** `conduit_location` (actions `now`, `locate`, `places`,
@@ -1666,7 +1684,9 @@ carrying `maps: {to, mode}`: Conduit opens Maps at once when the user is in
 that chat with Conduit open, and otherwise shows a Go button and a
 notification, answered by tap or by saying "go" in a call. Conduit says it
 can do this with `features: ["maps-navigate"]` in its present exchange;
-without it the tool returns an Apple Maps link for a text chat.
+without one that said so in the last 30 days the tool returns an Apple Maps
+link for a text chat. Only a Conduit that says so gets the Go prompt, and
+only its answer counts.
 
 The host has no map, so the user's iPhone answers. The tool stores the
 lookup sealed for that one phone (location's key, its own HKDF labels) and
@@ -1895,7 +1915,9 @@ relay key. The host still opens no inbound route.
   Python; if that Python already has `aiortc`, it's used as it is.
   `runtime` reads `ready`, `preparing`, `failed` (with the reason) or
   `missing`, and `engines` in a grant lists `gpt_live` only once it's
-  ready.
+  ready. The helper writes to the plugin from its own thread, so a slow
+  Watch connection never stalls the WebRTC side: past 2 s of model audio
+  waiting, the oldest is dropped, and events are never dropped.
 - **Grok** connects to xAI the way the phone's Grok relay does. Grok sends
   a reply's audio faster than it plays, so the plugin paces it to the Watch
   at real time with a little lead, and drops what's left when the user

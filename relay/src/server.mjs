@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { appendFileSync, chmodSync, readFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { isIP } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { ApnsClient } from './apns.mjs';
@@ -43,6 +44,15 @@ const MAPS_TOKENS_PER_HOUR = 12;
 // headroom for JSON escaping and delivery headers, dropping decision content
 // (not the notification) when a payload would exceed the bound.
 const MAX_NOTIFICATION_BYTES = 3800;
+// Hermes session keys (gateway `build_session_key`, custom API ids up to 256
+// characters) carry the platform's own ids: Matrix `!room:server` and
+// `@user:server`, WhatsApp `…@g.us`, a `main` profile's `agent:main~`. They
+// are opaque routing strings, kept whole: one with a control character or
+// over this many UTF-8 bytes is dropped, never cut (a cut key names another
+// chat, or none). Mirrors the plugin's events.SESSION_KEY_MAX_BYTES; twice
+// Hermes' 256-character cap, and small enough that a routing stub carrying
+// it twice stays under MAX_NOTIFICATION_BYTES.
+export const SESSION_KEY_MAX_BYTES = 512;
 
 // End-to-end encrypted events (#431): the plugin seals the content with a
 // key this relay never sees and sends an `e2e` envelope instead. The relay
@@ -56,6 +66,12 @@ const E2E_MAX_CT_CHARS = 2600;
 export const E2E_ANSWER_PREFIX = 'e2e1.';
 const E2E_MAX_ANSWER_CHARS = 11_000;
 const E2E_ANSWER_PATTERN = new RegExp(`^${E2E_ANSWER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[0-9a-f]{32}\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{22,10900}$`);
+// The sealed answer's header with a ciphertext of any length: an answer of
+// this shape the pattern above refuses is a broken or oversized sealed
+// answer, never plaintext.
+const E2E_ANSWER_SHAPE = new RegExp(`^${E2E_ANSWER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[0-9a-f]{32}\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]+$`);
+// Plaintext clarify answers, in characters (UTF-16 units) after trimming.
+const MAX_ANSWER_CHARS = 2000;
 // Stands in for question text the relay can't read, so a parked batch keeps
 // its qids (the store sanitizer drops questions without text).
 const E2E_QUESTION_PLACEHOLDER = '[encrypted]';
@@ -108,6 +124,7 @@ const DEVICE_TOKEN_REFUSED = new Set(['BadDeviceToken', 'Unregistered', 'DeviceT
 
 function main() {
   config = readConfig();
+  assertDataDirectoryWritable(config.dataPath);
   store = new RelayStore(config.dataPath, config.storeLimits);
   // Accepting an event sweeps expired IDs; this frees them on a quiet relay.
   // Sweeps throttle themselves, so the timer runs just past that interval.
@@ -725,14 +742,7 @@ async function route(request, response) {
     if (!installation) return sendJson(response, 401, { error: 'unauthorized' });
     enforceRateLimit(`decision-respond:${installation.id}`, 30, 60_000);
     const body = await readJson(request);
-    // An encrypted answer is opaque base64url: kept whole (never trimmed or
-    // truncated, which would break it) and only for the strict wire shape.
-    // Anything else, including plaintext that merely starts like one, is an
-    // ordinary answer (the plugin of an encrypted pairing rejects it).
-    const answer = typeof body.answer === 'string' && E2E_ANSWER_PATTERN.test(body.answer) && body.answer.length <= E2E_MAX_ANSWER_CHARS
-      ? body.answer
-      : cleanText(body.answer, 2000);
-    if (!answer) return sendJson(response, 400, { error: 'invalid_answer' });
+    const answer = validAnswer(body.answer);
     // question_id scopes the answer to ONE question of a batch decision
     // (first-answer-wins per qid, other qids stay open); its absence keeps
     // the legacy whole-decision shape for single-question cards.
@@ -1323,7 +1333,7 @@ function validateEvent(body) {
     type: body.type,
     title: cleanText(body.title, 120),
     body: cleanText(body.body, 500),
-    sessionId: cleanIdentifier(body.session_id, 180),
+    sessionId: cleanSessionKey(body.session_id),
     profile: cleanText(body.profile, 80),
     gateway: cleanIdentifier(body.gateway, 80),
     pluginVersion: cleanIdentifier(body.plugin_version, 40),
@@ -1365,7 +1375,7 @@ function validateCall(value) {
   const sessionIds = [];
   for (const item of value.session_ids) {
     // Like the plugin (events.sanitize_call): one malformed id drops the call.
-    const sessionId = typeof item === 'string' && item.length <= 180 ? cleanIdentifier(item, 180) : undefined;
+    const sessionId = cleanSessionKey(item);
     if (!sessionId) return undefined;
     if (!sessionIds.includes(sessionId)) sessionIds.push(sessionId);
   }
@@ -1440,7 +1450,7 @@ function validateDecision(value, eventType) {
   if (!value || typeof value !== 'object') return undefined;
   const kind = cleanText(value.kind, 40);
   if (kind === 'approval' && eventType === 'approval.needed') {
-    const sessionKey = cleanIdentifier(value.session_key, 180);
+    const sessionKey = cleanSessionKey(value.session_key);
     const description = cleanText(value.description, 500);
     if (!sessionKey || !description) return undefined;
     const allowed = new Set(['once', 'session', 'always', 'deny']);
@@ -1507,12 +1517,42 @@ function validatedToken(value, error) {
   return token;
 }
 
+// A clarify answer, kept whole or refused, never cut: a cut sealed answer
+// no longer opens, and a cut plaintext one isn't what the user wrote.
+// - An encrypted answer is opaque base64url, kept whole (never trimmed) and
+//   only for the strict wire shape. One with the sealed header that is too
+//   long is `413 answer_too_large`; one whose ciphertext is too short to
+//   hold its tag is `400 invalid_answer`.
+// - Anything else, including plaintext that merely starts like one, is an
+//   ordinary answer (the plugin of an encrypted pairing rejects it): control
+//   characters become spaces and it is trimmed; over MAX_ANSWER_CHARS it is
+//   `413 answer_too_large`.
+function validAnswer(value) {
+  if (typeof value !== 'string') throw httpError(400, 'invalid_answer');
+  if (E2E_ANSWER_SHAPE.test(value)) {
+    if (E2E_ANSWER_PATTERN.test(value) && value.length <= E2E_MAX_ANSWER_CHARS) return value;
+    // Only the ciphertext's length can fail the pattern here.
+    const tooShort = value.length - value.lastIndexOf('.') - 1 < 22;
+    throw tooShort ? httpError(400, 'invalid_answer') : httpError(413, 'answer_too_large');
+  }
+  const answer = value.replace(/[\u0000-\u001f]/g, ' ').trim();
+  if (!answer) throw httpError(400, 'invalid_answer');
+  if (answer.length > MAX_ANSWER_CHARS) throw httpError(413, 'answer_too_large');
+  return answer;
+}
+
 function cleanText(value, max) {
   return typeof value === 'string' ? value.replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, max) || undefined : undefined;
 }
 
 function cleanIdentifier(value, max) {
   return typeof value === 'string' && /^[A-Za-z0-9:_.\/-]+$/.test(value) ? value.slice(0, max) : undefined;
+}
+
+// A session key, whole, or undefined (see SESSION_KEY_MAX_BYTES).
+function cleanSessionKey(value) {
+  return typeof value === 'string' && value && value.isWellFormed() && !/[\u0000-\u001f\u007f]/.test(value)
+    && Buffer.byteLength(value) <= SESSION_KEY_MAX_BYTES ? value : undefined;
 }
 
 function readJson(request, maxChars = 32_768) {
@@ -1689,6 +1729,23 @@ function readConfig() {
     tokenProof: tokenProofModeFromEnv(process.env),
     ...limitsFromEnv(process.env),
   };
+}
+
+// Loading the store only reads, so a data directory the relay can't write
+// would pass /healthz and fail the first registration instead. A Compose bind
+// mount Docker created itself is root's, while the image runs as node.
+function assertDataDirectoryWritable(dataPath) {
+  const directory = dirname(dataPath);
+  const probe = `${dataPath}.${process.pid}.probe`;
+  try {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(probe, '', { flag: 'wx', mode: 0o600 });
+    unlinkSync(probe);
+  } catch (error) {
+    const uid = process.getuid?.();
+    throw new Error(`DATA_PATH directory ${directory} is not writable${uid === undefined ? '' : ` by uid ${uid}`} (${error?.code ?? error}). `
+      + 'With the Compose file, create it owned by the image\'s node user first: mkdir -p data && sudo chown 1000:1000 data');
+  }
 }
 
 function optionalMilliseconds(name, key) {

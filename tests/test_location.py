@@ -771,10 +771,35 @@ def test_routes_round_trip_and_start_rule_jobs(client):
     assert client.get(f"{BASE}/location/status").json()["stored"] is False
 
 
+def test_status_says_whether_hermes_can_ask_for_a_fresh_position(client, monkeypatch):
+    # Conduit's Location settings read `locate.available` to tell whether
+    # conduit_location's locate can reach this phone; it mirrors locate's own
+    # not_paired gate (background sharing is the phone's own setting).
+    pairing = client.home / "conduit-push.json"
+    monkeypatch.setattr(api, "_pairing_state_path", lambda: pairing)
+    assert client.get(f"{BASE}/location/status").json()["locate"] == {"available": False}
+    pairing.write_text(json.dumps({"credential": "c" * 32, "installation_id": "i" * 16}))
+    assert client.get(f"{BASE}/location/status").json()["locate"] == {"available": True}
+
+
 def test_ingest_refuses_an_oversized_body(client):
     response = client.post(f"{BASE}/location/ingest", content=b"x" * (api.LOCATION_MAX_INGEST_BODY_BYTES + 1),
                            headers={"content-type": "application/json"})
     assert response.status_code == 413
+
+
+def test_a_lost_key_refusal_carries_the_stores_code(client):
+    # Conduit sets up a new key when the host lost its old one; until now it
+    # had only the message to go on, which never named the code.
+    phone = Phone()
+    phone.accept(client.post(f"{BASE}/location/key", json=phone.key_request()).json())
+    sealed = phone.seal(phone.batch(fix=fix()))
+    for envelope, code in (({**sealed, "kid": "f" * 32}, "unknown_key"),
+                           ({**sealed, "batch_id": "batch-999999"}, "bad_seal")):
+        response = client.post(f"{BASE}/location/ingest", json=envelope)
+        assert response.status_code == 409 and response.headers["cache-control"] == "no-store"
+        body = response.json()
+        assert body["code"] == code and body["detail"] and code not in body["detail"]
 
 
 def test_a_rule_deleted_meanwhile_isnt_brought_back(store):

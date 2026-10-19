@@ -190,9 +190,9 @@ MEDIA_TYPES = ("media", "contact")
 LIVE_TYPES = ("status",)
 FEATURE_TYPES = {"info-cards": INFO_TYPES, "media-cards": MEDIA_TYPES, "live-cards": LIVE_TYPES}
 # A phone number's characters, and an address with nothing that could end a
-# link or a header early.
+# link or a header early, or add a header or recipient to its mailto: link.
 _PHONE = re.compile(r"^[0-9+\-(). ]+$")
-_EMAIL = re.compile(r"^[^@\s<>()\[\]\"'`,;:\\]+@[^@\s<>()\[\]\"'`,;:\\]+\.[^@\s<>()\[\]\"'`,;:\\.]+$")
+_EMAIL = re.compile(r"^[^@\s<>()\[\]\"'`,;:\\?#%&=]+@[^@\s<>()\[\]\"'`,;:\\?#%&=]+\.[^@\s<>()\[\]\"'`,;:\\?#%&=.]+$")
 
 
 def _apply_rules(card: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -524,7 +524,8 @@ def _status_markdown(card: dict[str, Any]) -> list[str]:
         head += f" ({phase})"
     facts = []
     if "progress" in status:
-        facts.append(f"{round(status['progress'] * 100)}%")
+        # Done is complete, as Conduit draws it, whatever was last reported.
+        facts.append(f"{100 if status.get('phase') == 'done' else round(status['progress'] * 100)}%")
     if status.get("eta"):
         facts.append(_escape(status["eta"]))
     if facts:
