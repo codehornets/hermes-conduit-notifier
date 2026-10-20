@@ -754,14 +754,14 @@ def _report(args: dict[str, Any], session_id: Any, task_id: Any = None) -> dict[
         "found in a few short lines: the call opens on it. Don't say the phone is ringing.")}
 
 
-def _cron_job_of(session_id: Any) -> str | None:
-    match = _CRON_SESSION.match(session_id.strip()) if isinstance(session_id, str) else None
-    return match.group("job") if match else None
+def _cron_job_of(session_id: Any, task_id: Any = None) -> str | None:
+    # A gateway-owned run names its job only in the task id.
+    return cron_runs.job_id(session_id, task_id)
 
 
-def is_watch_run(session_id: Any) -> bool:
-    """Whether ``session_id`` is a run of a watch this module set up."""
-    job_id = _cron_job_of(session_id)
+def is_watch_run(session_id: Any, task_id: Any = None) -> bool:
+    """Whether ``session_id`` (or ``task_id``) is a run of a watch this module set up."""
+    job_id = _cron_job_of(session_id, task_id)
     if job_id is None:
         return False
     try:
