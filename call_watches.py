@@ -40,7 +40,7 @@ from typing import Any, Callable, Iterator
 
 from hermes_constants import get_hermes_home
 
-from . import calls, client
+from . import calls, client, cron_runs
 from .calls_store import _exclusive
 
 logger = logging.getLogger("hermes.plugins.conduit_push")
@@ -65,8 +65,6 @@ EVERY_BOUNDS = (5, 24 * 60)
 # An incident no run has seen for this long (and three checks) starts over.
 STALE_S = 30 * 60
 _HOURS = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*(?:-|–|—|to)\s*(\d{1,2}):(\d{2})\s*$")
-# A cron run's session: cron_<job id>_<YYYYmmdd>_<HHMMSS> (cron/scheduler.py).
-_CRON_SESSION = re.compile(r"^cron_(?P<job>[A-Za-z0-9-]+)_\d{8}_\d{6}$")
 _thread_lock = threading.Lock()
 _setup_thread_lock = threading.Lock()
 # What the store keeps of a watch.
@@ -170,8 +168,8 @@ def register(ctx: Any, *, is_child: Callable[[Any], bool] = lambda _: False) -> 
     if not hasattr(ctx, "register_tool"):
         return
 
-    def _setup_handler(args: Any, session_id: Any = None, **_: Any) -> str:
-        return setup(args, session_id=session_id, is_child=is_child)
+    def _setup_handler(args: Any, session_id: Any = None, task_id: Any = None, **_: Any) -> str:
+        return setup(args, session_id=session_id, task_id=task_id, is_child=is_child)
 
     for name, schema, handler, check, emoji in (
         (SETUP_TOOL, SETUP_SCHEMA, _setup_handler, setup_available, "⏰"),
@@ -187,8 +185,8 @@ def register(ctx: Any, *, is_child: Callable[[Any], bool] = lambda _: False) -> 
             logger.warning("conduit_push: could not register %s", name, exc_info=True)
 
 
-def _report_handler(args: Any, session_id: Any = None, **_: Any) -> str:
-    return report(args, session_id=session_id)
+def _report_handler(args: Any, session_id: Any = None, task_id: Any = None, **_: Any) -> str:
+    return report(args, session_id=session_id, task_id=task_id)
 
 
 # Hermes caches a tool's availability for the whole process for a while,
@@ -245,9 +243,10 @@ class JobsUnavailable(Exception):
     """Hermes couldn't list its scheduled jobs."""
 
 
-def setup(args: Any, *, session_id: Any = None, is_child: Callable[[Any], bool] = lambda _: False) -> str:
+def setup(args: Any, *, session_id: Any = None, task_id: Any = None,
+          is_child: Callable[[Any], bool] = lambda _: False) -> str:
     try:
-        return _answer(**_setup(args if isinstance(args, dict) else {}, session_id, is_child))
+        return _answer(**_setup(args if isinstance(args, dict) else {}, session_id, is_child, task_id=task_id))
     except JobsUnavailable as error:
         return _answer(ok=False, error="unavailable",
                        note=f"The scheduled jobs couldn't be read ({error}), so nothing was changed. Tell the user.")
@@ -257,8 +256,9 @@ def setup(args: Any, *, session_id: Any = None, is_child: Callable[[Any], bool] 
                        note="The call watches couldn't be changed. Tell the user in your reply.")
 
 
-def _setup(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], bool] = lambda _: False) -> dict[str, Any]:
-    if _cron_job_of(session_id) is not None:
+def _setup(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], bool] = lambda _: False,
+           task_id: Any = None) -> dict[str, Any]:
+    if _cron_job_of(session_id, task_id) is not None:
         return {"ok": False, "error": "in_a_run",
                 "note": f"A scheduled run can't set up call watches. In a call watch's run, report with {REPORT_TOOL}."}
     action = str(args.get("action") or "").strip().lower()
@@ -679,9 +679,9 @@ def _minutes(value: Any, default: int) -> int | None:
 # --- Reporting from a run -------------------------------------------------------------
 
 
-def report(args: Any, *, session_id: Any = None) -> str:
+def report(args: Any, *, session_id: Any = None, task_id: Any = None) -> str:
     try:
-        return _answer(**_report(args if isinstance(args, dict) else {}, session_id))
+        return _answer(**_report(args if isinstance(args, dict) else {}, session_id, task_id))
     except Exception:  # noqa: BLE001 — a tool must never raise
         logger.warning("%s failed", REPORT_TOOL, exc_info=True)
         return _answer(ok=False, error="unavailable", reply="[SILENT]",
@@ -691,8 +691,8 @@ def report(args: Any, *, session_id: Any = None) -> str:
 SILENT = "Reply with exactly [SILENT] and nothing else: it tells Hermes there's nothing to send."
 
 
-def _report(args: dict[str, Any], session_id: Any) -> dict[str, Any]:
-    job_id = _cron_job_of(session_id)
+def _report(args: dict[str, Any], session_id: Any, task_id: Any = None) -> dict[str, Any]:
+    job_id = _cron_job_of(session_id, task_id)
     if job_id is None:
         return {"ok": False, "error": "not_a_watch_run",
                 "note": f"{REPORT_TOOL} is only for a run of a call watch. To set one up, use {SETUP_TOOL}."}
