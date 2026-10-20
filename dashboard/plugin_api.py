@@ -7118,7 +7118,7 @@ def voice_tools_call(envelope: Any) -> Dict[str, Any]:
     try:
         device_id, request, seal_answer = store.open_voice_request(envelope)
     except error_class as exc:
-        raise TokenError(exc.status, str(exc)) from exc
+        raise TokenError(exc.status, str(exc), exc.code) from exc
     provider = request.get("provider")
     provider = provider if isinstance(provider, str) and _VOICE_PROVIDER.fullmatch(provider) else "voice"
     args = request.get("args")
@@ -7137,7 +7137,7 @@ def _phone_voice_call(envelope: Dict[str, Any]) -> Dict[str, Any]:
     try:
         device_id, request, seal_answer = store.open_voice_request(envelope)
     except phone.PhoneError as exc:
-        raise TokenError(exc.status, str(exc)) from exc
+        raise TokenError(exc.status, str(exc), exc.code) from exc
     name = request.get("tool")
     if name not in phone.VOICE_TOOLS:
         raise TokenError(404, "This host has no voice tool by that name")
@@ -7161,7 +7161,7 @@ async def _voice_tools_route(response: Response, profile: Optional[str], fn: Cal
         raise HTTPException(status_code=504, detail=f"Voice tools {name} timed out",
                             headers={"Cache-Control": "no-store"})
     except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+        return _store_refusal(exc)
     except HTTPException as exc:
         exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
         raise
@@ -7467,7 +7467,7 @@ def _phone_call(fn: Callable[[Any], Dict[str, Any]]) -> Dict[str, Any]:
     try:
         return fn(module.PhoneStore(_calls_home()))
     except module.PhoneError as exc:
-        raise TokenError(exc.status, str(exc))
+        raise TokenError(exc.status, str(exc), exc.code)
 
 
 async def _phone_route(response: Response, profile: Optional[str], fn: Callable[[], Dict[str, Any]],
@@ -7476,7 +7476,7 @@ async def _phone_route(response: Response, profile: Optional[str], fn: Callable[
     try:
         return {"ok": True, **(await _run_scoped(profile, fn))}
     except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+        return _store_refusal(exc)
     except HTTPException as exc:
         exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
         raise
