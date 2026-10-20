@@ -117,6 +117,10 @@ class FakeSessionDB:
         if self.store.sessions[session_id]["end_reason"] == "compression":
             raise CompressionSessionClosedError(session_id)
 
+    def has_platform_message_id(self, session_id, platform_message_id):
+        return any(m.get("platform_message_id") == platform_message_id
+                   for m in self.store.messages.get(session_id, []))
+
     def append_message(self, session_id, role, content=None, timestamp=None, **kwargs):
         self._check(session_id)
         self.store.messages[session_id].append({"role": role, "content": content, "timestamp": timestamp})
@@ -742,8 +746,10 @@ def test_an_attached_call_ends_without_ending_the_chat(hermes, lifecycle):
 def test_a_save_with_new_turns_ends_the_call(client, hermes):
     session_id = save(client, engine="gpt-live", turns=turns(("user", "hi"), ("assistant", "hello"))).json()["session_id"]
     assert hermes.ends == [(None, session_id, "gpt-live", [
-        {"role": "user", "content": "hi", "timestamp": 1_780_000_000},
-        {"role": "assistant", "content": "hello", "timestamp": 1_780_000_001}])]
+        {"role": "user", "content": "hi", "timestamp": 1_780_000_000,
+         "platform_message_id": "conduit-voice:call-1:0"},
+        {"role": "assistant", "content": "hello", "timestamp": 1_780_000_001,
+         "platform_message_id": "conduit-voice:call-1:1"}])]
 
 
 def test_a_replayed_save_ends_nothing_twice(client, hermes):
@@ -752,6 +758,81 @@ def test_a_replayed_save_ends_nothing_twice(client, hermes):
     save(client, turns=turns(("user", "a")))
     save(client, session_id=first["session_id"], turns=turns(("user", "a")))
     assert len(hermes.ends) == 1
+
+
+def _lose_the_watermark(hermes, session_id, before):
+    """What a save that died after its append, before its watermark write,
+    leaves behind: the turns stored, the watermark and the end not."""
+    meta = hermes.stores["default"].meta
+    key = api.VOICE_CALLS_KEY.format(session_id=session_id)
+    if before is None:
+        meta.pop(key, None)
+    else:
+        meta[key] = before
+    hermes.ends.clear()
+
+
+def test_a_retry_after_a_lost_watermark_doesnt_store_its_turns_twice(client, hermes):
+    session_id = save(client, turns=turns(("user", "a"))).json()["session_id"]
+    meta = hermes.stores["default"].meta
+    before = meta[api.VOICE_CALLS_KEY.format(session_id=session_id)]
+    second = turns(("user", "b"), ("assistant", "c"), start=1)
+    save(client, session_id=session_id, turns=second)
+    _lose_the_watermark(hermes, session_id, before)
+    retried = save(client, session_id=session_id, turns=second)
+    assert retried.status_code == 200
+    assert retried.json() == {"ok": True, "session_id": session_id, "written": 3, "appended": 0,
+                              "skipped": 2, "created": False}
+    stored = hermes.stores["default"].messages[session_id]
+    assert [m["content"] for m in stored] == ["a", "b", "c"]
+    assert json.loads(meta[api.VOICE_CALLS_KEY.format(session_id=session_id)]) == {"call-1": 2}
+    # The attempt that stored them died before its end: the retry ends the call.
+    assert [[m["content"] for m in end[3]] for end in hermes.ends] == [["b", "c"]]
+    # And the next save continues after them.
+    assert save(client, session_id=session_id, turns=turns(("user", "d"), start=3)).json()["appended"] == 1
+
+
+def test_a_retry_carrying_more_turns_appends_only_the_new_ones(client, hermes):
+    # The attempt that died stored turn 1; the retry also carries turn 2 (the
+    # outbox merged a later flush into it).
+    session_id = save(client, turns=turns(("user", "a"))).json()["session_id"]
+    before = hermes.stores["default"].meta[api.VOICE_CALLS_KEY.format(session_id=session_id)]
+    stored = hermes.stores["default"].messages[session_id]
+    stored.append({"role": "user", "content": "b", "timestamp": 1_780_000_000,
+                   "platform_message_id": "conduit-voice:call-1:1"})
+    _lose_the_watermark(hermes, session_id, before)
+    retried = save(client, session_id=session_id, turns=turns(("user", "b"), ("assistant", "c"), start=1)).json()
+    assert (retried["written"], retried["appended"], retried["skipped"]) == (3, 1, 1)
+    assert [m["content"] for m in stored] == ["a", "b", "c"]
+    assert [[m["content"] for m in end[3]] for end in hermes.ends] == [["b", "c"]]
+
+
+def test_a_retried_create_after_a_lost_watermark_keeps_one_copy(client, hermes):
+    first = turns(("user", "a"), ("assistant", "b"))
+    session_id = save(client, turns=first).json()["session_id"]
+    _lose_the_watermark(hermes, session_id, None)
+    retried = save(client, turns=first).json()
+    assert retried["session_id"] == session_id and retried["appended"] == 0 and retried["written"] == 2
+    assert [m["content"] for m in hermes.stores["default"].messages[session_id]] == ["a", "b"]
+    assert len(hermes.ends) == 1
+
+
+def test_an_older_hermes_without_the_receipt_lookup_keeps_the_old_behavior(client, hermes, monkeypatch):
+    monkeypatch.delattr(FakeSessionDB, "has_platform_message_id")
+    session_id = save(client, turns=turns(("user", "a"))).json()["session_id"]
+    _lose_the_watermark(hermes, session_id, None)
+    retried = save(client, session_id=session_id, turns=turns(("user", "a"))).json()
+    assert retried["appended"] == 1
+    assert [m["content"] for m in hermes.stores["default"].messages[session_id]] == ["a", "a"]
+
+
+def test_a_hermes_that_only_appends_a_row_at_a_time_stores_no_receipt(client, hermes, monkeypatch):
+    # append_message drops platform_message_id, so the lookup never finds
+    # one and a retry after a lost watermark writes its turns again.
+    monkeypatch.delattr(FakeSessionDB, "append_messages_batch")
+    session_id = save(client, turns=turns(("user", "a"))).json()["session_id"]
+    _lose_the_watermark(hermes, session_id, None)
+    assert save(client, session_id=session_id, turns=turns(("user", "a"))).json()["appended"] == 1
 
 
 def test_nothing_saved_ends_nothing(client, hermes):
