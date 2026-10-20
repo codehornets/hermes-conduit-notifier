@@ -1021,3 +1021,15 @@ def test_a_damaged_location_store_hides_only_location_from_the_voice_list(voice,
     response = client.get(f"{BASE}/voice-tools")
     assert response.status_code == 200
     assert [item["name"] for item in response.json()["tools"]] == ["conduit_health"]
+
+
+def test_a_local_live_read_is_logged_as_a_local_live_call():
+    logged = []
+
+    class Store:
+        def log_read(self, action, session, title):
+            logged.append((action, session, title))
+
+    tool._log_voice(Store(), "now", "local-live")
+    tool._log_voice(Store(), "now", "something-new")
+    assert logged == [("now", "", "Local Live call"), ("now", "", "Voice call")]
