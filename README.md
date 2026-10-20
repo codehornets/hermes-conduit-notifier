@@ -1807,7 +1807,10 @@ marked private is reported only as "at a private place".
   never locations, and `locate.available` (whether `locate` can reach the
   phone: this profile is paired for notifications); `GET /location/reads` lists when the agent read location
   (kept 30 days, without the locations); `POST /location/wipe` deletes one
-  device's data and key, or everything with `{"all": true}`.
+  device's data and key, or everything with `{"all": true}`. A new device
+  key for a device id (a reinstall, sharing turned off and on, a new
+  pairing) drops that device's fixes, visits and saved places; the phone
+  sends its places again with the new key.
 - **Tool.** `conduit_location` (actions `now`, `locate`, `places`,
   `history`, `distance_to`, `rules`, `set_rule`, `remove_rule`) with its
   skill `conduit_push:using-location`. It answers "paused" or "off" when the
@@ -1921,7 +1924,14 @@ whether notes and attendees are included (off by default).
   emails without that switch, no events at all when the calendar is
   "add only" (write-only) or off, and status or Focus forgotten as soon as
   either is turned off. Only the shared window is kept (past days to
-  future days), status and Focus are the latest value only.
+  future days); a batch whose events leave out the range stays inside the
+  last one shared. `calendars` is the user's current selection, replaced
+  whole: events and reminders on a calendar or list it leaves out are
+  deleted. Status and Focus are the latest value only. A batch, status or
+  Focus time more than 5 minutes ahead of this host's clock is refused
+  with code `clock_skew`, so a future-dated batch can't make the real ones
+  after it (a sharing change included) look out of date. What a refused
+  batch turns off is still forgotten.
 - **Writes are changes the phone applies.** Hermes can't touch the phone's
   calendar, so `conduit_calendar`'s write actions queue a pending change.
   The plugin nudges the phone with a `phone.changes` relay event (sealed

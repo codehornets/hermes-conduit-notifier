@@ -340,10 +340,10 @@ def test_details_off_drops_notes_attendees_and_links_even_when_sent(store, iphon
 
 def test_attendee_emails_off_keeps_names_only(store, iphone):
     store.ingest(iphone.seal(_batch()))
-    store.ingest(iphone.seal({"batch_id": "batch-0002", "sent_at": "2026-10-14T08:05:00+01:00",
+    store.ingest(iphone.seal({"batch_id": "batch-0002", "sent_at": "2026-10-14T08:03:00+01:00",
                               "sharing": _sharing(attendee_emails=False)}))
     assert _events(store)["e_dentist"]["attendees"] == [{"name": "Sam", "status": "accepted", "role": "required"}]
-    store.ingest(iphone.seal(_batch("batch-0003", sent_at="2026-10-14T08:06:00+01:00",
+    store.ingest(iphone.seal(_batch("batch-0003", sent_at="2026-10-14T08:04:00+01:00",
                                     sharing=_sharing(attendee_emails=False))))
     assert "sam@example.com" not in json.dumps(_events(store))
 
@@ -396,7 +396,7 @@ def test_status_keeps_only_the_newest_reading(store, iphone):
 def test_a_diff_upserts_and_deletes_and_a_full_sync_replaces(store, iphone):
     store.ingest(iphone.seal(_batch()))
     result = store.ingest(iphone.seal({
-        "batch_id": "batch-0002", "sent_at": "2026-10-14T08:05:00+01:00", "sharing": _sharing(),
+        "batch_id": "batch-0002", "sent_at": "2026-10-14T08:03:00+01:00", "sharing": _sharing(),
         "events": {"full": False, "upsert": [_event(title="Dentist (moved)", start="2026-10-17T15:00:00+01:00",
                                                     end="2026-10-17T16:00:00+01:00")],
                    "delete": ["e_lunch", "e_unknown"]},
@@ -407,7 +407,7 @@ def test_a_diff_upserts_and_deletes_and_a_full_sync_replaces(store, iphone):
     assert len(events) == 4
     # A full sync is the whole window: anything it doesn't name goes.
     store.ingest(iphone.seal({
-        "batch_id": "batch-0003", "sent_at": "2026-10-14T08:10:00+01:00", "sharing": _sharing(),
+        "batch_id": "batch-0003", "sent_at": "2026-10-14T08:05:00+01:00", "sharing": _sharing(),
         "events": {"full": True, "from": "2026-10-07T00:00:00+01:00", "to": "2026-12-13T00:00:00+00:00",
                    "upsert": [_event("e_new", title="New thing")]},
         "reminders": {"full": True, "upsert": []}}))
@@ -422,6 +422,81 @@ def test_only_the_window_is_kept(store, iphone):
         "events": {"full": False, "from": "2026-10-15T00:00:00+01:00", "to": "2026-12-14T00:00:00+00:00",
                    "upsert": []}}))
     assert list(_events(store)) == ["e_dentist"]
+
+
+def test_a_diff_without_a_range_stays_in_the_shared_window(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    store.ingest(iphone.seal({
+        "batch_id": "batch-0002", "sent_at": "2026-10-14T08:03:00+01:00", "sharing": _sharing(),
+        "events": {"full": False, "upsert": [
+            _event("e_far", title="Far off", start="2027-03-01T10:00:00+00:00", end="2027-03-01T11:00:00+00:00"),
+            _event("e_old", title="Long ago", start="2026-09-01T10:00:00+01:00", end="2026-09-01T11:00:00+01:00"),
+            _event("e_soon", title="Soon", start="2026-10-20T10:00:00+01:00", end="2026-10-20T11:00:00+01:00")]}}))
+    events = _events(store)
+    assert "e_soon" in events and "e_far" not in events and "e_old" not in events
+
+
+def test_unselecting_a_calendar_or_list_forgets_its_items(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    batch = _batch()
+    calendars = [entry for entry in batch["calendars"] if entry["id"] not in ("c_family", "l_groceries")]
+    result = store.ingest(iphone.seal({"batch_id": "batch-0002", "sent_at": "2026-10-14T08:03:00+01:00",
+                                       "sharing": _sharing(), "calendars": calendars}))
+    assert result["deleted"] == 2
+    assert "e_standup" not in _events(store)
+    with store.reader("reminders") as (db, device):
+        assert {row[0] for row in db.execute("SELECT id FROM reminders WHERE device=?", (device["id"],))} \
+            == {"r_tax", "r_done"}
+    # Every list unselected: no reminder is left.
+    calendars = [entry for entry in calendars if entry["kind"] == "event"]
+    store.ingest(iphone.seal({"batch_id": "batch-0003", "sent_at": "2026-10-14T08:04:00+01:00",
+                              "sharing": _sharing(), "calendars": calendars}))
+    assert store.status(DEVICE)["device"]["counts"]["reminders"] == 0
+
+
+def test_a_refused_batch_narrows_from_nothing_stored_to_nothing():
+    narrowed = phone._narrowed(None, phone._parse_sharing(_sharing()))
+    assert narrowed["calendar"] == "off" and narrowed["future_days"] == 0
+    assert not any(value for value in narrowed.values() if isinstance(value, bool))
+    assert phone._narrowed({"reminders": True}, phone._parse_sharing(_sharing()))["calendar"] == "off"
+
+
+def test_a_future_batch_is_refused_and_cant_hold_off_a_revocation(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    with pytest.raises(phone.PhoneError) as error:
+        store.ingest(iphone.seal(_batch("batch-0002", sent_at="2026-10-14T08:06:00+01:00")))
+    assert error.value.code == "clock_skew"
+    assert store.status(DEVICE)["device"]["counts"]["events"] == 5
+    batch = _batch("batch-0002", sent_at="2026-10-14T08:01:00+01:00")
+    batch["status"]["at"] = "2026-10-14T08:06:00+01:00"
+    with pytest.raises(phone.PhoneError) as error:
+        store.ingest(iphone.seal(batch))
+    assert error.value.code == "clock_skew"
+    # Refused, but what it turns off is forgotten all the same.
+    with pytest.raises(phone.PhoneError) as error:
+        store.ingest(iphone.seal(_batch("batch-0002", sent_at="2026-10-14T08:30:00+01:00",
+                                        sharing=_sharing(reminders=False))))
+    assert error.value.code == "clock_skew"
+    assert store.status(DEVICE)["device"]["counts"]["reminders"] == 0
+    assert store.status(DEVICE)["device"]["counts"]["events"] == 5
+    # It can't widen anything: only the narrower of the two is kept.
+    with store._write() as db:
+        kept = json.loads(db.execute("SELECT sharing FROM devices").fetchone()[0])
+    assert kept["reminders"] is False and kept["calendar"] == "full"
+    with pytest.raises(phone.PhoneError):
+        store.ingest(iphone.seal(_batch("batch-0003", sent_at="2026-10-14T08:30:00+01:00",
+                                        sharing=_sharing(reminders=True, calendar="write_only"))))
+    with store._write() as db:
+        kept = json.loads(db.execute("SELECT sharing FROM devices").fetchone()[0])
+    assert kept["reminders"] is False and kept["calendar"] == "write_only"
+    # A watermark stored before the limit (a day ahead) doesn't make the
+    # real batches after it look stale.
+    with store._write() as db:
+        db.execute("UPDATE devices SET last_sent=?", (NOW + 20 * 3600,))
+    result = store.ingest(iphone.seal(_batch("batch-0003", sent_at="2026-10-14T08:01:00+01:00",
+                                             sharing=_sharing(calendar="off"))))
+    assert not result.get("stale")
+    assert store.status(DEVICE)["device"]["counts"]["events"] == 0
 
 
 def test_event_search_folds_non_ascii(store, iphone):

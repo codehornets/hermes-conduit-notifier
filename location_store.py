@@ -476,8 +476,9 @@ class LocationStore:
     def register_key(self, body: Any) -> dict[str, Any]:
         """A device's X25519 public key in, this profile's for that device
         out. Replaces the device's earlier key (the phone re-keys after a
-        reinstall or when the user turns sharing off and on). Registering
-        the same device key keeps its latest fix and batch watermark."""
+        reinstall or when the user turns sharing off and on) and forgets
+        what the old key sent. Registering the same device key keeps its
+        latest fix and batch watermark."""
         if not isinstance(body, dict):
             raise LocationError("malformed", "Expected a JSON object")
         device_id = body.get("device_id")
@@ -510,10 +511,17 @@ class LocationStore:
                 " last_sent=CASE WHEN devices.device_public=excluded.device_public THEN devices.last_sent END",
                 (device_id, name, device_public, host_private, host_public, kid, now),
             )
-            # A new key means a reinstall or sharing turned off and on: what
-            # this device said before is no longer where the user is.
+            # A new key means a reinstall, sharing turned off and on, or a
+            # new pairing: nothing the old key sent carries over to it. The
+            # phone sends its saved places again with the new key. Its
+            # sharing stays until then (its maps choice counts meanwhile), and
+            # maps rows keep counting against the budget, emptied and closed.
             if known and bytes(known[0]) != device_public:
-                db.execute("DELETE FROM fixes WHERE device=?", (device_id,))
+                for table in ("fixes", "visits", "places"):
+                    db.execute(f"DELETE FROM {table} WHERE device=?", (device_id,))
+                db.execute("UPDATE maps SET cache='', request='', answer=NULL,"
+                           " answered_at=COALESCE(answered_at, ?) WHERE device=?", (now, device_id))
+                db.execute("UPDATE devices SET last_sent=NULL WHERE id=?", (device_id,))
             generation = _meta(db, "generation")
         return {"kid": kid, "host_public_key": b64u(host_public), "generation": generation}
 

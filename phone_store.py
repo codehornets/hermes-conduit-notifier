@@ -153,6 +153,8 @@ MAX_VALUE_LABEL_CHARS = 30
 # Finished changes stay this long so the agent can see how they went.
 FINISHED_KEPT_S = 30 * 24 * 3600
 MAX_WINDOW_DAYS = 400
+# How far ahead of this host's clock a batch's sent_at may be.
+MAX_CLOCK_SKEW_S = 5 * 60
 EARLIEST = datetime(2000, 1, 1, tzinfo=timezone.utc)
 LATEST = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
@@ -654,11 +656,33 @@ class PhoneStore:
                 raise PhoneError("malformed", "The sealed batch isn't JSON") from None
             if not isinstance(batch, dict) or batch.get("batch_id") != batch_id:
                 raise PhoneError("malformed", "The sealed batch doesn't match its envelope")
-            result = _apply(db, device_id, batch, now)
-            _expire(db, now)
-            result["pending"] = db.execute("SELECT COUNT(*) FROM changes WHERE device=? AND state='pending'",
-                                           (device_id,)).fetchone()[0]
-            generation = _meta(db, "generation")
+            try:
+                result = _apply(db, device_id, batch, now)
+            except PhoneError as error:
+                if error.code != "clock_skew":
+                    raise
+                # Refused, but what it turns off still goes (committed below):
+                # a phone whose clock runs fast can always take sharing back.
+                skewed = error
+                try:
+                    sharing = _parse_sharing(batch.get("sharing"))
+                except PhoneError:
+                    sharing = None
+                if sharing is not None:
+                    stored = db.execute("SELECT sharing FROM devices WHERE id=?", (device_id,)).fetchone()
+                    sharing = _narrowed(_decode(stored[0], None) if stored else None, sharing)
+                    _forget_unshared(db, device_id, sharing)
+                    db.execute("UPDATE devices SET sharing=? WHERE id=?", (json.dumps(sharing), device_id))
+                db.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
+                _expire(db, now)
+            else:
+                skewed = None
+                _expire(db, now)
+                result["pending"] = db.execute("SELECT COUNT(*) FROM changes WHERE device=? AND state='pending'",
+                                               (device_id,)).fetchone()[0]
+                generation = _meta(db, "generation")
+        if skewed is not None:
+            raise skewed
         return {**result, "generation": generation}
 
     # Exchange --------------------------------------------------------------------
@@ -1364,9 +1388,68 @@ def _parse_sharing(value: Any) -> dict[str, Any]:
     return sharing
 
 
+def _forget_unshared(db: sqlite3.Connection, device_id: str, sharing: dict[str, Any]) -> None:
+    """Sharing turned off: forget what was kept."""
+    if sharing["calendar"] != "full":
+        db.execute("DELETE FROM events WHERE device=?", (device_id,))
+    if sharing["calendar"] == "off":
+        db.execute("DELETE FROM calendars WHERE device=? AND kind='event'", (device_id,))
+    elif sharing["calendar"] == "write_only":
+        db.execute("DELETE FROM calendars WHERE device=? AND kind='event' AND writable=0", (device_id,))
+    if not sharing["reminders"]:
+        db.execute("DELETE FROM reminders WHERE device=?", (device_id,))
+        db.execute("DELETE FROM calendars WHERE device=? AND kind='reminder'", (device_id,))
+    if not sharing["details"]:
+        for table in ("events", "reminders"):
+            db.execute(f"UPDATE {table} SET notes=NULL, url=NULL WHERE device=?", (device_id,))
+        db.execute("UPDATE events SET attendees=NULL WHERE device=?", (device_id,))
+    elif not sharing["attendee_emails"]:
+        for event_id, attendees in db.execute("SELECT id, attendees FROM events WHERE device=? AND attendees"
+                                              " LIKE '%\"email\"%'", (device_id,)).fetchall():
+            kept = [{key: value for key, value in person.items() if key != "email"}
+                    for person in _decode(attendees, [])]
+            db.execute("UPDATE events SET attendees=? WHERE device=? AND id=?",
+                       (json.dumps(kept) if kept else None, device_id, event_id))
+    if not sharing["status"]:
+        db.execute("UPDATE devices SET status=NULL, status_at=NULL WHERE id=?", (device_id,))
+    if not sharing["focus"]:
+        db.execute("UPDATE devices SET focus=NULL, focus_at=NULL WHERE id=?", (device_id,))
+    if not sharing["alarms"]:
+        db.execute("UPDATE devices SET alarms=NULL, alarms_at=NULL WHERE id=?", (device_id,))
+    if not sharing["contacts"]:
+        db.execute("DELETE FROM contacts WHERE device=?", (device_id,))
+
+
+def _narrowed(stored: Any, sharing: dict[str, Any]) -> dict[str, Any]:
+    """What stays shared when a batch can only take sharing away: each
+    switch as the narrower of the two. Nothing stored reads as nothing
+    shared."""
+    if not isinstance(stored, dict):
+        stored = {}
+    rank = {level: index for index, level in enumerate(reversed(CALENDAR_SHARING))}
+    narrowed = dict(sharing)
+    if rank.get(stored.get("calendar"), 0) < rank[sharing["calendar"]]:
+        narrowed["calendar"] = stored.get("calendar") if stored.get("calendar") in rank else "off"
+    for field, value in sharing.items():
+        if isinstance(value, bool):
+            narrowed[field] = value and stored.get(field) is True
+        elif field in ("past_days", "future_days"):
+            kept = stored.get(field)
+            narrowed[field] = min(value, kept) if isinstance(kept, int) and not isinstance(kept, bool) else 0
+    return narrowed
+
+
+def _not_ahead(at: datetime, field: str, now: int) -> datetime:
+    if at.timestamp() > now + MAX_CLOCK_SKEW_S:
+        raise PhoneError("clock_skew", f"{field} is more than {MAX_CLOCK_SKEW_S // 60} minutes ahead of this host;"
+                         " check the iPhone's clock and the host's")
+    return at
+
+
 def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: int) -> dict[str, Any]:
-    sent_at = parse_time(batch.get("sent_at"), "sent_at",
-                         latest=datetime.fromtimestamp(now, timezone.utc) + timedelta(days=1))
+    # A batch from the future would shut out every real one after it (they'd
+    # all look older), revocations included: only clock skew is allowed.
+    sent_at = _not_ahead(parse_time(batch.get("sent_at"), "sent_at"), "sent_at", now)
     sharing = _parse_sharing(batch.get("sharing"))
     tz = batch.get("time_zone")
     if tz is not None and (not isinstance(tz, str) or not _TZ.match(tz)):
@@ -1427,9 +1510,20 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
     parsed_alarms = _parse_alarms(alarms) if sharing["alarms"] and alarms is not None else None
     parsed_contacts = _parse_contacts(contacts) if sharing["contacts"] and contacts is not None else None
 
-    stored = db.execute("SELECT last_sent, status_at, focus_at FROM devices WHERE id=?", (device_id,)).fetchone()
+    stored = db.execute("SELECT last_sent, status_at, focus_at, window_from, window_to FROM devices WHERE id=?",
+                        (device_id,)).fetchone()
     sent_epoch = sent_at.timestamp()
-    stale = stored[0] is not None and sent_epoch < stored[0]
+    # A watermark further ahead than skew allows came from before that
+    # limit; it doesn't get to hold newer batches off.
+    stale = stored[0] is not None and stored[0] <= now + MAX_CLOCK_SKEW_S and sent_epoch < stored[0]
+    if window is None and share_events and event_upserts and stored[3] and stored[4]:
+        # A diff without a range stays inside the one the user last shared.
+        try:
+            window = (datetime.fromisoformat(stored[3]), datetime.fromisoformat(stored[4]))
+        except (TypeError, ValueError):
+            window = None
+        if window is not None and (window[0].tzinfo is None or window[1].tzinfo is None or window[1] <= window[0]):
+            window = None
 
     counts = {"events": 0, "reminders": 0, "deleted": 0}
     if stale:
@@ -1440,35 +1534,7 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
         db.execute("UPDATE devices SET last_seen=? WHERE id=?", (now, device_id))
         return {**counts, "stale": True}
 
-    # Sharing turned off: forget what was kept.
-    if sharing["calendar"] != "full":
-        db.execute("DELETE FROM events WHERE device=?", (device_id,))
-    if sharing["calendar"] == "off":
-        db.execute("DELETE FROM calendars WHERE device=? AND kind='event'", (device_id,))
-    elif sharing["calendar"] == "write_only":
-        db.execute("DELETE FROM calendars WHERE device=? AND kind='event' AND writable=0", (device_id,))
-    if not share_reminders:
-        db.execute("DELETE FROM reminders WHERE device=?", (device_id,))
-        db.execute("DELETE FROM calendars WHERE device=? AND kind='reminder'", (device_id,))
-    if not sharing["details"]:
-        for table in ("events", "reminders"):
-            db.execute(f"UPDATE {table} SET notes=NULL, url=NULL WHERE device=?", (device_id,))
-        db.execute("UPDATE events SET attendees=NULL WHERE device=?", (device_id,))
-    elif not sharing["attendee_emails"]:
-        for event_id, attendees in db.execute("SELECT id, attendees FROM events WHERE device=? AND attendees"
-                                              " LIKE '%\"email\"%'", (device_id,)).fetchall():
-            kept = [{key: value for key, value in person.items() if key != "email"}
-                    for person in _decode(attendees, [])]
-            db.execute("UPDATE events SET attendees=? WHERE device=? AND id=?",
-                       (json.dumps(kept) if kept else None, device_id, event_id))
-    if not sharing["status"]:
-        db.execute("UPDATE devices SET status=NULL, status_at=NULL WHERE id=?", (device_id,))
-    if not sharing["focus"]:
-        db.execute("UPDATE devices SET focus=NULL, focus_at=NULL WHERE id=?", (device_id,))
-    if not sharing["alarms"]:
-        db.execute("UPDATE devices SET alarms=NULL, alarms_at=NULL WHERE id=?", (device_id,))
-    if not sharing["contacts"]:
-        db.execute("DELETE FROM contacts WHERE device=?", (device_id,))
+    _forget_unshared(db, device_id, sharing)
 
     if parsed_calendars is not None:
         db.execute("DELETE FROM calendars WHERE device=?", (device_id,))
@@ -1515,6 +1581,15 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
                         int(item["recurring"]), item["url"], item["notes"], now))
             counts["reminders"] += 1
 
+    if parsed_calendars is not None:
+        # A calendar or list taken out of the selection takes its items along.
+        for table, column, kind in (("events", "calendar_id", "event"), ("reminders", "list_id", "reminder")):
+            kept = [entry["id"] for entry in parsed_calendars if entry["kind"] == kind]
+            sql = f"DELETE FROM {table} WHERE device=? AND {column} IS NOT NULL"
+            if kept:
+                sql += f" AND {column} NOT IN ({','.join('?' * len(kept))})"
+            counts["deleted"] += db.execute(sql, (device_id, *kept)).rowcount
+
     # The alarms Conduit set and the people the user picked: replaced whole.
     if parsed_alarms is not None:
         db.execute("UPDATE devices SET alarms=?, alarms_at=? WHERE id=?",
@@ -1530,10 +1605,10 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
         counts["contacts"] = len(parsed_contacts)
 
     # Latest only: an older reading never replaces a newer one.
-    if status is not None and (stored[1] is None or status["at"] >= stored[1]):
+    if status is not None and (stored[1] is None or stored[1] > now + MAX_CLOCK_SKEW_S or status["at"] >= stored[1]):
         db.execute("UPDATE devices SET status=?, status_at=? WHERE id=?",
                    (json.dumps(status["value"]), status["at"], device_id))
-    if focus is not None and (stored[2] is None or focus["at"] >= stored[2]):
+    if focus is not None and (stored[2] is None or stored[2] > now + MAX_CLOCK_SKEW_S or focus["at"] >= stored[2]):
         db.execute("UPDATE devices SET focus=?, focus_at=? WHERE id=?",
                    (json.dumps(focus["value"]), focus["at"], device_id))
     db.execute("UPDATE devices SET last_seen=?, last_sent=?, sharing=?, tz=COALESCE(?, tz) WHERE id=?",
@@ -1674,7 +1749,7 @@ def _parse_location_alarm(value: Any, field: str) -> dict[str, str] | None:
 
 def _parse_status(value: Any, now: int) -> dict[str, Any]:
     status = _object(value, "status") or {}
-    at = parse_time(status.get("at"), "status.at", latest=datetime.fromtimestamp(now, timezone.utc) + timedelta(days=1))
+    at = _not_ahead(parse_time(status.get("at"), "status.at"), "status.at", now)
     clean = {
         "battery": _number(status.get("battery"), "status.battery", 0, 1),
         "charging": _bool(status.get("charging"), "status.charging"),
@@ -1690,7 +1765,7 @@ def _parse_status(value: Any, now: int) -> dict[str, Any]:
 
 def _parse_focus(value: Any, now: int) -> dict[str, Any]:
     focus = _object(value, "focus") or {}
-    at = parse_time(focus.get("at"), "focus.at", latest=datetime.fromtimestamp(now, timezone.utc) + timedelta(days=1))
+    at = _not_ahead(parse_time(focus.get("at"), "focus.at"), "focus.at", now)
     active = _bool(focus.get("active"), "focus.active")
     if active is None:
         raise PhoneError("malformed", "focus.active must be true or false")
