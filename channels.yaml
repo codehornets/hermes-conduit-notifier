@@ -1,0 +1,13 @@
+# Which plugin version Conduit's App Store builds ask users to update to.
+#
+# TestFlight builds ask for every version on main (plugin.yaml). App Store
+# builds only show the update notice when a host is below `stable` (or below
+# the version that Conduit build needs), so a plugin merge between App Store
+# releases doesn't nag everyone. Raise `stable` when App Store users should
+# update: a fix they need, or a new Conduit release that uses new routes.
+# Tapping Update still installs main. Users can switch in Conduit under
+# Settings > Conduit plugin > Update notices.
+#
+# Must be a dotted number no newer than plugin.yaml's version
+# (tests/test_channels.py).
+stable: 0.51.0
