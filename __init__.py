@@ -23,6 +23,8 @@ from .events import approval_decision, clarification_text, event_id, is_silent_r
 
 logger = logging.getLogger(__name__)
 _child_sessions: set[str] = set()
+# Id a reported child moved to on compaction -> the id it was reported by.
+_compacted_children: dict[str, str] = {}
 _children_lock = threading.Lock()
 _profile = "default"
 _clarify_loop_active = False
@@ -414,13 +416,27 @@ def _subagent_start(**kwargs: Any) -> None:
 def _subagent_stop(**kwargs: Any) -> None:
     child = _text(kwargs.get("child_session_id"))
     if child:
+        # Hermes reports the id the child ends under, which a compaction may
+        # have moved from the one subagent_start reported.
         with _children_lock:
-            _child_sessions.discard(child)
+            reported = _compacted_children.get(child, child)
+            unknown = reported not in _child_sessions and bool(_child_sessions)
+            known = set(_child_sessions)
+        if unknown:
+            found = _continues_a_child(child, known)
+            if isinstance(found, str):
+                reported = found
+        with _children_lock:
+            _child_sessions.discard(reported)
+            for learned in [key for key, root in _compacted_children.items() if root == reported]:
+                del _compacted_children[learned]
     parent = _text(kwargs.get("parent_session_id"))
     # A subagent that ends inside the turn that started it (delegate_task
     # waits for it) is part of that turn's reply: only one that outlives it,
     # a background task, notifies. Nor does a nested one, or a muted cron job's.
-    if (_inside_parent_turn(parent, kwargs.get("parent_turn_id")) or _is_child(parent)
+    # The parent is asked about by id: this hook can run in the child's own
+    # run, where Hermes' delegation flag describes the child.
+    if (_inside_parent_turn(parent, kwargs.get("parent_turn_id")) or _is_child_session(parent)
             or cron_runs.quiet(parent, None)):
         return
     status = _text(kwargs.get("child_status")) or "finished"
@@ -572,10 +588,137 @@ def _voice_persona_note(history: Any) -> str | None:
     return None
 
 
+# Ids checked against compaction lineage and found not to be a child. A
+# session's lineage never changes, so the answer can be kept.
+_not_child_lineage: set[str] = set()
+_LINEAGE_HOPS = 32
+
+
+# Hermes' "running inside a delegated child" check (agent.delegation_context,
+# Hermes 0.22+), looked up once: False when this Hermes has none.
+_delegated_child_check: Any = None
+_delegated_check_failed = False
+
+
+def _inside_delegated_child() -> bool:
+    """Whether the code running now is a delegated child's run. Hermes binds
+    the flag in the child's own thread, on a copy of the parent's context, so
+    the parent never sees it set."""
+    global _delegated_child_check, _delegated_check_failed
+    if _delegated_child_check is None:
+        try:
+            from agent.delegation_context import is_delegated_child_context
+
+            _delegated_child_check = is_delegated_child_context
+        except ImportError:
+            logger.info("conduit_push: this Hermes has no delegation flag; subagents are found by session id")
+            _delegated_child_check = False  # an older Hermes: ids and lineage answer
+        except Exception:  # noqa: BLE001 — a broken module must not break every hook
+            logger.warning("conduit_push: Hermes' delegation context failed to load", exc_info=True)
+            _delegated_child_check = False
+    if _delegated_child_check is False:
+        return False
+    try:
+        return bool(_delegated_child_check())
+    except Exception:  # noqa: BLE001
+        if not _delegated_check_failed:
+            _delegated_check_failed = True
+            logger.warning("conduit_push: Hermes' delegation check failed; using session ids", exc_info=True)
+        return False
+
+
 def _is_child(session_id: Any) -> bool:
+    """Whether the session running now is a delegated child: Hermes'
+    delegation flag, else :func:`_is_child_session`."""
+    return _inside_delegated_child() or _is_child_session(session_id)
+
+
+def _is_child_session(session_id: Any) -> bool:
+    """Whether this id is a delegated child, whichever session is running: an
+    id ``subagent_start`` reported, or one that continues it. With
+    ``compression.in_place: false`` a compaction gives the agent a new session
+    id without firing ``subagent_start`` again; Hermes records the old id as
+    the new session's parent and ends the old one with ``compression``, so
+    following those links back finds the child it was."""
     value = _text(session_id)
+    if not value:
+        return False
     with _children_lock:
-        return bool(value and value in _child_sessions)
+        if value in _child_sessions or value in _compacted_children:
+            return True
+        if not _child_sessions or value in _not_child_lineage:
+            return False  # no child running: nothing to read the store for
+        known = _child_sessions | set(_compacted_children)
+    continues = _continues_a_child(value, known)
+    if continues:
+        with _children_lock:
+            root = _compacted_children.get(continues, continues)
+            if root in _child_sessions:
+                _compacted_children[value] = root
+        return True
+    if continues is None:
+        return False  # unread, so not kept: the next call reads again
+    with _children_lock:
+        if len(_not_child_lineage) > 4096:
+            _not_child_lineage.clear()
+        _not_child_lineage.add(value)
+    return False
+
+
+def _continues_a_child(session_id: str, children: set[str]) -> str | bool | None:
+    """The child ``session_id`` descends from, through compactions (or
+    delegations under it), read from Hermes' session store; False when none,
+    None when that can't be settled yet."""
+    import sqlite3
+
+    try:
+        path = Path(get_hermes_home()) / "state.db"
+        if not path.exists():
+            return None
+        db = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=1.0)
+    except Exception:  # noqa: BLE001 — a hook must never break the turn
+        _lineage_unread("couldn't open the session store to check a subagent's lineage")
+        return None
+    try:
+        current, settled = session_id, True
+        for _ in range(_LINEAGE_HOPS):
+            row = db.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (current,)).fetchone()
+            if row is None and current == session_id:
+                return None  # not stored yet, or another profile's store: ask again later
+            parent = row[0] if row else None
+            if not parent:
+                # A root: no child above. Kept only if every link passed was
+                # settled; an open one may be a compaction still being written.
+                return False if settled else None
+            ended = db.execute("SELECT end_reason FROM sessions WHERE id = ?", (parent,)).fetchone()
+            reason = ended[0] if ended else None
+            if reason == "branched":
+                return False  # a branch is a new conversation, not the child going on
+            if parent in children:
+                return parent  # a child's compaction, or a subagent under it
+            settled = settled and bool(reason)
+            current = parent
+        return None  # longer than we follow: not an answer to keep
+    except sqlite3.Error:
+        _lineage_unread("couldn't read a subagent's lineage from the session store")
+        return None
+    finally:
+        db.close()
+
+
+_lineage_unread_count = 0
+
+
+def _lineage_unread(message: str) -> None:
+    """Warn on the first failure and every 100th after: while a child runs
+    every hook may ask again, and an operator should see the gate degraded."""
+    global _lineage_unread_count
+    _lineage_unread_count += 1
+    if _lineage_unread_count % 100 == 1:
+        logger.warning("conduit_push: %s (%d times so far); a compacted subagent may not be recognised",
+                       message, _lineage_unread_count, exc_info=True)
+    else:
+        logger.debug("conduit_push: %s", message, exc_info=True)
 
 
 def _text(value: Any) -> str:
