@@ -378,6 +378,19 @@ def test_a_run_reports_and_the_plugin_calls_once_it_lasted(home, hermes, clock):
     assert _report(job_id, True)["status"] == "waiting", "a new incident waits again"
 
 
+def test_a_gateway_owned_run_is_known_by_its_task_id(home, hermes, clock):
+    # The gateway runs the job in its own session: only the task id names it.
+    job_id = _homelab(hermes)
+    task = f"cron:{job_id}:20261011_120000"
+    assert watches.is_watch_run("gateway-session-1", task)
+    first = json.loads(watches.report({"happening": True, "saw": "Down."}, session_id="gateway-session-1", task_id=task))
+    assert first["status"] == "waiting"
+    answer = json.loads(call_tool.handle({"reason": "Down.", "asked_by_user": True},
+                                         session_id="gateway-session-1", task_id=task))
+    assert answer["error"] == "use_report"
+    assert not watches.is_watch_run("gateway-session-1", "cron:not-a-watch:x")
+
+
 def test_outside_the_allowed_hours_it_waits_and_calls_inside_them(home, hermes, clock):
     job_id = _homelab(hermes, for_minutes=0)
     clock.when[0] = datetime(2026, 10, 11, 7, 30, tzinfo=timezone.utc)
