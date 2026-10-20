@@ -2771,10 +2771,12 @@ def _local_live_read_key() -> str:
     """This profile's key (inside its scope), or "" when none was made."""
     try:
         data = json.loads(_local_live_key_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return ""
     key = data.get("api_key") if isinstance(data, dict) else None
-    return key if isinstance(key, str) and key.startswith(LOCAL_LIVE_KEY_PREFIX + ".") else ""
+    if not isinstance(key, str) or not key.startswith(LOCAL_LIVE_KEY_PREFIX + "."):
+        raise ValueError("Invalid Local Live key store")
+    return key
 
 
 def local_live_key(profile: Optional[str], rotate: bool = False) -> str:
@@ -2797,8 +2799,16 @@ def local_live_key(profile: Optional[str], rotate: bool = False) -> str:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump({"version": 1, "api_key": key, "created_at": int(time.time())}, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 os.chmod(tmp, 0o600)
                 os.replace(tmp, path)
+                if os.name == "posix":
+                    directory = os.open(path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
             except BaseException:
                 with contextlib.suppress(OSError):
                     os.unlink(tmp)
@@ -12679,11 +12689,15 @@ class _DesktopViewStore:
         return os.path.join(key, DESKTOP_VIEWS_FILE)
 
     @staticmethod
-    def _load(path: str) -> Dict[str, Dict[str, Any]]:
+    def _load(path: str, *, for_write: bool = False) -> Dict[str, Dict[str, Any]]:
         try:
             with open(path, encoding="utf-8") as handle:
                 value = json.load(handle)
-        except (OSError, ValueError, RecursionError):  # RecursionError: absurdly nested JSON
+        except (FileNotFoundError, ValueError, RecursionError):
+            return {}
+        except OSError:
+            if for_write:
+                raise
             return {}
         views = value.get("views") if isinstance(value, dict) else None
         if not isinstance(views, dict):
@@ -12717,7 +12731,7 @@ class _DesktopViewStore:
         path = self._path(key)
         # Path-generic: locks the sibling ".conduit-desktop-views.json.lock".
         with _pairing_state_lock(Path(path)):
-            merged = self._merged(self._load(path), views)
+            merged = self._merged(self._load(path, for_write=True), views)
             # A fresh, exclusively created 0600 name, so nothing planted in
             # the home can redirect the write.
             fd, temp = tempfile.mkstemp(dir=key, prefix=f".{DESKTOP_VIEWS_FILE}.", suffix=".tmp")

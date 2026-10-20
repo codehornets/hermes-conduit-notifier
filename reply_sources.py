@@ -37,8 +37,18 @@ import os
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]
 
 FILE_NAME = "conduit-notifications.json"
 VERSION = 1
@@ -73,9 +83,10 @@ class ReplySourcesStore:
             raise ValueError(f"source must be one of {', '.join(SOURCES)}")
         if not isinstance(notify, bool):
             raise ValueError("notify must be true or false")
-        # Only the dashboard writes, so a process-wide lock is enough; a
-        # reader sees the old file or the new one.
-        with _thread_lock:
+        # Dashboard processes sharing a home serialize the whole update.
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        with _thread_lock, open(lock_path, "a+b") as handle, _exclusive(handle):
             muted = self._load(for_write=True)
             muted.pop(source, None)
             if not notify:
@@ -105,7 +116,7 @@ class ReplySourcesStore:
     def _save(self, state: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             try:
                 handle = os.fdopen(descriptor, "w", encoding="utf-8")
@@ -114,6 +125,8 @@ class ReplySourcesStore:
                 raise
             with handle:
                 handle.write(json.dumps(state, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
             temporary.replace(self.path)
         except BaseException:
             try:
@@ -121,6 +134,44 @@ class ReplySourcesStore:
             except OSError:
                 pass
             raise
+        if os.name == "posix":
+            # Best effort, as the other stores: the rename itself survives a crash.
+            try:
+                directory = os.open(self.path.parent, os.O_RDONLY)
+            except OSError:
+                return
+            try:
+                os.fsync(directory)
+            except OSError:
+                pass
+            finally:
+                os.close(directory)
+
+
+@contextmanager
+def _exclusive(handle: Any) -> Iterator[None]:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        handle.seek(0)
+        for attempt in range(6):
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                break
+            except OSError:
+                if attempt == 5:
+                    raise
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        yield
 
 
 def turn_source(platform: Any, transport: Any = None) -> str | None:
