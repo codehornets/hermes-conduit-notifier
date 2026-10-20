@@ -1355,7 +1355,7 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
     parsed_contacts = _parse_contacts(contacts) if sharing["contacts"] and contacts is not None else None
 
     stored = db.execute("SELECT last_sent, status_at, focus_at FROM devices WHERE id=?", (device_id,)).fetchone()
-    sent_epoch = int(sent_at.timestamp())
+    sent_epoch = sent_at.timestamp()
     stale = stored[0] is not None and sent_epoch < stored[0]
 
     counts = {"events": 0, "reminders": 0, "deleted": 0}
@@ -1893,13 +1893,12 @@ def _check_change(db: sqlite3.Connection, device_id: str, kind: str, fields: dic
     collection = clean_fields.get("calendar_id" if is_event else "list_id")
     if collection is None and existing is not None:
         collection = existing.get("calendar_id" if is_event else "list_id")
-    if collection is not None:
-        calendar = _calendar_row(db, device_id, collection_kind, collection)
-        word = "calendar" if is_event else "list"
-        if calendar is None and (clean_fields.get("calendar_id" if is_event else "list_id") is not None):
-            raise PhoneError(f"unknown_{word}", f"No shared {word} has that id; see overview")
-        if calendar is not None and not calendar["writable"]:
-            raise PhoneError("read_only", f"The {word} {calendar['title'] or collection!r} is read-only on the phone")
+    calendar = _calendar_row(db, device_id, collection_kind, collection)
+    word = "calendar" if is_event else "list"
+    if collection is not None and calendar is None:
+        raise PhoneError(f"unknown_{word}", f"No shared {word} has that id; see overview")
+    if calendar is not None and not calendar["writable"]:
+        raise PhoneError("read_only", f"The {word} {calendar['title'] or collection!r} is read-only on the phone")
     merged = {**(existing or {}), **{key: value for key, value in clean_fields.items() if value is not None}}
     if kind in _DISPLAY_ONLY_KINDS and existing is not None:
         # The phone ignores these when applying; its card shows them, so the
