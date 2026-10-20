@@ -791,8 +791,8 @@ class _ProviderEntry:
                 with self._state:
                     self._running = False
                     self.stuck = False
+                    done.set()
                 self.call_lock.release()
-                done.set()
 
         with self._state:
             self._running = True
@@ -805,10 +805,12 @@ class _ProviderEntry:
             raise
         if not done.wait(max(deadline - time.monotonic(), 0.0)):
             with self._state:
-                if self._running:
+                completed = done.is_set()
+                if not completed and self._running:
                     self.stuck = True
-            logger.warning("Memory provider %r %s for Conduit timed out; abandoning the call", self.name, what)
-            raise TokenError(504, f"Memory {what} timed out")
+            if not completed:
+                logger.warning("Memory provider %r %s for Conduit timed out; abandoning the call", self.name, what)
+                raise TokenError(504, f"Memory {what} timed out")
         if "error" in box:
             raise box["error"]
         return box.get("value")
@@ -6050,8 +6052,8 @@ async def post_turn_surface(request: Request, response: Response) -> Dict[str, A
 E2E_LIMIT = 10
 E2E_WINDOW_S = 60.0
 E2E_MAX_BODY_BYTES = 4 * 1024
-_E2E_KID = re.compile(r"^[0-9a-f]{32}$")
-_E2E_B64URL = re.compile(r"^[A-Za-z0-9_-]{43}$")  # 32 bytes, unpadded
+_E2E_KID = re.compile(r"^[0-9a-f]{32}\Z")
+_E2E_B64URL = re.compile(r"^[A-Za-z0-9_-]{43}\Z")  # 32 bytes, unpadded
 _e2e_limiter = _MintLimiter(E2E_LIMIT, E2E_WINDOW_S, message="Too many encryption key requests; try again shortly")
 _e2e_lock = threading.Lock()
 
