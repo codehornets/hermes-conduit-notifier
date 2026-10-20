@@ -9042,7 +9042,7 @@ class _WatchJob:
         self.error = ""
         # The pending approval: Hermes' request id, its server request's id
         # (for request.cancel), the redacted command and its description.
-        self.approval: Optional[Dict[str, str]] = None
+        self.approval: Optional[Dict[str, Any]] = None
         # Told to the Watch: the outcome, and the approval request last told
         # (None before any, as a request's key can be empty).
         self.outcome_told = False
@@ -9083,7 +9083,8 @@ class _WatchJob:
         if self.approval and self.status == "needs_approval":
             item["approval"] = {
                 "request_id": self.approval["request_id"],
-                "command": _json_clip(self.approval["command"], WATCH_JOB_COMMAND_BYTES),
+                "command": self.approval["command"],
+                "cut": self.approval["cut"],
                 "description": _json_clip(self.approval["description"], WATCH_JOB_DETAIL_BYTES),
             }
         return item
@@ -9198,7 +9199,13 @@ class _WatchJobs:
         sid = params.get("session_id") if isinstance(params.get("session_id"), str) else ""
         if method == "event":
             payload = params.get("payload") if isinstance(params.get("payload"), dict) else {}
-            self._event(str(params.get("type") or ""), sid, payload)
+            kind = str(params.get("type") or "")
+            if kind == "approval.request":
+                # The event form: the same fields, in the payload, with no
+                # server request for a request.cancel to name.
+                self._approval_requested(sid, "", payload)
+            else:
+                self._event(kind, sid, payload)
         elif method == "approval":
             # A server request: its fields sit beside session_id.
             self._approval_requested(sid, _rpc_id(obj.get("id")), params)
@@ -9316,10 +9323,14 @@ class _WatchJobs:
             if job.held_completion is not None:
                 # Still at work, as any frame for the session says.
                 job.held_at = time.monotonic()
+            command = params.get("command")
+            command = command.strip() if isinstance(command, str) else ""
+            shown_command = _json_clip(command[:2_000], WATCH_JOB_COMMAND_BYTES)
             job.approval = {
                 "request_id": text("request_id", 128),
                 "server_request_id": server_request_id,
-                "command": text("command", 2_000),
+                "command": shown_command,
+                "cut": shown_command != command,
                 "description": text("description", 500) or "Approval required",
             }
             job.status = "needs_approval"
@@ -9790,6 +9801,11 @@ class _WatchJobs:
         if wanted != approval["request_id"]:
             # Only the request the Watch showed: a newer one needs its own answer.
             return {"ok": True, "status": "not_pending", "message": "That approval request has been replaced."}
+        if choice == "once" and approval.get("cut"):
+            # The Watch showed only part of the command: approving it would
+            # approve what the user never saw.
+            return {"ok": False, "status": 400,
+                    "detail": "The command was too long to show whole, so it can only be denied"}
         params: Dict[str, Any] = {"session_id": job.session_id, "choice": choice}
         if approval["request_id"]:
             params["request_id"] = approval["request_id"]
