@@ -44,7 +44,7 @@ def test_a_picture_round_trips_and_lists_its_revision(tmp_path):
     assert base64.b64decode(record["data_base64"]) == JPEG
     assert record["rev"] == stored["rev"]
     files = sorted(os.listdir(tmp_path))
-    assert [name.rsplit(".", 1)[1] for name in files] == ["img", "json"]
+    assert [name.rsplit(".", 1)[1] for name in files] == ["lock", "img", "json"]
     for name in files:
         assert os.stat(tmp_path / name).st_mode & 0o777 == 0o600
 

@@ -6108,37 +6108,54 @@ def _pairing_state_lock(path: Any):
     # The same lock file client.state_file_lock takes in the agent process,
     # so a hook rewriting the state can't drop a key stored here (or the
     # other way round).
-    with open(_pairing_state_lock_path(path), "a+b") as handle:
-        try:
-            import fcntl
-        except ImportError:
-            fcntl = None
-        if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            return
-        try:
-            import msvcrt
-        except ImportError:
-            yield
-            return
-        # Windows: the same first-byte lock client.state_file_lock takes.
-        handle.seek(0)
-        for attempt in range(6):  # about a minute
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                break
-            except OSError:
-                if attempt == 5:
-                    raise
+    with open(_pairing_state_lock_path(path), "a+b") as handle, _locked_handle(handle):
+        yield
+
+
+def _open_private_lock_file(lock_path: str) -> Any:
+    """A lock file opened owner-only and never through a symlink."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        return os.fdopen(fd, "a+b")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextlib.contextmanager
+def _locked_handle(handle: Any):
+    """flock on ``handle``, or a first-byte lock on Windows."""
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    try:
+        import msvcrt
+    except ImportError:
+        yield
+        return
+    # Windows: the same first-byte lock client.state_file_lock takes.
+    handle.seek(0)
+    for attempt in range(6):  # about a minute
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            break
+        except OSError:
+            if attempt == 5:
+                raise
+    try:
+        yield
+    finally:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _save_pairing_state(path: Any, value: Dict[str, Any]) -> None:
@@ -13453,13 +13470,15 @@ ROOM_IMAGE_MAX_ROOMS = 500
 ROOM_IMAGE_RECORD_MAX_BYTES = 4096
 # Temp files a crashed write left behind go after this long.
 ROOM_IMAGE_STALE_TEMP_S = 3600.0
+# Taken by every process that reads or writes the folder's pictures.
+ROOM_IMAGE_LOCK_FILE = ".room-images.lock"
 ROOM_IMAGE_LIMIT = 60
 ROOM_IMAGE_WINDOW_S = 600.0
 _room_image_limiter = _MintLimiter(ROOM_IMAGE_LIMIT, ROOM_IMAGE_WINDOW_S,
                                    message="Too many picture changes; try again shortly")
 _ROOM_IMAGE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 _room_image_lock = threading.Lock()
-# Writes wait on one another (the lock above), so they get their own threads
+# Writes wait on one another (the locks below), so they get their own threads
 # rather than the default pool other routes share.
 _room_image_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conduit-room-images")
 
@@ -13522,6 +13541,31 @@ def _read_room_record(path: str) -> Optional[Dict[str, Any]]:
     return record
 
 
+@contextlib.contextmanager
+def _room_images_locked(root: str, *, create: bool = False):
+    """A picture's bytes and its record change and are read as a pair: under
+    a lock file in the folder, which every process and thread takes through
+    its own handle, then this process's lock. Without ``create``, a folder
+    that isn't there (or a lock file that can't be opened) has nothing to
+    pair, so only the thread lock is taken."""
+    if create:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        with contextlib.suppress(OSError):
+            # makedirs leaves an existing folder's mode alone.
+            os.chmod(root, 0o700)
+    lock_path = os.path.join(root, ROOM_IMAGE_LOCK_FILE)
+    try:
+        handle = _open_private_lock_file(lock_path)
+    except OSError:
+        if create:
+            raise
+        with _room_image_lock:
+            yield
+        return
+    with handle, _locked_handle(handle), _room_image_lock:
+        yield
+
+
 def _write_atomic(root: str, path: str, data: bytes) -> None:
     # A fresh, exclusively created 0600 name, so nothing planted in the
     # folder can redirect the write.
@@ -13555,7 +13599,7 @@ def list_room_images(root: str) -> Dict[str, str]:
 def read_room_image(root: str, room_id: str) -> Optional[Dict[str, Any]]:
     stem = _room_image_stem(root, room_id)
     # Under the write lock, so a record and its bytes are read as a pair.
-    with _room_image_lock:
+    with _room_images_locked(root):
         record = _read_room_record(stem + ".json")
         if record is None or record["room_id"] != room_id:
             return None
@@ -13631,12 +13675,8 @@ def store_room_image(root: str, room_id: str, body: Any, now: Optional[float] = 
     record = json.dumps({"version": 1, "room_id": room_id, "rev": rev, "mime": mime},
                         separators=(",", ":")).encode("utf-8")
     stem = _room_image_stem(root, room_id)
-    with _room_image_lock:
-        try:
-            os.makedirs(root, mode=0o700, exist_ok=True)
-            with contextlib.suppress(OSError):
-                # makedirs leaves an existing folder's mode alone.
-                os.chmod(root, 0o700)
+    try:
+        with _room_images_locked(root, create=True):
             # Bytes first: a record always names a picture that's there.
             _write_atomic(root, stem + ".img", data)
             try:
@@ -13646,17 +13686,17 @@ def store_room_image(root: str, room_id: str, body: Any, now: Optional[float] = 
                 # revision: drop the room instead, so clients refetch.
                 _remove_room_image_files(stem)
                 raise
-        except OSError as exc:
-            if exc.errno in (errno.ENOSPC, errno.EDQUOT):
-                raise HTTPException(status_code=507, detail="The host is low on disk space", headers=no_store)
-            raise
-        _prune_room_images(root, stem, now)
+            _prune_room_images(root, stem, now)
+    except OSError as exc:
+        if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+            raise HTTPException(status_code=507, detail="The host is low on disk space", headers=no_store)
+        raise
     return {"room_id": room_id, "rev": rev, "mime": mime}
 
 
 def clear_room_image(root: str, room_id: str) -> bool:
     stem = _room_image_stem(root, room_id)
-    with _room_image_lock:
+    with _room_images_locked(root):
         record = _read_room_record(stem + ".json")
         if record is None or record["room_id"] != room_id:
             return False

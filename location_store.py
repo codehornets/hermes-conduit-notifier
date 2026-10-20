@@ -46,6 +46,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt
+except ImportError:  # everything but Windows
+    msvcrt = None  # type: ignore[assignment]
+
 FILE_NAME = "conduit-location.sqlite3"
 SCHEMA_VERSION = 3
 # Versions _migrate brings up to SCHEMA_VERSION.
@@ -145,6 +154,34 @@ _HOURS = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})\Z")
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+")
 
 _thread_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _exclusive(handle: Any) -> Iterator[None]:
+    # The same locking as calls_store: flock where there is one, a
+    # first-byte lock on Windows.
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        handle.seek(0)
+        for attempt in range(6):  # about a minute
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                break
+            except OSError:
+                if attempt == 5:
+                    raise
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        yield
 
 
 class LocationError(ValueError):
@@ -362,9 +399,23 @@ class LocationStore:
         return self.path.exists()
 
     @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """The writers' lock: a lock file beside the database, which every
+        process (two dashboards, the agent) and thread takes through its own
+        handle, then this process's thread lock. The file lock comes first,
+        so waiting on another process never holds up other profiles' stores
+        here. The lock file outlives a wipe, so a writer waiting on it never
+        races the unlink."""
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        with os.fdopen(os.open(lock_path, flags, 0o600), "a+b") as handle, _exclusive(handle), _thread_lock:
+            yield
+
+    @contextlib.contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with _thread_lock:
+        with self._locked():
             if not self.path.exists():
                 # Owner-only from the first byte; SQLite gives the -wal and
                 # -shm files the same mode.
@@ -628,16 +679,20 @@ class LocationStore:
                 jobs = [row[0] for row in db.execute("SELECT job_id FROM rules WHERE job_id IS NOT NULL")]
                 for table in ("rules", "reads", "locates"):
                     db.execute(f"DELETE FROM {table}")
-        with _thread_lock:
+        with self._locked():
             remaining = self._count("devices")
             if remaining == 0 and self._count("rules") == 0:
-                for suffix in ("", "-wal", "-shm", "-journal"):
-                    with contextlib.suppress(FileNotFoundError):
+                # Companions first: a crash part-way never leaves a WAL that a
+                # fresh database could pick up.
+                for suffix in ("-wal", "-shm", "-journal", ""):
+                    # Windows refuses while a reader has it open; the data
+                    # is already deleted, and the next wipe tries again.
+                    with contextlib.suppress(OSError):
                         os.unlink(f"{self.path}{suffix}")
         return {"deleted": True, "remaining_devices": remaining, "rule_jobs": jobs}
 
     def _count(self, table: str) -> int:
-        """Rows in a table; the caller holds ``_thread_lock``."""
+        """Rows in a table; the caller holds ``_locked()``."""
         if not self.path.exists():
             return 0
         connection = sqlite3.connect(self.path, timeout=15)
