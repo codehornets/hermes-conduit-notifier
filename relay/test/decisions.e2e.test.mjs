@@ -655,7 +655,7 @@ test('a copy that arrives mid-send waits for it, and is told to retry when it fa
   const created = fixture.createInstallation({ bundleId: 'com.milim.relay', deviceToken: 'c'.repeat(64), environment: 'production' });
   const pairing = fixture.createPairing(created.installation.id);
   const claim = fixture.claimPairing(pairing.code, 'in-flight target');
-  const child = await startRelay(aPort, 'accept', isolatedPath, { APNS_CAPTURE_PATH: capturePath, APNS_FAIL_FIRST: '1', APNS_SEND_DELAY_MS: '400' });
+  const child = await startRelay(aPort, 'accept', isolatedPath, { APNS_CAPTURE_PATH: capturePath, APNS_FAIL_FIRST: '1', APNS_SEND_DELAY_MS: '1500' });
   children.push(child);
   const base = `http://127.0.0.1:${aPort}`;
   const send = (eventId) => api(base, '/v1/events', {
@@ -665,14 +665,14 @@ test('a copy that arrives mid-send waits for it, and is told to retry when it fa
   });
   try {
     const first = send('input:inflight00001');
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 500));
     const copy = await send('input:inflight00001');
     assert.deepEqual(await first, { status: 502, json: { error: 'apns_unreachable' } });
     assert.deepEqual(copy, { status: 503, json: { error: 'delivery_failed' } }, 'the copy is not told the failed send was a duplicate');
     assert.deepEqual(await send('input:inflight00001'), { status: 202, json: { accepted: true, delivered: true } });
 
     const second = send('input:inflight00002');
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 500));
     assert.deepEqual(await send('input:inflight00002'), { status: 200, json: { accepted: true, duplicate: true } },
       'a copy of a send that worked is a duplicate');
     assert.equal((await second).status, 202);
