@@ -31,8 +31,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - reviewer: MiniMax M3.1 Flash
-            model: commandcode/minimax/minimax-m3.1-flash:free
+          - reviewer: MiMo V2.6 Flash
+            model: mimo/mimo-v2.6-flash
           - reviewer: GLM-5.3-Flash
             model: zai-custom/glm-5.3-flash
     # No id-token: opencode uses the run's token (USE_GITHUB_TOKEN), not OIDC.
@@ -115,7 +115,7 @@ jobs:
       - name: Run opencode review
         run: GITHUB_EVENT_NAME=pull_request GITHUB_ACTOR=${{ github.repository_owner }} opencode github run
         env:
-          COMMANDCODE_API_KEY: ${{ secrets.COMMANDCODE_API_KEY }}
+          MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           # The run's own token: this repo only, the job's permissions above,
           # and it expires when the run ends.
