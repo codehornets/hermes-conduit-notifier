@@ -92,6 +92,9 @@ KEY_BYTES = 32
 EXCHANGE_OPS = ("changes", "voice")
 
 CALENDAR_SHARING = ("full", "write_only", "off")
+# Sharing switches that take changes away when on: Hermes reads what's
+# shared but can't add, change or delete anything in it.
+READ_ONLY_SHARING = ("calendar_read_only", "reminders_read_only")
 CALENDAR_KINDS = ("event", "reminder")
 AVAILABILITY = ("busy", "free", "tentative", "unavailable", "none")
 EVENT_STATUS = ("confirmed", "tentative", "canceled", "none")
@@ -794,6 +797,7 @@ class PhoneStore:
                            " WHERE id=? AND device=? AND state IN ('pending', 'lost')",
                            (result["outcome"], now, result.get("item_id"), result.get("note"), result["id"],
                             device_id))
+            _refuse_unshared_changes(db, device_id, now)
             rows = db.execute(f"SELECT {_CHANGE_COLUMNS} FROM changes WHERE device=? AND state='pending'"
                               " ORDER BY created_at, rowid LIMIT ?", (device_id, MAX_CHANGES_PER_ANSWER)).fetchall()
             if rows:
@@ -1363,6 +1367,25 @@ def _drop_device_data(db: sqlite3.Connection, device_id: str, keep_changes: bool
                " alarms_at=NULL WHERE id=?", (device_id,))
 
 
+def _refuse_unshared_changes(db: sqlite3.Connection, device_id: str, now: int) -> None:
+    """Changes still waiting that the device's sharing no longer allows (the
+    user made the calendar read-only, or stopped sharing it, after Hermes
+    asked) fail here instead of reaching the phone."""
+    row = db.execute("SELECT sharing FROM devices WHERE id=?", (device_id,)).fetchone()
+    sharing = _decode(row[0], None) if row else None
+    if not isinstance(sharing, dict):
+        return
+    for change_id, kind in db.execute("SELECT id, kind FROM changes WHERE device=? AND state='pending'",
+                                      (device_id,)).fetchall():
+        need = change_need(kind)
+        if not shares(sharing, need):
+            refusal = _read_only(sharing, need)
+            note = (f"{refusal}. Don't ask again: tell the user, so they can make it themselves" if refusal
+                    else f"The user no longer shares {_NEED_WORDS.get(need, need)} with Hermes")
+            db.execute("UPDATE changes SET state='failed', finished_at=?, note=?, reported_at=NULL WHERE id=?",
+                       (now, note, change_id))
+
+
 def _expire(db: sqlite3.Connection, now: int) -> None:
     db.execute("UPDATE changes SET state='expired', finished_at=expires_at, reported_at=NULL"
                " WHERE state='pending' AND expires_at<=?", (now,))
@@ -1375,9 +1398,13 @@ def shares(sharing: dict[str, Any], need: str) -> bool:
     if need == "events":
         return calendar == "full"
     if need == "events_write":
-        return calendar in ("full", "write_only")
+        return calendar in ("full", "write_only") and sharing.get("calendar_read_only") is not True
+    if need == "events_change":
+        return calendar == "full" and sharing.get("calendar_read_only") is not True
     if need == "reminders":
         return sharing.get("reminders") is True
+    if need == "reminders_write":
+        return sharing.get("reminders") is True and sharing.get("reminders_read_only") is not True
     if need == "calendars":
         return calendar in ("full", "write_only") or sharing.get("reminders") is True
     if need in ("status", "focus", "alarms", "contacts"):
@@ -1391,10 +1418,24 @@ def shares(sharing: dict[str, Any], need: str) -> bool:
     return need == "any"
 
 
-_NEED_WORDS = {"events": "their calendar", "events_write": "adding to their calendar", "reminders": "reminders",
+_NEED_WORDS = {"events": "their calendar", "events_write": "adding to their calendar",
+               "events_change": "changes to their calendar", "reminders": "reminders",
+               "reminders_write": "changes to their reminders",
                "calendars": "calendars or reminders", "status": "phone status", "focus": "Focus",
                "phone": "phone status or Focus", "alarms": "alarms and timers", "contacts": "contacts",
                "phone_tool": "phone status, Focus or alarms", "any": "anything"}
+
+
+def _read_only(sharing: dict[str, Any], need: str) -> PhoneError | None:
+    """The refusal for a change to something the user shares read-only."""
+    if need in ("events_write", "events_change") and sharing.get("calendar_read_only") is True \
+            and sharing.get("calendar") in ("full", "write_only"):
+        return PhoneError("shared_read_only", "The user shares their calendar read-only: Hermes can't add, change or delete "
+                          "events")
+    if need == "reminders_write" and sharing.get("reminders_read_only") is True and sharing.get("reminders") is True:
+        return PhoneError("shared_read_only", "The user shares their reminders read-only: Hermes can't add, change, complete "
+                          "or delete reminders")
+    return None
 
 
 def _pick_device(db: sqlite3.Connection, wanted: Any, need: str,
@@ -1410,8 +1451,11 @@ def _pick_device(db: sqlite3.Connection, wanted: Any, need: str,
         named = [row for row in rows if row[0] == wanted]
         if not named:
             raise PhoneError("nothing_shared", "This iPhone hasn't shared anything yet")
-        if need == "events" and named[0][2].get("calendar") == "write_only":
+        if need in ("events", "events_change") and named[0][2].get("calendar") == "write_only":
             raise PhoneError("write_only", "The user lets Hermes add events but not read their calendar")
+        refusal = _read_only(named[0][2], need)
+        if refusal is not None:
+            raise refusal
         if not shares(named[0][2], need):
             raise PhoneError("not_shared", f"{named[0][1]} doesn't share {_NEED_WORDS.get(need, need)} with Hermes")
         return named[0]
@@ -1421,6 +1465,9 @@ def _pick_device(db: sqlite3.Connection, wanted: Any, need: str,
             row for row in rows if row[1].casefold() == wanted.casefold()]
         if len(named) != 1:
             raise PhoneError("unknown_device", "No single device has that id or name; use one from overview")
+        refusal = _read_only(named[0][2], need)
+        if refusal is not None:
+            raise refusal
         if not shares(named[0][2], need):
             raise PhoneError("not_shared", f"{named[0][1]} doesn't share {_NEED_WORDS.get(need, need)} with Hermes")
         return named[0]
@@ -1443,8 +1490,13 @@ def _pick_device(db: sqlite3.Connection, wanted: Any, need: str,
     for row in rows:
         if shares(row[2], need):
             return row
-    if rows and need == "events" and any(row[2].get("calendar") == "write_only" for row in rows):
+    if rows and need in ("events", "events_change") and any(row[2].get("calendar") == "write_only"
+                                                           for row in rows):
         raise PhoneError("write_only", "The user lets Hermes add events but not read their calendar")
+    for row in rows:
+        refusal = _read_only(row[2], need)
+        if refusal is not None:
+            raise refusal
     raise PhoneError("nothing_shared", f"No device shares {_NEED_WORDS.get(need, need)} with Hermes")
 
 
@@ -1468,8 +1520,14 @@ def _parse_sharing(value: Any) -> dict[str, Any]:
     if calendar not in CALENDAR_SHARING:
         raise PhoneError("malformed", f"sharing.calendar must be one of {', '.join(CALENDAR_SHARING)}")
     sharing: dict[str, Any] = {"calendar": calendar}
-    for field in ("reminders", "details", "attendee_emails", "status", "focus", "auto_add", "alarms", "contacts"):
+    for field in ("reminders", "details", "attendee_emails", "status", "focus", "auto_add", "alarms", "contacts",
+                  *READ_ONLY_SHARING):
         sharing[field] = bool(_bool(value.get(field), f"sharing.{field}", False))
+    # Add-only and read-only leaves nothing; read-only reminders need reminders.
+    if sharing["calendar"] == "write_only" and sharing["calendar_read_only"]:
+        sharing["calendar"] = "off"
+    sharing["calendar_read_only"] = sharing["calendar_read_only"] and sharing["calendar"] == "full"
+    sharing["reminders_read_only"] = sharing["reminders_read_only"] and sharing["reminders"]
     # Emails are part of the details.
     sharing["attendee_emails"] = sharing["attendee_emails"] and sharing["details"]
     sharing["past_days"] = _whole(value.get("past_days"), "sharing.past_days", 0, MAX_WINDOW_DAYS)
@@ -1520,7 +1578,12 @@ def _narrowed(stored: Any, sharing: dict[str, Any]) -> dict[str, Any]:
     if rank.get(stored.get("calendar"), 0) < rank[sharing["calendar"]]:
         narrowed["calendar"] = stored.get("calendar") if stored.get("calendar") in rank else "off"
     for field, value in sharing.items():
-        if isinstance(value, bool):
+        if field in READ_ONLY_SHARING:
+            # Read-only is the narrower side: on in either keeps it on. A
+            # stored sharing from before these switches had them off (and
+            # nothing stored shares nothing anyway: the calendar goes off).
+            narrowed[field] = value or stored.get(field) is True
+        elif isinstance(value, bool):
             narrowed[field] = value and stored.get(field) is True
         elif field in ("past_days", "future_days"):
             kept = stored.get(field)
@@ -2150,10 +2213,10 @@ def change_need(kind: str) -> str:
     if kind == "add_event":
         return "events_write"
     if kind.endswith("_event"):
-        return "events"
+        return "events_change"
     if kind in ALARM_CHANGE_KINDS:
         return "alarms"
-    return "reminders"
+    return "reminders_write"
 
 
 def _check_alarm_change(db: sqlite3.Connection, device_id: str, kind: str, fields: dict[str, Any],

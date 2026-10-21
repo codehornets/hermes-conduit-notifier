@@ -33,7 +33,7 @@ from . import client, session_titles
 from .conduit_first import CALENDAR_FIRST, CONTACTS_FIRST, PHONE_FIRST
 from .events import push_event
 from .phone_store import (ALARM_CHANGE_KINDS, CALENDAR_CHANGE_KINDS, WEEKDAYS, PhoneError, PhoneStore, alarm_summary,
-                          clean_text, parse_day, parse_time, shares)
+                          change_need, clean_text, parse_day, parse_time, shares)
 
 logger = logging.getLogger("hermes.plugins.conduit_push")
 
@@ -71,7 +71,8 @@ CALENDAR_SCHEMA: dict[str, Any] = {
         "people can read, and don't write attendee emails into memory unless the user asks. "
         "Reads: overview (what's shared, calendars, freshness), calendars, events, free_busy, next, reminders. "
         "Writes queue a change the phone applies: add_event, update_event, delete_event, add_reminder, "
-        "update_reminder, complete_reminder, delete_reminder; the user approves each on the phone, by tap or by saying "
+        "update_reminder, complete_reminder, delete_reminder (not when overview says read only); the user approves "
+        "each on the phone, by tap or by saying "
         "yes or no in a voice chat as their very next words after the reply that queued it, unless they let Hermes add "
         "without asking (updates, deletes and completions always ask), so "
         "never say a change is done until pending shows it applied. pending: recent changes and how they went. Read results are as of the phone's last sync. "
@@ -319,6 +320,10 @@ def _error_note(error: PhoneError) -> str:
     if error.code in ("nothing_shared", "not_shared"):
         return (f"{error} The user can turn it on in Conduit's {SETTINGS_LINK} (leave the link out of anything "
                 "spoken).")
+    if error.code == "shared_read_only":
+        return (f"{error}. Don't ask the phone for this change: tell the user, so they can make it themselves. "
+                f"They can let Hermes make changes in Conduit's {SETTINGS_LINK} (leave the link out of anything "
+                "spoken).")
     if error.code == "write_only":
         return f"{error}. You can still add events; reading needs full access in Conduit's {SETTINGS_LINK}."
     return str(error)
@@ -404,12 +409,13 @@ def _overview(store: PhoneStore, only: str | None = None) -> dict[str, Any]:
         entry = {
             "id": device["id"], "name": device["name"], "as_of": _ago(device["last_seen"], now),
             "time_zone": device["time_zone"],
-            "calendar": {"full": "read and add", "write_only": "add only (can't read)",
-                         "off": "not shared"}[sharing.get("calendar", "off")],
-            "reminders": "read and add" if sharing.get("reminders") else "not shared",
+            "calendar": _calendar_level(sharing),
+            "reminders": ("not shared" if not sharing.get("reminders") else
+                          "read only (no changes)" if sharing.get("reminders_read_only") else "read and add"),
             "details": "notes, attendees and links shared" if sharing.get("details") else
                        "titles, times and places only (no notes, attendees or links)",
-            "adds_without_asking": bool(sharing.get("auto_add")),
+            "adds_without_asking": bool(sharing.get("auto_add")) and (
+                shares(sharing, "events_write") or shares(sharing, "reminders_write")),
             "calendars": [{key: value for key, value in calendar.items() if key != "color"}
                           for calendar in calendars],
         }
@@ -422,6 +428,13 @@ def _overview(store: PhoneStore, only: str | None = None) -> dict[str, Any]:
         found.append(entry)
     return {"ok": True, "devices": found, "note": FRESHNESS_NOTE + " Changes to a shared calendar or list notify "
                                                                   "the other people on it."}
+
+
+def _calendar_level(sharing: dict[str, Any]) -> str:
+    calendar = sharing.get("calendar", "off")
+    if calendar == "full" and sharing.get("calendar_read_only"):
+        return "read only (no changes)"
+    return {"full": "read and add", "write_only": "add only (can't read)"}.get(calendar, "not shared")
 
 
 # --- Writes ------------------------------------------------------------------------
@@ -466,7 +479,7 @@ def _queued(store: PhoneStore, change: dict[str, Any], profile: str) -> tuple[st
 
 def _write(store: PhoneStore, kind: str, args: dict[str, Any], session_id: Any, profile: str) -> dict[str, Any]:
     is_event = kind.endswith("_event")
-    need = "events_write" if kind == "add_event" else "events" if is_event else "reminders"
+    need = change_need(kind)
     fields: dict[str, Any] = {}
     target: dict[str, Any] = {}
     for key in (_EVENT_ARGS if is_event else _REMINDER_ARGS):

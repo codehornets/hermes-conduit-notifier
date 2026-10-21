@@ -1938,7 +1938,12 @@ whether notes and attendees are included (off by default).
   Focus time more than 5 minutes ahead of this host's clock is refused
   with code `clock_skew`, so a future-dated batch can't make the real ones
   after it (a sharing change included) look out of date. What a refused
-  batch turns off is still forgotten.
+  batch turns off is still forgotten. A calendar or reminders shared
+  "read only" (`calendar_read_only` / `reminders_read_only`, plugin
+  0.52.0+) are read but never written: every change to them is refused
+  with `shared_read_only`, changes already waiting fail at the phone's
+  next exchange (as do those whose calendar or list is no longer shared),
+  and a refused batch can't lift read-only.
 - **Writes are changes the phone applies.** Hermes can't touch the phone's
   calendar, so `conduit_calendar`'s write actions queue a pending change.
   The plugin nudges the phone with a `phone.changes` relay event (sealed

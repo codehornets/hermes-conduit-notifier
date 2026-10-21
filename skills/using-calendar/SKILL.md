@@ -60,9 +60,13 @@ what they already shared.
 ## Start with overview
 
 `conduit_calendar` with `action: "overview"` says what each device shares
-(calendar: read and add, add only, or not shared; reminders; whether
-notes and attendees are included; whether Hermes may add without asking),
-the calendar and list names, and how fresh the copy is.
+(calendar: read and add, read only, add only, or not shared; reminders:
+read and add, read only, or not shared; whether notes and attendees are
+included; whether Hermes may add without asking), the calendar and list
+names, and how fresh the copy is. When the calendar or reminders are read
+only, the user chose that Hermes never changes them: don't ask the phone
+for a change there (it's refused); tell the user what to add or change
+themselves.
 
 ## Which action answers what
 

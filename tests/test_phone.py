@@ -678,8 +678,23 @@ def test_unselecting_a_calendar_or_list_forgets_its_items(store, iphone):
 def test_a_refused_batch_narrows_from_nothing_stored_to_nothing():
     narrowed = phone._narrowed(None, phone._parse_sharing(_sharing()))
     assert narrowed["calendar"] == "off" and narrowed["future_days"] == 0
-    assert not any(value for value in narrowed.values() if isinstance(value, bool))
+    assert not any(value for field, value in narrowed.items()
+                   if isinstance(value, bool) and field not in phone.READ_ONLY_SHARING)
+    # Stored before read-only existed: off, and nothing writable is left anyway.
+    assert all(narrowed[field] is False for field in phone.READ_ONLY_SHARING)
     assert phone._narrowed({"reminders": True}, phone._parse_sharing(_sharing()))["calendar"] == "off"
+
+
+def test_a_refused_batch_cant_lift_read_only():
+    stored = phone._parse_sharing(_sharing(calendar_read_only=True))
+    assert phone._narrowed(stored, phone._parse_sharing(_sharing()))["calendar_read_only"] is True
+    assert phone._narrowed(phone._parse_sharing(_sharing()),
+                           phone._parse_sharing(_sharing(reminders_read_only=True)))["reminders_read_only"] is True
+    assert phone._narrowed(phone._parse_sharing(_sharing()),
+                           phone._parse_sharing(_sharing()))["calendar_read_only"] is False
+    # Add-only and read-only together leave nothing.
+    assert phone._parse_sharing(_sharing(calendar="write_only", calendar_read_only=True))["calendar"] == "off"
+    assert phone._parse_sharing(_sharing(reminders=False, reminders_read_only=True))["reminders_read_only"] is False
 
 
 def test_a_future_batch_is_refused_and_cant_hold_off_a_revocation(store, iphone):
@@ -838,6 +853,58 @@ def test_wipe_all_keeps_nothing_and_a_new_key_after_it_stays(store, iphone):
 
 
 # --- Pending changes and the exchange ------------------------------------------------
+
+
+def test_a_read_only_calendar_is_read_but_never_changed(store, iphone):
+    store.ingest(iphone.seal(_batch(sharing=_sharing(calendar_read_only=True))))
+    assert "e_standup" in _events(store)
+    event = {"title": "Gym", "start": "2026-10-15T07:00:00+01:00", "end": "2026-10-15T08:00:00+01:00"}
+    for kind, fields, target in (("add_event", event, None), ("update_event", {"title": "Gym"}, {"event_id": "e_standup"}),
+                                 ("delete_event", {}, {"event_id": "e_standup"})):
+        with pytest.raises(phone.PhoneError) as error:
+            store.add_change(kind, fields, target)
+        assert error.value.code == "shared_read_only"
+        with pytest.raises(phone.PhoneError) as error:
+            store.add_change(kind, fields, target, device=DEVICE)
+        assert error.value.code == "shared_read_only"
+    # Reminders stay writable: each has its own switch.
+    assert store.add_change("add_reminder", {"title": "Milk"})["kind"] == "add_reminder"
+
+
+def test_read_only_reminders_are_read_but_never_changed(store, iphone):
+    store.ingest(iphone.seal(_batch(sharing=_sharing(reminders_read_only=True))))
+    with store.reader("reminders") as (db, device):
+        assert store.reminders(db, device["id"], status="all")[0]
+    for kind, fields, target in (("add_reminder", {"title": "Milk"}, None),
+                                 ("complete_reminder", {}, {"reminder_id": "r_milk"}),
+                                 ("delete_reminder", {}, {"reminder_id": "r_milk"})):
+        with pytest.raises(phone.PhoneError) as error:
+            store.add_change(kind, fields, target)
+        assert error.value.code == "shared_read_only" and "reminders read-only" in str(error.value)
+    assert store.add_change("add_event", {"title": "Gym", "start": "2026-10-15T07:00:00+01:00",
+                                          "end": "2026-10-15T08:00:00+01:00"})["kind"] == "add_event"
+
+
+def test_a_change_waiting_when_the_calendar_turns_read_only_never_reaches_the_phone(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    change = store.add_change("delete_event", {}, {"event_id": "e_standup"})
+    reminder = store.add_change("add_reminder", {"title": "Milk"})
+    store.ingest(iphone.seal(_batch("batch-0002", sent_at="2026-10-14T08:01:00+01:00",
+                                    sharing=_sharing(calendar_read_only=True))))
+    assert [sent["id"] for sent in iphone.changes(store)] == [reminder["id"]]
+    refused = next(item for item in store.changes() if item["id"] == change["id"])
+    assert refused["state"] == "failed" and "read-only" in refused["note"]
+
+
+def test_a_change_waiting_when_sharing_turns_off_never_reaches_the_phone(store, iphone):
+    store.ingest(iphone.seal(_batch()))
+    change = store.add_change("add_reminder", {"title": "Milk"})
+    store.ingest(iphone.seal(_batch("batch-0002", sent_at="2026-10-14T08:01:00+01:00",
+                                    sharing=_sharing(reminders=False))))
+    assert iphone.changes(store) == []
+    [refused] = store.changes()
+    assert refused["id"] == change["id"] and refused["state"] == "failed"
+    assert "no longer shares" in refused["note"]
 
 
 def test_a_change_reaches_the_phone_and_its_outcome_comes_back(store, iphone):
@@ -1122,6 +1189,19 @@ def test_write_only_refuses_reads_but_takes_adds(home):
     added = _cal({"action": "add_event", "title": "Gym", "start": "2026-10-15T07:00:00+01:00",
                   "end": "2026-10-15T08:00:00+01:00", "calendar": "Personal"})
     assert added["ok"] is True and added["status"] == "waiting_for_approval"
+
+
+def test_read_only_sharing_reads_and_tells_the_agent_not_to_write(home):
+    _shared(home, calendar_read_only=True, reminders_read_only=True, auto_add=True)
+    [device] = _cal({"action": "overview"})["devices"]
+    assert device["calendar"] == "read only (no changes)" and device["reminders"] == "read only (no changes)"
+    assert _cal({"action": "events", "from": "2026-10-14"})["ok"] is True
+    added = _cal({"action": "add_event", "title": "Gym", "start": "2026-10-15T07:00:00+01:00",
+                  "end": "2026-10-15T08:00:00+01:00"})
+    assert added["error"] == "shared_read_only" and "tell the user" in added["note"] and "conduit://settings/phone" in added["note"]
+    assert _cal({"action": "complete_reminder", "reminder_id": "r_milk"})["error"] == "shared_read_only"
+    assert device["adds_without_asking"] is False
+    assert home.sent == []
 
 
 def test_a_write_queues_a_change_and_nudges_the_phone(home):
