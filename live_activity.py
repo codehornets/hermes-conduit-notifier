@@ -17,8 +17,8 @@ Sends are coalesced per session on one background thread: at most one every
 once. The relay answers whether the phone registered an activity for the
 session; one that didn't (yet) is asked again only every
 ``UNTRACKED_RETRY_S`` (Conduit registers a moment after the turn starts), so a
-turn nobody watches costs a request or two. A relay without the route turns
-the whole thing off for a while.
+turn nobody watches costs a request or two. A relay without the route, or
+one that refuses the caller (401/403), turns the whole thing off for a while.
 """
 
 from __future__ import annotations
@@ -53,6 +53,11 @@ END_RETRY_S = 10.0
 END_GIVE_UP_S = 15 * 60.0
 # The relay has no Live Activity route: try again after this long.
 UNSUPPORTED_S = 30 * 60.0
+# The relay (or a filter in front of it) refused the credential or the
+# caller: every turn waits this long. Retrying an end every 10 s instead kept
+# a CrowdSec brute-force ban renewing itself for days. A refused end is
+# given up on (END_GIVE_UP_S) before the pause lifts.
+REFUSED_S = 30 * 60.0
 # How long a sent end keeps a second end of the same turn from going out.
 ENDED_MEMORY_S = 120.0
 # Turns tracked at once; the oldest is forgotten past this.
@@ -273,6 +278,14 @@ class LiveActivityReporter:
                 if now - ended_at >= ENDED_MEMORY_S:
                     del self._ended[session_id]
         for session_id, turn, payload in due:
+            with self._lock:
+                # A refusal earlier in this batch paused everything: the rest
+                # wait too instead of reaching the relay back to back.
+                if self._clock() < self._paused_until:
+                    if self._turns.get(session_id) is turn:
+                        turn.dirty = True
+                    next_in = self._paused_until - self._clock()
+                    continue
             self._deliver(session_id, turn, payload)
         return next_in
 
@@ -296,6 +309,10 @@ class LiveActivityReporter:
                 if status == 404:
                     # The relay has no route at all: every turn waits.
                     self._paused_until = now + UNSUPPORTED_S
+                elif status in (401, 403):
+                    self._paused_until = now + REFUSED_S
+                    logger.warning("Conduit Live Activity paused for %d minutes: the relay answered %s",
+                                   REFUSED_S // 60, status)
                 else:
                     turn.retry_at = now + (END_RETRY_S if payload.get("end") is not None else BACKOFF_S)
                 # The state (an end included) goes out on the next try,
@@ -409,13 +426,23 @@ def _post_to_relay(payload: dict[str, Any]) -> dict[str, Any]:
         return {"tracked": False}
     if state.get("redact_content"):
         payload = {**payload, "state": {k: v for k, v in payload["state"].items() if k != "tool"}}
-    return client.request_json(
-        f"{state['relay_url'].rstrip('/')}/v1/live-activity",
-        method="POST",
-        credential=state["credential"],
-        payload=payload,
-        timeout=10.0,
-    )
+    try:
+        answer = client.request_json(
+            f"{state['relay_url'].rstrip('/')}/v1/live-activity",
+            method="POST",
+            credential=state["credential"],
+            payload=payload,
+            timeout=10.0,
+        )
+    except client.RelayRejected as error:
+        # The same "pair again" signal notifications raise (and clear), for a
+        # host whose only relay traffic is Live Activities.
+        if error.status == 401:
+            client._mark_relay_rejected(state, True)
+        raise
+    if state.get("relay_rejected_at"):
+        client._mark_relay_rejected(state, False)
+    return answer
 
 
 reporter = LiveActivityReporter()

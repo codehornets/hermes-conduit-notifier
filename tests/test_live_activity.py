@@ -166,6 +166,65 @@ def test_a_relay_without_the_route_turns_reporting_off_for_a_while(reporter, rel
     assert relay.posts[-1]["session_id"] == "s-2"
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_refused_caller_pauses_every_turn_instead_of_retrying(reporter, relay, clock, status):
+    reporter.turn_started("s-1")
+    clock[0] += live.FIRST_DELAY_S
+    reporter.flush()
+    relay.failure = client.RelayRejected(status, "request_rejected")
+    reporter.turn_ended("s-1", "done")
+    reporter.flush()
+    reporter.turn_started("s-2")
+    for _ in range(30):
+        clock[0] += live.END_RETRY_S
+        reporter.flush()
+    assert len(relay.posts) == 2
+    relay.failure = None
+    clock[0] += live.REFUSED_S
+    reporter.thinking("s-2")
+    reporter.flush()
+    assert relay.posts[-1]["session_id"] == "s-2"
+    assert len(relay.posts) == 3
+
+
+def test_a_refusal_holds_back_the_rest_of_the_batch(reporter, relay, clock):
+    for session_id in ("s-1", "s-2", "s-3"):
+        reporter.turn_started(session_id)
+    relay.failure = client.RelayRejected(403, "request_rejected")
+    clock[0] += live.FIRST_DELAY_S
+    reporter.flush()
+    assert len(relay.posts) == 1
+    relay.failure = None
+    clock[0] += live.REFUSED_S
+    reporter.flush()
+    assert sorted(post["session_id"] for post in relay.posts[1:]) == ["s-1", "s-2", "s-3"]
+
+
+def test_a_working_credential_clears_the_refusal(monkeypatch):
+    state = {"relay_url": "https://relay.example", "credential": "c", "relay_rejected_at": "2026-10-21T00:00:00Z"}
+    marked = []
+    monkeypatch.setattr(client, "load_state", lambda: state)
+    monkeypatch.setattr(client, "_mark_relay_rejected", lambda sent_with, rejected: marked.append((sent_with, rejected)))
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: {"tracked": True})
+    assert live._post_to_relay({"session_id": "s", "state": {"phase": "thinking", "tools": 0}}) == {"tracked": True}
+    assert marked == [(state, False)]
+
+
+def test_a_refused_credential_tells_status_to_pair_again(monkeypatch):
+    state = {"relay_url": "https://relay.example", "credential": "c"}
+    marked = []
+    monkeypatch.setattr(client, "load_state", lambda: state)
+    monkeypatch.setattr(client, "_mark_relay_rejected", lambda sent_with, rejected: marked.append((sent_with, rejected)))
+
+    def refuse(url, **kwargs):
+        raise client.RelayRejected(401, "unauthorized")
+
+    monkeypatch.setattr(client, "request_json", refuse)
+    with pytest.raises(client.RelayRejected):
+        live._post_to_relay({"session_id": "s", "state": {"phase": "thinking", "tools": 0}})
+    assert marked == [(state, True)]
+
+
 def test_an_end_the_relay_did_not_take_is_sent_again(reporter, relay, clock):
     reporter.turn_started("s-1")
     clock[0] += live.FIRST_DELAY_S
