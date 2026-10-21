@@ -10,17 +10,31 @@ process that hosts those sessions.
 
 Everything here goes through the host's method table. A Hermes without it
 (or without either method) reports itself unavailable instead of failing.
+
+The chat is Pulse's own, so when another surface holds it (Hermes Desktop
+keeps a chat it has open, and Hermes refuses anyone else's turn with
+SESSION_NOT_OWNED) Pulse takes it over the way Conduit's "Take over" does
+(chat_takeover.py) and sends once more. A turn running there is never cut
+off: that answers busy and the send stays refused.
 """
 
 from __future__ import annotations
 
 import sys
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 RESUME = "session.resume"
 SUBMIT = "prompt.submit"
+# Like the dashboard's takeover route: a lock holder that never lets go
+# can't stall the Pulse loop longer than this.
+TAKEOVER_TIMEOUT_S = 20.0
+# The one takeover worker that may still be waiting on Hermes' lock: while it
+# is, a new takeover waits for it instead of starting another thread.
+_worker: Optional[threading.Thread] = None
+_worker_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -46,7 +60,50 @@ def available() -> bool:
     return _methods() is not None
 
 
-def send(chat_id: str, text: str, *, profile: str = "") -> Sent:
+def take_over(session_ids: list[str]) -> str:
+    """Drops other processes' claims on the chat: chat_takeover's status
+    ("free", "taken_over", "busy", "same_host"), or why it couldn't.
+
+    One worker at a time: a worker that timed out waiting on Hermes' lock is
+    left waiting, and until it finishes every refusal reports that instead of
+    starting another thread (a lock Hermes never releases needs a restart)."""
+    global _worker
+    try:
+        from . import chat_takeover as takeover
+    except Exception as error:  # noqa: BLE001 — a partial install: a reason, not a crash
+        return f"takeover failed: {type(error).__name__}"
+    abandoned = threading.Event()
+    outcome: list[str] = []
+
+    def run() -> None:
+        try:
+            registry, turn_marker = takeover.modules()
+            outcome.append(str(takeover.take_over_session(
+                session_ids, registry=registry, turn_marker=turn_marker, home=takeover.home(), by="Pulse",
+                abandoned=abandoned).get("status") or ""))
+        except takeover.TakeoverError as error:
+            outcome.append(str(error))
+        except Exception as error:  # noqa: BLE001 — a reason for `pulse status`, never a crash in the loop
+            outcome.append(f"takeover failed: {type(error).__name__}")
+
+    with _worker_lock:
+        if _worker is not None and _worker.is_alive():
+            return "a takeover is still waiting on Hermes"
+        worker = threading.Thread(target=run, name="conduit-pulse-takeover", daemon=True)
+        _worker = worker
+    try:
+        worker.start()
+    except RuntimeError as error:
+        return f"takeover failed: {type(error).__name__}"
+    worker.join(TAKEOVER_TIMEOUT_S)
+    if worker.is_alive():
+        abandoned.set()  # nothing is written after this
+        return "takeover timed out"
+    return outcome[0] if outcome else "takeover failed"
+
+
+def send(chat_id: str, text: str, *, profile: str = "",
+         taking_over: Optional[Callable[[list[str]], str]] = None) -> Sent:
     """Reopens the chat (the live session when someone has it open) and
     submits ``text`` as a hidden turn. A chat busy with a turn queues it
     behind that turn instead of interrupting it."""
@@ -63,12 +120,34 @@ def send(chat_id: str, text: str, *, profile: str = "") -> Sent:
     sid = ((resumed.get("result") or {}).get("session_id") or "") if isinstance(resumed.get("result"), dict) else ""
     if not sid:
         return Sent(False, "", "couldn't open the chat: no session id came back")
-    submitted = methods[SUBMIT](rid, {"session_id": sid, "text": text, "display_kind": "hidden", "queued": True})
+    def submit() -> Any:
+        # A request id per call: the resend is a new request, not the refused one.
+        return methods[SUBMIT](f"pulse-{uuid.uuid4().hex[:12]}",
+                               {"session_id": sid, "text": text, "display_kind": "hidden", "queued": True})
+
+    submitted, taken = submit(), ""
+    if _not_owned(submitted):
+        taken = (taking_over or take_over)(list(dict.fromkeys([chat_id, sid])))
+        if taken not in ("free", "taken_over", "same_host"):
+            return Sent(False, "", f"the chat refused the turn: {_message(submitted)} "
+                                   f"(Pulse couldn't take it over: {taken or 'unknown'})")
+        submitted = submit()
+        if _not_owned(submitted):
+            return Sent(False, "", f"the chat refused the turn again after Pulse took it over ({taken}): "
+                                   f"{_message(submitted)}")
     if not isinstance(submitted, dict) or "error" in submitted:
-        return Sent(False, "", f"the chat refused the turn: {_message(submitted)}")
+        after = f" after Pulse took it over ({taken})" if taken else ""
+        return Sent(False, "", f"the chat refused the turn{after}: {_message(submitted)}")
     result = submitted.get("result") if isinstance(submitted.get("result"), dict) else {}
     status = str(result.get("status") or "")
     return Sent(True, "streaming" if status == "streaming" else "queued", status)
+
+
+def _not_owned(response: Any) -> bool:
+    """Hermes refused the turn because another live surface holds the chat."""
+    error = response.get("error") if isinstance(response, dict) else None
+    data = error.get("data") if isinstance(error, dict) else None
+    return isinstance(data, dict) and data.get("reason") == "SESSION_NOT_OWNED"
 
 
 def _message(response: Any) -> str:

@@ -387,6 +387,72 @@ def test_send_reports_a_refusal(monkeypatch):
     assert not sent.ok and "session not found" in sent.detail
 
 
+NOT_OWNED = {"error": {"code": 4090, "message": "This chat is open in another Hermes window/terminal.",
+                       "data": {"reason": "SESSION_NOT_OWNED"}}}
+
+
+@pytest.mark.parametrize("status", ["taken_over", "free"])
+def test_a_chat_held_elsewhere_is_taken_over_and_sent_again(monkeypatch, status):
+    fake = FakeHost().install(monkeypatch)
+    replies, rids = [NOT_OWNED, {"result": {"status": "streaming"}}], []
+    monkeypatch.setitem(sys.modules["tui_gateway.server"]._methods, host.SUBMIT,
+                        lambda rid, params: rids.append(rid) or fake.calls.append((host.SUBMIT, params))
+                        or replies.pop(0))
+    taken = []
+    monkeypatch.setattr(host, "take_over", lambda ids: taken.append(ids) or status)
+    assert host.send(SID, "x") == host.Sent(True, "streaming", "streaming")
+    assert taken == [[SID, "ui-1"]]
+    assert [name for name, _ in fake.calls] == [host.RESUME, host.SUBMIT, host.SUBMIT]
+    assert len(set(rids)) == 2  # the resend is a new request
+
+
+def test_one_takeover_waits_on_hermes_at_a_time(monkeypatch):
+    import threading
+
+    takeover = _load("conduit_push.chat_takeover", ROOT / "chat_takeover.py")
+    release = threading.Event()
+    monkeypatch.setattr(takeover, "modules", lambda: (object(), object()))
+    monkeypatch.setattr(takeover, "home", lambda: "home")
+    monkeypatch.setattr(takeover, "take_over_session", lambda ids, **_: release.wait(5) and {"status": "free"})
+    monkeypatch.setattr(host, "TAKEOVER_TIMEOUT_S", 0.05)
+    assert host.take_over([SID]) == "takeover timed out"
+    assert host.take_over([SID]) == "a takeover is still waiting on Hermes"
+    release.set()
+    host._worker.join(2)
+    monkeypatch.setattr(host, "TAKEOVER_TIMEOUT_S", 2)
+    assert host.take_over([SID]) == "free"
+
+
+def test_the_dashboard_and_pulse_copies_share_one_takeover_lock():
+    pulse_copy = _load("conduit_push.chat_takeover", ROOT / "chat_takeover.py")
+    dashboard_copy = _load("conduit_push_dashboard_pkg.chat_takeover", ROOT / "chat_takeover.py")
+    assert pulse_copy is not dashboard_copy
+    assert pulse_copy._in_process is dashboard_copy._in_process
+
+
+def test_another_refusal_after_the_takeover_names_it(monkeypatch):
+    fake = FakeHost().install(monkeypatch)
+    replies = [NOT_OWNED, {"error": {"code": 4009, "message": "nope"}}]
+    monkeypatch.setitem(sys.modules["tui_gateway.server"]._methods, host.SUBMIT,
+                        lambda rid, params: fake.calls.append((host.SUBMIT, params)) or replies.pop(0))
+    sent = host.send(SID, "x", taking_over=lambda ids: "taken_over")
+    assert not sent.ok and sent.detail == "the chat refused the turn after Pulse took it over (taken_over): nope"
+
+
+def test_a_chat_busy_elsewhere_stays_refused(monkeypatch):
+    fake = FakeHost(submit=NOT_OWNED).install(monkeypatch)
+    sent = host.send(SID, "x", taking_over=lambda ids: "busy")
+    assert not sent.ok and "couldn't take it over: busy" in sent.detail
+    assert [name for name, _ in fake.calls] == [host.RESUME, host.SUBMIT]
+
+
+def test_another_refusal_takes_nothing_over(monkeypatch):
+    FakeHost(submit={"error": {"code": 4009, "message": "nope"}}).install(monkeypatch)
+    taken = []
+    assert not host.send(SID, "x", taking_over=lambda ids: taken.append(ids) or "taken_over").ok
+    assert taken == []
+
+
 def test_no_host_means_unavailable(monkeypatch):
     monkeypatch.delitem(sys.modules, "tui_gateway.server", raising=False)
     assert not host.available()
@@ -2024,3 +2090,46 @@ def test_pulse_routes(remembering, db, monkeypatch):
     assert http.post(f"{base}/backfill", json={"action": "stop"}).json()["detail"]["code"] == "not_running"
     assert http.post(f"{base}/memory/forget", json={"id": 1}).json()["forgotten"] is False
     assert not (fresh / store.DB_NAME).exists()
+
+
+def test_take_over_names_why_it_could_not(monkeypatch):
+    takeover = _load("conduit_push.chat_takeover", ROOT / "chat_takeover.py")
+    monkeypatch.setattr(takeover, "modules", lambda: (_ for _ in ()).throw(
+        takeover.TakeoverError(501, "This Hermes version can't hand a chat over")))
+    assert host.take_over([SID]) == "This Hermes version can't hand a chat over"
+
+
+def test_take_over_turns_any_failure_into_a_reason(monkeypatch):
+    takeover = _load("conduit_push.chat_takeover", ROOT / "chat_takeover.py")
+    monkeypatch.setattr(takeover, "modules", lambda: (_ for _ in ()).throw(OSError("disk")))
+    assert host.take_over([SID]) == "takeover failed: OSError"
+
+
+def test_a_takeover_that_hangs_is_abandoned(monkeypatch):
+    import threading
+
+    takeover = _load("conduit_push.chat_takeover", ROOT / "chat_takeover.py")
+    release, seen = threading.Event(), []
+
+    def stuck(ids, *, abandoned, **_):
+        release.wait(5)
+        seen.append(abandoned.is_set())
+        return {"status": "taken_over"}
+
+    monkeypatch.setattr(takeover, "modules", lambda: (object(), object()))
+    monkeypatch.setattr(takeover, "home", lambda: "home")
+    monkeypatch.setattr(takeover, "take_over_session", stuck)
+    monkeypatch.setattr(host, "TAKEOVER_TIMEOUT_S", 0.05)
+    assert host.take_over([SID]) == "takeover timed out"
+    release.set()
+    for _ in range(100):
+        if seen:
+            break
+        time.sleep(0.01)
+    assert seen == [True]  # the worker sees it was abandoned, so it writes nothing
+
+
+def test_a_chat_refused_again_after_the_takeover_says_so(monkeypatch):
+    FakeHost(submit=NOT_OWNED).install(monkeypatch)
+    sent = host.send(SID, "x", taking_over=lambda ids: "same_host")
+    assert not sent.ok and "again after Pulse took it over (same_host)" in sent.detail
