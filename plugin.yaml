@@ -1,6 +1,6 @@
 name: conduit_push
 manifest_version: 1
-version: 0.52.3
+version: 0.53.0
 description: "Send Hermes lifecycle notifications to Conduit devices."
 author: Hermes Conduit
 kind: standalone
@@ -10,6 +10,7 @@ platforms:
   - windows
 provides_hooks:
   - pre_tool_call
+  - post_tool_call
   - post_llm_call
   - on_session_end
   - pre_approval_request
