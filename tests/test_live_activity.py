@@ -210,6 +210,61 @@ def test_a_working_credential_clears_the_refusal(monkeypatch):
     assert marked == [(state, False)]
 
 
+def test_a_failed_refusal_mark_still_reports_the_relay_answer(monkeypatch):
+    state = {"relay_url": "https://relay.example", "credential": "c", "relay_rejected_at": "x"}
+    monkeypatch.setattr(client, "load_state", lambda: state)
+
+    def broken(sent_with, rejected):
+        raise RuntimeError("state unavailable")
+
+    monkeypatch.setattr(client, "_mark_relay_rejected", broken)
+    monkeypatch.setattr(client, "request_json", lambda url, **kwargs: {"tracked": True})
+    assert live._post_to_relay({"session_id": "s", "state": {"phase": "thinking", "tools": 0}}) == {"tracked": True}
+
+    def refuse(url, **kwargs):
+        raise client.RelayRejected(401, "unauthorized")
+
+    monkeypatch.setattr(client, "request_json", refuse)
+    with pytest.raises(client.RelayRejected):
+        live._post_to_relay({"session_id": "s", "state": {"phase": "thinking", "tools": 0}})
+
+
+def test_a_reload_starts_unpaused(reporter, relay, clock):
+    relay.failure = client.RelayRejected(401, "unauthorized")
+    reporter.turn_started("s-1")
+    clock[0] += live.FIRST_DELAY_S
+    reporter.flush()
+    reporter.stop()
+    reporter.start()
+    relay.failure = None
+    reporter.turn_started("s-2")
+    clock[0] += live.FIRST_DELAY_S
+    reporter.flush()
+    assert relay.posts[-1]["session_id"] == "s-2"
+
+
+def test_a_refusal_in_flight_across_a_reload_does_not_pause_the_new_reporter(reporter, relay, clock):
+    reporter.turn_started("s-1")
+    clock[0] += live.FIRST_DELAY_S
+    stale = []
+
+    def post(payload):
+        # The plugin reloads while this send is on its way, then it's refused.
+        reporter.stop()
+        reporter.start()
+        stale.append(payload)
+        raise client.RelayRejected(401, "unauthorized")
+
+    reporter._post = post
+    reporter.flush()
+    reporter._post = relay
+    reporter.turn_started("s-2")
+    clock[0] += live.FIRST_DELAY_S
+    reporter.flush()
+    assert len(stale) == 1
+    assert relay.posts[-1]["session_id"] == "s-2"
+
+
 def test_a_refused_credential_tells_status_to_pair_again(monkeypatch):
     state = {"relay_url": "https://relay.example", "credential": "c"}
     marked = []
