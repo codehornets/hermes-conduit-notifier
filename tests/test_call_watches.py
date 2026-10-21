@@ -47,6 +47,7 @@ class FakeHermes:
         self.calls = []
         self.list_fails = False
         self.next_id = 1
+        self.id_format = "{:012x}"
 
     def __call__(self, action, job_id=None, include_disabled=False, **fields):
         self.calls.append((action, job_id, fields))
@@ -60,7 +61,7 @@ class FakeHermes:
                  **{field: job[field] for field in ("script", "enabled_toolsets") if job.get(field)}}
                 for key, job in self.jobs.items()]})
         if action == "create":
-            key = f"{self.next_id:012x}"
+            key = self.id_format.format(self.next_id)
             self.next_id += 1
             self.jobs[key] = {"name": fields["name"], "prompt": fields["prompt"], "schedule": fields["schedule"],
                               "skills": fields.get("skills") or [], "enabled_toolsets": fields.get("enabled_toolsets")}
@@ -389,6 +390,15 @@ def test_a_gateway_owned_run_is_known_by_its_task_id(home, hermes, clock):
                                          session_id="gateway-session-1", task_id=task))
     assert answer["error"] == "use_report"
     assert not watches.is_watch_run("gateway-session-1", "cron:not-a-watch:x")
+
+
+@pytest.mark.parametrize("id_format", ["job.{}_nightly", "j{:0100d}"])
+def test_a_watch_on_any_valid_cron_job_id_keeps_ringing(home, hermes, clock, id_format):
+    # Hermes allows . and _ and up to 128 characters: the stored watch must survive a reload.
+    hermes.id_format = id_format
+    job_id = _homelab(hermes)
+    assert watches._store().configs().keys() == {job_id}
+    assert _report(job_id, True)["status"] == "waiting"
 
 
 def test_outside_the_allowed_hours_it_waits_and_calls_inside_them(home, hermes, clock):

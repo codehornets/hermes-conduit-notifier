@@ -40,7 +40,7 @@ from typing import Any, Callable, Iterator
 
 from hermes_constants import get_hermes_home
 
-from . import calls, client, cron_runs
+from . import calls, client, cron_runs, cron_store
 from .calls_store import _exclusive
 
 logger = logging.getLogger("hermes.plugins.conduit_push")
@@ -877,7 +877,8 @@ def _normalized(raw: Any) -> dict[str, Any]:
     watches: dict[str, dict[str, Any]] = {}
     stored = raw.get("watches") if isinstance(raw.get("watches"), dict) else {}
     for job_id, entry in stored.items():
-        if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", job_id) or not isinstance(entry, dict):
+        # The cron contract's own id rule, as run detection reads it.
+        if cron_store.valid_job_id(job_id) is None or not isinstance(entry, dict):
             continue
         config = _stored_config(entry.get("config"))
         if config is not None:
