@@ -4958,10 +4958,21 @@ def _card_schema() -> Any:
         return None if _card_schema_module is _CARD_SCHEMA_MISSING else _card_schema_module
 
 
-def _row_message(turn: Dict[str, Any]) -> Dict[str, Any]:
+def _voice_turn_receipt(call_id: str, index: int) -> str:
+    """The receipt a stored turn carries as its platform_message_id: the call
+    and the turn's index, so a retried save recognizes exactly the turns an
+    earlier attempt already stored (the same dedupe Hermes' gateway runs on a
+    retried user turn, via SessionDB.has_platform_message_id)."""
+    return f"conduit-voice:{call_id}:{index}"
+
+
+def _row_message(turn: Dict[str, Any], call_id: str) -> Dict[str, Any]:
     """A turn as a row's message: a session row holds text only, so a turn's
-    cards become their Markdown after its text."""
+    cards become their Markdown after its text. The receipt rides along so a
+    retried save that lands after its append but before the watermark write
+    drops the turns the row already holds instead of writing them twice."""
     message = {k: v for k, v in turn.items() if k not in ("index", "cards") and v is not None}
+    message["platform_message_id"] = _voice_turn_receipt(call_id, turn["index"])
     schema = _card_schema() if turn.get("cards") else None
     if schema:
         markdown = schema.fallback_markdown(turn["cards"])
@@ -5093,7 +5104,12 @@ def save_voice_turns(body: Dict[str, Any],
     Conduit saves a call only after it has ended, so those turns end it. It runs
     with the store closed but the save lock held, so a session's ends keep the
     order its turns were stored in; it must be quick and must not raise (the
-    turns are already stored).
+    turns are already stored). A retry that finds its turns already stored by
+    receipt (an earlier attempt died before its watermark, so before its end)
+    still ends the call, with those turns.
+
+    ``skipped`` counts every turn this save didn't append: replays below the
+    watermark and turns the row already held by receipt.
     """
     call_id = _voice_id(body.get("call_id"), "call_id")
     engine = str(body.get("engine") or "").strip()
@@ -5152,15 +5168,39 @@ def save_voice_turns(body: Dict[str, Any],
                         raise TokenError(400, f"Turns must continue from index {last + 1} for this call")
                     fresh.append(turn)
                     last = turn["index"]
+                # The append and the watermark are two separate commits, so a
+                # save can store its turns and die before the watermark write;
+                # the outbox then retries the same turns. A turn the row
+                # already holds is recognized by its receipt and dropped here
+                # instead of written twice, while the watermark below still
+                # advances past it. Hosts without the receipt lookup (older
+                # Hermes) keep the old best-effort behavior, and so do hosts
+                # whose only writer is append_message: it doesn't store the
+                # receipt, so the lookup never finds one.
+                to_end = fresh
+                receipts_dropped = 0
+                if fresh and hasattr(db, "has_platform_message_id"):
+                    kept = []
+                    for turn in fresh:
+                        if db.has_platform_message_id(session_id, _voice_turn_receipt(call_id, turn["index"])):
+                            receipts_dropped += 1
+                            continue
+                        kept.append(turn)
+                    if receipts_dropped:
+                        fresh = kept
                 skipped = len(turns) - len(fresh)
                 if skipped:
                     logger.debug("Conduit voice save for %s skipped %d already-written turn(s)", session_id, skipped)
-                messages = [_row_message(turn) for turn in fresh]
+                messages = [_row_message(turn, call_id) for turn in fresh]
                 if messages:
                     _append_voice_messages(db, session_id, messages)
-                if fresh:
+                # The watermark is written before the end runs, so turns
+                # dropped by receipt were stored by an attempt that died before
+                # its end: this save ends the call, with all of them.
+                end_messages = [_row_message(turn, call_id) for turn in to_end]
+                if fresh or receipts_dropped:
                     _record_voice_call(db, session_id, calls, call_id, last)
-                if hasattr(db, "end_session") and (created or adopted or fresh):
+                if hasattr(db, "end_session") and (created or adopted or fresh or receipts_dropped):
                     # A saved call is never a live chat; the first end wins, so
                     # later flushes are no-ops. Hermes refuses appends only to rows
                     # that compression closed, so this end doesn't block them.
@@ -5182,8 +5222,8 @@ def save_voice_turns(body: Dict[str, Any],
                       "skipped": skipped, "created": created}
         finally:
             db.close()
-        if messages and on_end is not None:
-            on_end(session_id, engine, messages)
+        if end_messages and on_end is not None:
+            on_end(session_id, engine, end_messages)
     return result
 
 
