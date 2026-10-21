@@ -214,10 +214,26 @@ def test_session_rejects_a_bad_greeting(client, openai, greeting):
     assert openai.calls == []
 
 
-@pytest.mark.parametrize("briefing", [5, "x" * (api.GPT_LIVE_MAX_BRIEFING_CHARS + 1)])
+def test_session_takes_a_briefing_with_a_long_memory(client, openai):
+    """A 44 KB briefing (rules, persona and a long memory) went over the old 32 KB
+    limit and ended every call (kaishi00/hermes-conduit#1077)."""
+    briefing = "[Conduit rules]\n<hermes_memory>\n" + "Likes tea.\n" * 4_000 + "</hermes_memory>"
+    assert len(briefing) > 40_000
+    body = client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "briefing": briefing}).json()
+    assert body["briefing_applied"] is True
+
+
+@pytest.mark.parametrize("briefing", [5, "x" * (api.GPT_LIVE_MAX_BRIEFING_CHARS + 1), "😀" * (api.GPT_LIVE_MAX_BRIEFING_CHARS + 1)])
 def test_session_rejects_a_bad_briefing(client, openai, briefing):
     assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "briefing": briefing}).status_code == 400
     assert openai.calls == []
+
+
+def test_a_multibyte_briefing_at_the_limit_fits_the_request_body(client, openai):
+    """The body limit is in bytes and the briefing limit in characters: one at its
+    limit in 4-byte characters still reaches the briefing check, not a 413."""
+    briefing = "😀" * api.GPT_LIVE_MAX_BRIEFING_CHARS
+    assert client.post(f"{BASE}/gpt-live/session", json={"sdp": OFFER, "briefing": briefing}).status_code == 200
 
 
 @pytest.mark.parametrize("voice", ["../x", "a b", 5, "x" * 40])

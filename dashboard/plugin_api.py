@@ -1111,7 +1111,9 @@ GPT_LIVE_LIMIT = 10
 GPT_LIVE_WINDOW_S = 60.0
 GPT_LIVE_WORKERS = 2
 # An SDP offer is a few KB; the rest is room for the recent-history items.
-GPT_LIVE_MAX_BODY_BYTES = 256 * 1024
+# Room for a briefing at its character limit in 4-byte UTF-8, JSON-escaped, plus
+# the SDP offer and history.
+GPT_LIVE_MAX_BODY_BYTES = 640 * 1024
 GPT_LIVE_MAX_HISTORY_ITEMS = 40
 GPT_LIVE_MAX_ANSWER_BYTES = 64 * 1024
 # Bounds how long Conduit waits (a 504), above the socket timeout. It can't
@@ -1578,7 +1580,10 @@ def _clean_voice(voice: Any) -> Optional[str]:
     return voice
 
 
-GPT_LIVE_MAX_BRIEFING_CHARS = 32 * 1024
+# Conduit's rules plus the user's persona and memory. 32 KB turned away
+# calls for users with a long memory ("briefing is too long",
+# kaishi00/hermes-conduit#1077); Conduit 2.2.0 build 219 doesn't trim it.
+GPT_LIVE_MAX_BRIEFING_CHARS = 64 * 1024
 # Last, so a chatty persona doesn't talk the model into an opening greeting.
 GPT_LIVE_WAIT_FOR_USER = (
     "Opening policy: do not speak first. When the call starts, stay silent until the user "
