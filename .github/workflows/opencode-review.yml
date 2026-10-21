@@ -112,7 +112,12 @@ jobs:
           fi
 
           echo "$opencode_bin_dir" >> "$GITHUB_PATH"
+      # A reviewer waiting on a permission prompt nobody can answer used to
+      # hold the job for the 6-hour default; opencode.json now denies every
+      # prompt it would ask, and this bounds whatever else can stall a run.
+      # The slowest reviews that finished took about 26 minutes.
       - name: Run opencode review
+        timeout-minutes: 40
         run: GITHUB_EVENT_NAME=pull_request GITHUB_ACTOR=${{ github.repository_owner }} opencode github run
         env:
           MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
