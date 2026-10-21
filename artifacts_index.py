@@ -424,12 +424,16 @@ def list_artifacts(conn: sqlite3.Connection, *, before: Optional[int] = None,
                    session_id: Optional[str] = None, session_ids: Iterable[str] = (),
                    group: Optional[str] = None,
                    query: str = "", limit: int = DEFAULT_LIMIT,
+                   include_missing: bool = True,
                    stat: Callable[[str], Optional[int]] = _file_size,
                    window_rows: int = WINDOW_ROWS, max_scan_rows: int = MAX_SCAN_ROWS) -> dict:
     """One page of artifacts, newest first, and where the next page starts
     (``next_before``, None once the history is read to its start). One chat
     (``session_id``/``session_ids``) reads only its own rows, up to
-    ``max_scan_rows`` of them, and ignores ``window_rows``."""
+    ``max_scan_rows`` of them, and ignores ``window_rows``. Without
+    ``include_missing``, a file no longer on disk is left out, so a history
+    of deleted files doesn't leave Conduit's pages mostly empty; links have
+    no file and always stay."""
     limit = max(1, min(int(limit), MAX_LIMIT))
     max_scan_rows = max(1, int(max_scan_rows))
     kinds = GROUPS.get(group) if group else None
@@ -465,6 +469,11 @@ def list_artifacts(conn: sqlite3.Connection, *, before: Optional[int] = None,
                 continue
             item = _describe(source, kind, target, label, row,
                              title_for(str(row["session_id"]), row["title"]), stat)
+            if item is not None and not include_missing and item.get("exists") is False:
+                # Gone at its newest mention, gone at every older one, so
+                # each gone path is checked once.
+                seen.add(key)
+                continue
             # Seen once listed: a newer mention the filter leaves out
             # doesn't hide an older one it keeps.
             if item is not None and _matches(item, kinds, query):

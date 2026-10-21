@@ -1339,7 +1339,10 @@ come back short with a `next_before` to keep going. One message adds at most 200
 artifacts to a page (a page ends after the message that fills it, so it can
 run past `limit`); the rest of a message naming more than that isn't listed. With `session_id` (plugin
 0.43.2+) only that chat's own rows are read, so a chat under a long history
-of other chats, cron runs say, lists in one request. Capability `artifacts`.
+of other chats, cron runs say, lists in one request. `missing=hide` (plugin
+0.51.8+) leaves out files no longer on the host, so a history of deleted files
+doesn't leave pages mostly empty; links always stay, and an older plugin
+ignores it and lists them. Capability `artifacts`.
 
 ## Hermes calls you (plugin 0.13+)
 

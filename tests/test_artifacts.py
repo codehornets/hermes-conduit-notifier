@@ -339,3 +339,38 @@ def test_one_message_cannot_make_a_page_stat_thousands_of_files(tmp_path, monkey
     page = index.list_artifacts(conn, limit=10, stat=lambda path: statted.append(path) or 1)
     assert len(page["items"]) <= index.MAX_LIMIT
     assert len(statted) <= index.MAX_LIMIT, len(statted)
+
+
+def test_missing_files_can_be_left_out_and_links_stay(tmp_path, monkeypatch):
+    _no_gateway(monkeypatch)
+    kept = tmp_path / "out" / "kept.pdf"
+    kept.parent.mkdir()
+    kept.write_bytes(b"pdf")
+    conn = _db(tmp_path / "home", [("s1", "assistant", f"MEDIA:{kept}"),
+                                   ("s1", "assistant", f"MEDIA:{tmp_path / 'gone.pdf'}"),
+                                   ("s1", "assistant", "See https://example.com/a")])
+    every = index.list_artifacts(conn)["items"]
+    assert [i["name"] for i in every] == ["example.com/a", "gone.pdf", "kept.pdf"]
+    present = index.list_artifacts(conn, include_missing=False)["items"]
+    assert [i["name"] for i in present] == ["example.com/a", "kept.pdf"]
+
+
+def test_a_missing_file_is_statted_once_while_left_out(tmp_path, monkeypatch):
+    _no_gateway(monkeypatch)
+    conn = _db(tmp_path, [("s1", "assistant", "MEDIA:/root/gone.pdf"), ("s2", "assistant", "again MEDIA:/root/gone.pdf")])
+    statted = []
+    page = index.list_artifacts(conn, include_missing=False, stat=lambda path: statted.append(path) or None)
+    assert page["items"] == [] and statted == ["/root/gone.pdf"]
+
+
+def test_the_route_hides_missing_files_on_request(tmp_path, monkeypatch):
+    _no_gateway(monkeypatch)
+    _db(tmp_path, [("s1", "assistant", f"MEDIA:{tmp_path / 'gone.png'}")]).close()
+    monkeypatch.setattr(sys.modules["hermes_constants"], "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(api, "_artifacts_index", lambda: index)
+    app = FastAPI()
+    app.include_router(api.router, prefix=BASE)
+    client = TestClient(app)
+    assert [i["name"] for i in client.get(f"{BASE}/artifacts?missing=show").json()["items"]] == ["gone.png"]
+    assert client.get(f"{BASE}/artifacts?missing=hide").json()["items"] == []
+    assert client.get(f"{BASE}/artifacts?missing=bogus").status_code == 400
