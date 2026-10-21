@@ -75,8 +75,8 @@ def register(ctx: Any, *, is_child: Callable[[Any], bool], skill_path: Any) -> N
     """Registers the tool and its skill, if this Hermes supports them. A
     Hermes that refuses either keeps everything else working."""
     if hasattr(ctx, "register_tool"):
-        def handler(args: Any, session_id: Any = None, **_: Any) -> str:
-            return handle(args, session_id=session_id, is_child=is_child)
+        def handler(args: Any, session_id: Any = None, task_id: Any = None, **_: Any) -> str:
+            return handle(args, session_id=session_id, task_id=task_id, is_child=is_child)
 
         tool = {"name": TOOL_NAME, "toolset": TOOLSET, "schema": SCHEMA, "handler": handler, "check_fn": available}
         try:
@@ -106,15 +106,17 @@ def available() -> bool:
         return False
 
 
-def handle(args: Any, *, session_id: Any = None, is_child: Callable[[Any], bool] = lambda _: False) -> str:
+def handle(args: Any, *, session_id: Any = None, task_id: Any = None,
+           is_child: Callable[[Any], bool] = lambda _: False) -> str:
     try:
-        return _answer(**_handle(args, session_id, is_child))
+        return _answer(**_handle(args, session_id, is_child, task_id))
     except Exception:  # noqa: BLE001 — a tool must never raise
         logger.warning("conduit_call_user failed", exc_info=True)
         return _answer(ok=False, error="unavailable", note="The call couldn't be set up. Tell the user in your reply instead.")
 
 
-def _handle(args: Any, session_id: Any, is_child: Callable[[Any], bool]) -> dict[str, Any]:
+def _handle(args: Any, session_id: Any, is_child: Callable[[Any], bool],
+            task_id: Any = None) -> dict[str, Any]:
     args = args if isinstance(args, dict) else {}
     reason = args.get("reason")
     if not isinstance(reason, str) or not reason.strip():
@@ -128,7 +130,7 @@ def _handle(args: Any, session_id: Any, is_child: Callable[[Any], bool]) -> dict
                 "note": "Only the main conversation can call the user. Report back; the main agent can call."}
     if not session:
         return {"ok": False, "error": "no_session", "note": "This conversation can't place a call."}
-    if call_watches.is_watch_run(session):
+    if call_watches.is_watch_run(session, task_id):
         # A watch's run calls through its report, once per incident.
         return {"ok": False, "error": "use_report",
                 "note": (f"This is a run of a call watch: report with {call_watches.REPORT_TOOL} instead. It calls "

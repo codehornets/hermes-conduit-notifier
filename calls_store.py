@@ -212,7 +212,8 @@ class CallStore:
             # A retried request (the first answer lost) gets the same watch,
             # never a second one that would call again.
             for watch in state["watches"]:
-                if watch["origin"] != "alert" and set(watch["session_ids"]) == set(ids):
+                if watch["origin"] != "alert" and set(watch["session_ids"]).issubset(ids):
+                    watch["session_ids"] = ids
                     if hold:
                         watch["hold_until"] = max(watch["hold_until"], now + hold)
                     return {"status": "watching", "id": watch["id"]}
