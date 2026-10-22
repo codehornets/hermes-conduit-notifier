@@ -20,6 +20,8 @@ off: that answers busy and the send stays refused.
 
 from __future__ import annotations
 
+import logging
+import re
 import sys
 import threading
 import uuid
@@ -28,6 +30,8 @@ from typing import Any, Callable, Optional
 
 RESUME = "session.resume"
 SUBMIT = "prompt.submit"
+CONFIG_SET = "config.set"
+logger = logging.getLogger(__name__)
 # Like the dashboard's takeover route: a lock holder that never lets go
 # can't stall the Pulse loop longer than this.
 TAKEOVER_TIMEOUT_S = 20.0
@@ -102,11 +106,14 @@ def take_over(session_ids: list[str]) -> str:
     return outcome[0] if outcome else "takeover failed"
 
 
-def send(chat_id: str, text: str, *, profile: str = "",
+def send(chat_id: str, text: str, *, profile: str = "", model: Optional[dict] = None,
          taking_over: Optional[Callable[[list[str]], str]] = None) -> Sent:
     """Reopens the chat (the live session when someone has it open) and
     submits ``text`` as a hidden turn. A chat busy with a turn queues it
-    behind that turn instead of interrupting it."""
+    behind that turn instead of interrupting it. With ``model``
+    ({"provider", "model"}), the chat is put on that model first, as its
+    own model picker would (a busy chat takes it at its next turn). It is
+    the chat's model after the turn too: Pulse's chat runs on Pulse's model."""
     methods = _methods()
     if methods is None:
         return Sent(False, "", "this Hermes has no session host to send through")
@@ -120,6 +127,8 @@ def send(chat_id: str, text: str, *, profile: str = "",
     sid = ((resumed.get("result") or {}).get("session_id") or "") if isinstance(resumed.get("result"), dict) else ""
     if not sid:
         return Sent(False, "", "couldn't open the chat: no session id came back")
+    if model:
+        _use_model(methods, sid, resumed.get("result"), model)
     def submit() -> Any:
         # A request id per call: the resend is a new request, not the refused one.
         return methods[SUBMIT](f"pulse-{uuid.uuid4().hex[:12]}",
@@ -131,6 +140,8 @@ def send(chat_id: str, text: str, *, profile: str = "",
         if taken not in ("free", "taken_over", "same_host"):
             return Sent(False, "", f"the chat refused the turn: {_message(submitted)} "
                                    f"(Pulse couldn't take it over: {taken or 'unknown'})")
+        if model:  # the surface that held the chat may have kept it from switching
+            _use_model(methods, sid, resumed.get("result"), model)
         submitted = submit()
         if _not_owned(submitted):
             return Sent(False, "", f"the chat refused the turn again after Pulse took it over ({taken}): "
@@ -141,6 +152,36 @@ def send(chat_id: str, text: str, *, profile: str = "",
     result = submitted.get("result") if isinstance(submitted.get("result"), dict) else {}
     status = str(result.get("status") or "")
     return Sent(True, "streaming" if status == "streaming" else "queued", status)
+
+
+_FLAG_VALUE = re.compile(r"[A-Za-z0-9._:/@+][A-Za-z0-9._:/@+-]*")
+
+
+def plain_flag_value(value: str) -> bool:
+    """A model or provider name that reads as one plain word, never a flag or
+    a quote, in config.set's value string."""
+    return bool(_FLAG_VALUE.fullmatch(value))
+
+
+def _use_model(methods: dict[str, Callable[..., Any]], sid: str, resumed: Any, model: dict) -> None:
+    """Puts the chat on Pulse's model unless it is on it already. The user
+    picked it in Settings > Pulse, so a price guard doesn't hold it back. A
+    refusal leaves the chat's own model: the turn still goes."""
+    name, provider = str(model.get("model") or ""), str(model.get("provider") or "")
+    info = resumed.get("info") if isinstance(resumed, dict) else None
+    if isinstance(info, dict) and info.get("model") == name and (not provider or info.get("provider") == provider):
+        return
+    if not plain_flag_value(name) or (provider and not plain_flag_value(provider)) or CONFIG_SET not in methods:
+        return
+    value = f"{name} --provider {provider} --session" if provider else f"{name} --session"
+    try:
+        result = methods[CONFIG_SET](f"pulse-{uuid.uuid4().hex[:12]}", {
+            "key": "model", "session_id": sid, "value": value, "confirm_expensive_model": True})
+    except Exception:  # noqa: BLE001 — the turn goes on the chat's own model
+        logger.warning("conduit_push: Pulse couldn't put its chat on %s", name, exc_info=True)
+        return
+    if not isinstance(result, dict) or "error" in result:
+        logger.warning("conduit_push: Pulse couldn't put its chat on %s: %s", name, _message(result))
 
 
 def _not_owned(response: Any) -> bool:

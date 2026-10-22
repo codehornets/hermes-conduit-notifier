@@ -381,6 +381,53 @@ def test_send_reopens_the_chat_and_submits_a_hidden_queued_turn(monkeypatch):
     ]
 
 
+def test_send_puts_the_chat_on_pulses_model_first(monkeypatch):
+    fake = FakeHost().install(monkeypatch)
+    sys.modules["tui_gateway.server"]._methods[host.CONFIG_SET] = \
+        lambda rid, params: fake.calls.append((host.CONFIG_SET, params)) or {"result": {"value": "m"}}
+    model = {"provider": "openrouter", "model": "google/gemini-flash"}
+    assert host.send(SID, "x", model=model).ok
+    assert [call[0] for call in fake.calls] == [host.RESUME, host.CONFIG_SET, host.SUBMIT]
+    assert fake.calls[1][1] == {"key": "model", "session_id": "ui-1", "confirm_expensive_model": True,
+                                "value": "google/gemini-flash --provider openrouter --session"}
+    # Already on it: no switch.
+    fake.calls.clear()
+    fake.resume = {"result": {"session_id": "ui-1", "info": {"model": "google/gemini-flash", "provider": "openrouter"}}}
+    assert host.send(SID, "x", model=model).ok
+    assert [call[0] for call in fake.calls] == [host.RESUME, host.SUBMIT]
+    # A refused switch still sends, on the chat's own model.
+    fake.calls.clear()
+    fake.resume = {"result": {"session_id": "ui-1"}}
+    sys.modules["tui_gateway.server"]._methods[host.CONFIG_SET] = lambda rid, params: {"error": {"message": "no"}}
+    assert host.send(SID, "x", model=model).ok and fake.calls[-1][0] == host.SUBMIT
+
+
+def test_the_pulse_model_setting(pulse_store, tmp_path):
+    store_ = pulse_store
+    control.update(store_, {"model": {"provider": "openrouter", "model": "google/gemini-flash"}})
+    assert store_.get(pulse.MODEL) == {"provider": "openrouter", "model": "google/gemini-flash"}
+    for bad in ({"model": "flash"}, {"model": {"model": ""}}, {"model": {"model": "a b"}},
+                {"model": {"model": "--provider"}}, {"model": {"model": "m", "provider": "-x"}},
+                {"model": {"model": 'x"'}}, {"model": {"model": "x\x00"}},
+                {"model": {"model": "m", "base_url": "x"}}):
+        with pytest.raises(control.Refused):
+            control.update(store_, bad)
+    control.update(store_, {"model": None})
+    assert store_.get(pulse.MODEL) is None
+    store_.set(pulse.MODEL, {"provider": "", "model": "x --base-url y"})
+    assert pulse.turn_model(store_) is None and control.state(store_, tmp_path)["model"] is None
+
+
+def test_pulse_turns_go_out_on_pulses_model(pulse_store, tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(host, "send", lambda chat_id, body, **kw: sent.append(kw["model"]))
+    pulse._sender(pulse_store)("c", "x")
+    control.update(pulse_store, {"model": {"provider": "openrouter", "model": "anthropic/claude-haiku-4.5"}})
+    pulse._sender(pulse_store)("c", "x")
+    assert sent == [None, {"provider": "openrouter", "model": "anthropic/claude-haiku-4.5"}]
+    assert control.state(pulse_store, tmp_path)["model"] == sent[1]
+
+
 def test_send_reports_a_refusal(monkeypatch):
     FakeHost(resume={"error": {"code": 4007, "message": "session not found"}}).install(monkeypatch)
     sent = host.send(SID, "x")
@@ -404,6 +451,18 @@ def test_a_chat_held_elsewhere_is_taken_over_and_sent_again(monkeypatch, status)
     assert taken == [[SID, "ui-1"]]
     assert [name for name, _ in fake.calls] == [host.RESUME, host.SUBMIT, host.SUBMIT]
     assert len(set(rids)) == 2  # the resend is a new request
+
+
+def test_a_taken_over_chat_is_put_on_pulses_model_again(monkeypatch):
+    fake = FakeHost().install(monkeypatch)
+    methods = sys.modules["tui_gateway.server"]._methods
+    switches = [{"error": {"message": "held elsewhere"}}, {"result": {"value": "m"}}]
+    methods[host.CONFIG_SET] = lambda rid, params: fake.calls.append((host.CONFIG_SET, params)) or switches.pop(0)
+    replies = [NOT_OWNED, {"result": {"status": "queued"}}]
+    methods[host.SUBMIT] = lambda rid, params: fake.calls.append((host.SUBMIT, params)) or replies.pop(0)
+    monkeypatch.setattr(host, "take_over", lambda ids: "taken_over")
+    assert host.send(SID, "x", model={"provider": "", "model": "m"}).ok
+    assert [name for name, _ in fake.calls] == [host.RESUME, host.CONFIG_SET, host.SUBMIT, host.CONFIG_SET, host.SUBMIT]
 
 
 def test_one_takeover_waits_on_hermes_at_a_time(monkeypatch):
