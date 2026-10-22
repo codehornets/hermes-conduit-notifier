@@ -1264,7 +1264,7 @@ There is nothing to set up.
   turn with no start time, a file that can't be read, or `plugins.isolation:
   host` (where Desktop views aren't observed) all push as before.
 
-## Quiet while you read in Conduit (plugin 0.55+)
+## Quiet while you read in Conduit (plugin 0.60+)
 
 A reply that lands in a chat you have open in Conduit sends no "response
 ready" push, on whichever device you have it open: chatting on a Mac or an
@@ -1289,7 +1289,9 @@ questions, failed turns and calls. There is nothing to set up.
   the next reply there pushes as before.
 - Each device kind (`iphone`, `ipad`, `mac`, `vision`, `watch`) keeps its own
   file in `<hermes home>/conduit-on-screen/` (private to the user), so one
-  device leaving never ends another's hold. A hold longer than 10 minutes, a
+  device leaving never ends another's hold (two devices of the same kind
+  share a file, and the later report wins). A turn longer than 30 minutes
+  pushes whatever Conduit says. A hold longer than 10 minutes, a
   file that can't be read, or a turn whose hooks don't share the profile's
   home with the dashboard pushes as before. Capability `chat-on-screen`.
 

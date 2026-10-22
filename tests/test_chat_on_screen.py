@@ -3,6 +3,7 @@ import importlib.util
 import pathlib
 import sys
 import tempfile
+import time
 import types
 
 import pytest
@@ -113,6 +114,9 @@ def test_the_file_is_private_and_no_temp_file_is_left(tmp_path):
     {"device": "iphone", "session_ids": ["s-1"], "hold_s": 601},
     {"device": "iphone", "session_ids": ["s-1"], "hold_s": True},
     {"device": "iphone", "session_ids": ["s-1"], "hold_s": float("nan")},
+    {"device": "iphone", "session_ids": ["s-1"], "hold_s": float("inf")},
+    # An integer too large for a float is a 400, not an OverflowError.
+    {"device": "iphone", "session_ids": ["s-1"], "hold_s": 10 ** 400},
     {"device": "iphone", "session_ids": "s-1", "hold_s": 30},
     {"device": "iphone", "session_ids": [1], "hold_s": 30},
     {"device": "iphone", "session_ids": [" "], "hold_s": 30},
@@ -123,6 +127,25 @@ def test_the_file_is_private_and_no_temp_file_is_left(tmp_path):
 def test_bad_bodies_are_refused(body):
     with pytest.raises(ValueError):
         on_screen.parse(body)
+
+
+def test_anything_but_a_positive_hold_releases(tmp_path):
+    on_screen.hold(tmp_path, "mac", ["s-1"], 90, now=1000.0)
+    assert not on_screen.hold(tmp_path, "mac", ["s-1"], -5, now=1000.0)
+    on_screen.hold(tmp_path, "mac", ["s-1"], 90, now=1000.0)
+    assert not on_screen.hold(tmp_path, "mac", ["s-1"], float("nan"), now=1000.0)
+    assert not on_screen.on_screen(tmp_path, "s-1", now=1001.0)
+
+
+def test_a_huge_hold_is_capped(tmp_path):
+    assert on_screen.hold(tmp_path, "mac", ["s-1"], 10 ** 400, now=1000.0)
+    assert on_screen.on_screen(tmp_path, "s-1", now=1000.0 + on_screen.MAX_HOLD_S - 1)
+
+
+def test_only_a_turn_within_the_host_cap_counts_as_attended():
+    assert on_screen.attended(100.0, now=100.0 + on_screen.MAX_TURN_S)
+    assert not on_screen.attended(100.0, now=100.0 + on_screen.MAX_TURN_S + 1)
+    assert not on_screen.attended(None)
 
 
 def test_a_release_needs_no_ids():
@@ -148,8 +171,9 @@ def turn(tmp_path, monkeypatch):
     pushed = []
     monkeypatch.setattr(plugin, "enqueue", pushed.append)
 
-    def run(failed=False):
+    def run(failed=False, ran_s=5.0):
         pushed.clear()
+        plugin._turn_started["t-1"] = time.monotonic() - ran_s
         plugin._post_llm_call(session_id="s-1", turn_id="t-1", assistant_response="Done.", platform="tui")
         plugin._on_session_end(session_id="s-1", turn_id="t-1", completed=not failed, failed=failed,
                                interrupted=False, platform="tui")
@@ -165,6 +189,11 @@ def test_a_reply_in_a_chat_conduit_has_on_screen_sends_no_push(turn):
     assert turn() == []
     on_screen.hold(turn.home, "mac", [], 0)
     assert turn() == ["response.ready"]
+
+
+def test_a_turn_past_the_host_cap_pushes_even_while_held(turn):
+    on_screen.hold(turn.home, "mac", ["s-1"], 90)
+    assert turn(ran_s=on_screen.MAX_TURN_S + 60) == ["response.ready"]
 
 
 def test_another_chat_on_screen_doesnt_quiet_this_one(turn):
@@ -216,3 +245,7 @@ def test_a_bad_body_is_a_400(client):
     assert response.status_code == 400
     assert response.headers["cache-control"] == "no-store"
     assert client.put(f"{BASE}/notifications/on-screen", json=["iphone"]).status_code == 400
+    response = client.put(f"{BASE}/notifications/on-screen", content=b"{not json",
+                          headers={"Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert response.headers["cache-control"] == "no-store"

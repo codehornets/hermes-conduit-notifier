@@ -6690,8 +6690,8 @@ def set_chat_on_screen(body: Any) -> Dict[str, Any]:
 async def put_chat_on_screen(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     no_store = {"Cache-Control": "no-store"}
-    body = await _read_json_body(request, ON_SCREEN_MAX_BODY_BYTES)
     try:
+        body = await _read_json_body(request, ON_SCREEN_MAX_BODY_BYTES)
         _on_screen_limiter.acquire(_limiter_key(profile))
         return {"ok": True, **(await _run_scoped(profile, lambda: set_chat_on_screen(body)))}
     except TokenError as exc:

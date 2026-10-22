@@ -214,7 +214,7 @@ def _post_llm_call(**kwargs: Any) -> None:
     # on screen, on any device (chat_on_screen.py). A reply to a message sent
     # from a source the user turned off (Desktop, a messaging app…) arrives
     # there (#115).
-    send = (ready is not None and not _desktop_watched(session_id, started) and not _conduit_watched(session_id)
+    send = (ready is not None and not _desktop_watched(session_id, started) and not _conduit_watched(session_id, started)
             and _source_notifies(kwargs.get("platform")))
     # Hermes also runs this hook for a turn that failed with text (its error
     # explanation): on_session_end, right after, says which it was, so the
@@ -321,9 +321,9 @@ def _desktop_watched(session_id: str, started: float | None) -> bool:
         return False
 
 
-def _conduit_watched(session_id: str) -> bool:
+def _conduit_watched(session_id: str, started: float | None) -> bool:
     try:
-        return chat_on_screen.on_screen(get_hermes_home(), session_id)
+        return chat_on_screen.attended(started) and chat_on_screen.on_screen(get_hermes_home(), session_id)
     except Exception:  # noqa: BLE001 — can't tell, so the push goes out
         logger.debug("conduit_push: Conduit's on-screen chats unreadable", exc_info=True)
         return False
