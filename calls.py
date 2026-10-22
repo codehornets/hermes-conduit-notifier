@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 from hermes_constants import get_hermes_home
 
-from . import client
+from . import client, location_profiles
 from .calls_store import CallStore
 from .location_store import LocationStore
 from .events import push_event
@@ -104,7 +104,9 @@ def _store(home: Any) -> CallStore:
 def _place_blocked(home: Any, settings: dict[str, Any]) -> bool:
     """Whether the user is at a saved place they don't want calls at (or
     Conduit can't say where they are and they asked to count that too)."""
-    place = LocationStore(home, clock=lambda: _clock()).latest_place()
+    # A profile reading another's shared location is held back by it too.
+    store, _ = location_profiles.store_for(home, lambda path: LocationStore(path, clock=lambda: _clock()))
+    place = store.latest_place()
     known = place is not None and place["trusted"] and not place["paused"]
     if not known:
         return bool(settings["avoid_unknown_place"])

@@ -101,6 +101,9 @@ starts, and its run is told which place and which move; set it up with
   if the phone reports the move within 15 minutes.
 - Confirm in one sentence what you set up. `rules` lists them,
   `remove_rule` stops one (only after the user says so).
+- The user may share their location with this profile through another
+  profile on the same host. Then the rule actions answer `other_profile`,
+  naming that profile: tell the user to set place rules in a chat with it.
 
 ## Maps: travel time, directions, places
 

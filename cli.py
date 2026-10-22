@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import e2e
-from .client import DEFAULT_RELAY_URL, UnpairedLocally, build_outgoing, claim_pairing, e2e_status, load_state, post_event, send_now, set_redact_content, state_path, unpair
+from .client import DEFAULT_RELAY_URL, RelayRejected, UnpairedLocally, build_outgoing, claim_pairing, e2e_status, load_state, post_event, record_relay_accepted, record_relay_refusal, send_now, set_redact_content, state_path, unpair
 from .relay_urls import check_request_url
 from .events import event_id, plugin_hello, push_event
 
@@ -37,18 +37,25 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         help="Redact chat text from pushes; choice labels still transit so cards stay answerable",
     )
     redact.add_argument("mode", choices=["on", "off"])
-    pulse = commands.add_parser("pulse", help="Pulse, the proactivity experiment: on, off, status, probe, report, home, outcomes, memory")
-    pulse.add_argument("pulse_action", choices=["on", "off", "status", "probe", "report", "home", "outcomes", "memory"])
+    pulse = commands.add_parser("pulse", help="Pulse, the proactivity experiment: on, off, status, probe, report, home, outcomes, memory, followups, "
+                                                 "cards, rate, learned")
+    pulse.add_argument("pulse_action", choices=["on", "off", "status", "probe", "report", "home", "outcomes", "memory",
+                                                "followups", "cards", "rate", "learned"])
     pulse.add_argument("value", nargs="?", default="",
                        help="for home: the id of the chat to use, or 'auto' to find it by title; "
                             "for outcomes: how many to show, or a chat id; "
                             "for report: 'now', 'on', 'off', times like 08:00,13:00, a time zone like Europe/Paris, "
                             "'all-profiles' or 'this-profile'; "
                             "for memory: a kind to list, 'now', 'on', 'off', 'forget' and an item number, "
-                            "or 'backfill'")
+                            "or 'backfill'; "
+                            "for followups: 'on' or 'off', or nothing to list them; "
+                            "for rate: the card number; "
+                            "for learned: 'undo' and a lesson number, or a kind and a loudness to set")
     pulse.add_argument("extra", nargs="?", default="",
                        help="for memory forget: the item number; for memory backfill: how many days back "
-                            "(it shows what that costs), 'start', 'stop' or 'cancel'")
+                            "(it shows what that costs), 'start', 'stop' or 'cancel'; "
+                            "for rate: 'up', 'down', or a reason for a thumbs down (not_relevant, already_knew, "
+                            "too_late, too_often); for learned: the lesson number, or push, screen, brief or off")
     prefs = commands.add_parser(
         "prefs",
         help="Conduit's synced preferences: export them to a file, or import one from another host",
@@ -69,6 +76,13 @@ def _printable(value: object) -> str:
     return "".join(c for c in str(value) if c.isprintable())
 
 
+def _block_operator(relay_url: str) -> str:
+    """Who can lift a block in front of the relay."""
+    if relay_url.rstrip("/") == DEFAULT_RELAY_URL:
+        return "email support@milim.dev with this host's public IP address"
+    return "ask whoever runs the relay"
+
+
 def dispatch(args: argparse.Namespace) -> int:
     action = getattr(args, "conduit_push_action", None)
     if action == "pair":
@@ -76,6 +90,12 @@ def dispatch(args: argparse.Namespace) -> int:
             state = claim_pairing(args.code, args.relay_url, args.name)
         except _RELAY_ERRORS as error:
             print(f"Pairing failed: {error}")
+            if getattr(error, "detail", "") == "gateway_limit_reached":
+                print("The relay holds too many pairings for that phone. Turn notifications off and on again in "
+                      "Conduit's Settings > Notifications to start fresh, then pair with a new code.")
+            if getattr(error, "edge_blocked", False):
+                print("That empty 403 came from something in front of the relay blocking this host, so pairing "
+                      f"can't get through. To get it lifted, {_block_operator(str(args.relay_url or DEFAULT_RELAY_URL))}.")
             return 1
         print(f"Paired {state['gateway_name']} with Conduit.")
         try:
@@ -102,6 +122,11 @@ def dispatch(args: argparse.Namespace) -> int:
             print(f"Warning: the relay refused this pairing's credential "
                   f"(since {_printable(state['relay_rejected_at'])}), so notifications aren't arriving. "
                   "Conduit removed this gateway or the relay lost its data: pair again from Conduit.")
+        if state.get("relay_blocked_at"):
+            print(f"Warning: something in front of the relay (a firewall or rate limiter) has been answering this host "
+                  f"with an empty 403 since {_printable(state['relay_blocked_at'])}, so notifications, calls and "
+                  "Lock Screen progress aren't arriving. Pairing again won't help: it meets the same block. "
+                  f"To get it lifted, {_block_operator(relay_url)}.")
         print(f"Redact content: {'on' if state.get('redact_content') else 'off'}")
         encryption = e2e_status(state)
         if encryption["enabled"]:
@@ -133,14 +158,21 @@ def dispatch(args: argparse.Namespace) -> int:
             try:
                 post_event(outgoing)
             except _RELAY_ERRORS as error:
+                if isinstance(error, RelayRejected) and error.status in (401, 403):
+                    record_relay_refusal(state, error)
                 print(f"The Conduit relay did not accept the test notification: {error}")
                 return 1
+            record_relay_accepted(state)
             print("Broken encrypted test notification accepted by the Conduit relay. The phone should show only generic text.")
             return 0
         try:
             send_now(event)
         except _RELAY_ERRORS as error:
             print(f"The Conduit relay did not accept the test notification: {error}")
+            if getattr(error, "edge_blocked", False):
+                relay_url = str((load_state() or {}).get("relay_url") or DEFAULT_RELAY_URL)
+                print("That empty 403 came from something in front of the relay blocking this host, not from the "
+                      f"relay, so pairing again won't help. To get it lifted, {_block_operator(relay_url)}.")
             return 1
         print("Test notification accepted by the Conduit relay.")
         return 0
@@ -179,11 +211,16 @@ def _pulse(args: argparse.Namespace) -> int:
     from . import pulse, pulse_delivery, pulse_memory
     home = get_hermes_home()
     action = args.pulse_action
-    listing = action == "memory" and (args.value or "").strip() not in ("on", "off")
+    # Follow-ups are on by default, so even `followups on|off` needs no file yet.
+    listing = action in ("followups", "cards", "rate", "learned") \
+        or (action == "memory" and (args.value or "").strip() not in ("on", "off"))
     if (action in ("status", "probe", "off", "outcomes") or listing) and not (Path(home) / pulse_delivery.store.DB_NAME).exists():
         # Never turned on: say so without leaving a file behind.
-        print("Pulse: off (never turned on). `hermes conduit-push pulse on` to start it.")
-        return 1 if action == "probe" or (action == "memory" and (args.value or "").strip() in ("now", "forget")) else 0
+        print("Pulse: off (never turned on). `hermes conduit-push pulse on` to start it."
+              + (" Nothing was changed." if action in ("followups", "learned") and (args.value or "").strip() else ""))
+        return 1 if action in ("probe", "rate") or (action == "learned" and (args.value or "").strip()) \
+            or (action == "memory" and (args.value or "").strip() in ("now", "forget")) \
+            or (action == "followups" and (args.value or "").strip() == "on") else 0
     pulse_store = pulse.open_store(home)
     if action in ("on", "off"):
         pulse_store.set("enabled", action == "on")
@@ -215,6 +252,11 @@ def _pulse(args: argparse.Namespace) -> int:
         return _pulse_outcomes(pulse_store, (args.value or "").strip())
     if action == "report":
         return _pulse_report(pulse_store, (args.value or "").strip())
+    if action == "followups":
+        return _pulse_followups(pulse_store, home, (args.value or "").strip())
+    if action in ("cards", "rate", "learned"):
+        return _pulse_learning(pulse_store, action, (args.value or "").strip(),
+                               str(getattr(args, "extra", "") or "").strip())
     if action == "memory":
         return _pulse_memory(pulse_store, home, (args.value or "").strip(), str(getattr(args, "extra", "") or "").strip())
     print(f"Pulse: {'on' if pulse_store.get('enabled') else 'off'}")
@@ -287,6 +329,21 @@ def _pulse(args: argparse.Namespace) -> int:
             and isinstance(pulse_store.get("memory_daily_tokens"), (int, float))
             and int(today.get("tokens", 0) or 0) >= pulse_store.get("memory_daily_tokens")):
         print(f"Memory used today's {pulse_store.get('memory_daily_tokens')} tokens; it reads again tomorrow.")
+    if pulse_store.get("followups") and not pulse_store.get("memory"):
+        print("Follow-ups: waiting on memory, which finds Hermes's promises: `hermes conduit-push pulse memory on`")
+    elif pulse_store.get("followups"):
+        follow = pulse_store.followup_counts()
+        usage = pulse_store.get("followup_usage")
+        usage = usage if isinstance(usage, dict) else {}
+        print("Follow-ups on Hermes's promises: "
+              + (", ".join(f"{n} {decision}" for decision, n in sorted(follow.items())) or "none yet")
+              + f" ({int(usage.get('checks', 0) or 0)} checks, {int(usage.get('tokens', 0) or 0)} tokens"
+              + (f", {int(usage.get('failed', 0) or 0)} failed" if usage.get("failed") else "") + ")")
+    else:
+        print("Follow-ups: off")
+    learning_lines = _learning_status(pulse_store)
+    if learning_lines:
+        print(learning_lines)
     ratings = pulse.rating_counts(pulse_store)
     if ratings:
         print("Ratings so far: " + ", ".join(f"{kind} {yes} yes / {no} no" for kind, (yes, no) in ratings.items()))
@@ -382,6 +439,87 @@ def _pulse_report(pulse_store: Any, value: str) -> int:
 
 
 MEMORY_LIST = 50
+
+
+def _pulse_followups(pulse_store: Any, home: Any, value: str) -> int:
+    from . import pulse, pulse_followup
+    if value in ("on", "off"):
+        pulse_store.set("followups", value == "on")
+        print("Pulse follow-ups are off: promises Hermes makes are no longer checked on." if value == "off" else
+              "Pulse follow-ups are on: Pulse checks on what Hermes promised and brings the news to its chat."
+              + ("" if pulse_store.get("memory") else " They need memory too: `hermes conduit-push pulse memory on`."))
+        return 0
+    if value:
+        print("Usage: hermes conduit-push pulse followups [on|off]")
+        return 2
+    rows = pulse_store.followups(MEMORY_LIST)
+    if not rows:
+        print("No promises to follow up yet." if pulse_store.get("followups") else "Pulse follow-ups are off.")
+        return 0
+    zone = pulse.report_zone(pulse_store, home)
+    for row in rows:
+        print(_printable(pulse_followup.describe(row, pulse_store.item(row["item_id"]), zone)))
+    return 0
+
+
+def _learning_status(pulse_store: Any) -> str:
+    from . import pulse_learning
+    moved = [f"{pulse_learning.KIND_NAMES.get(kind, kind)} {pulse_learning.LEVEL_NAMES.get(level, level)}"
+             for kind, level in pulse_learning.levels(pulse_store).items()
+             if level != pulse_learning.DEFAULT_LEVELS[kind]]
+    lessons = len(pulse_learning.learned(pulse_store))
+    unseen = pulse_store.unseen_cards()
+    parts = moved + ([f"{lessons} thing(s) learned from ratings"] if lessons else []) \
+        + ([f"{unseen} unseen card(s)"] if unseen else [])
+    return ("Pulse screen: " + "; ".join(parts)) if parts else ""
+
+
+def _pulse_learning(pulse_store: Any, action: str, value: str, extra: str) -> int:
+    from . import pulse_control, pulse_learning
+    if action == "cards":
+        cards = pulse_store.cards(MEMORY_LIST)
+        if not cards:
+            print("No cards yet: Pulse hasn't brought you anything.")
+        for card in cards:
+            rated = f" (rated {card['rating']}{', ' + card['reason'] if card['reason'] else ''})" if card["rating"] else ""
+            print(_printable(f"#{card['id']} [{card['level']}] {card['title']}: {card['news']}{rated}"))
+        return 0
+    try:
+        if action == "rate":
+            if not value.isdecimal() or len(value) > 18 or not extra:
+                print("Usage: hermes conduit-push pulse rate <card> up|down|not_relevant|already_knew|too_late|too_often")
+                return 2
+            rating, reason = ("down", extra) if extra in pulse_learning.REASONS else (extra, "")
+            made = pulse_control.rate(pulse_store, int(value), rating, reason)
+            print("Rated." + "".join(f"\nPulse learned: {_printable(lesson['text'])}" for lesson in made))
+            return 0
+        if value == "undo":
+            if not extra.isdecimal() or len(extra) > 18:
+                print("Usage: hermes conduit-push pulse learned undo <lesson>")
+                return 2
+            print("Undone." if pulse_control.undo(pulse_store, int(extra)) else "Nothing to undo with that number.")
+            return 0
+        if value:
+            if not extra:
+                print("Usage: hermes conduit-push pulse learned [undo <lesson> | <kind> push|screen|brief|off]")
+                return 2
+            lesson = pulse_control.set_level(pulse_store, value, extra)
+            print(_printable(lesson["text"]) if lesson else "It's set that way already.")
+            return 0
+    except pulse_control.Refused as refused:
+        if refused.code == "pulse_off":
+            print("Pulse is off: `hermes conduit-push pulse on` first.")
+            return 1
+        print(f"Pulse doesn't take that {refused.data.get('field', 'value')}.")
+        return 2
+    lessons = pulse_learning.learned(pulse_store)
+    for kind, level in pulse_learning.levels(pulse_store).items():
+        print(f"{pulse_learning.KIND_NAMES.get(kind, kind)}: {pulse_learning.LEVEL_NAMES.get(level, level)}")
+    if not lessons:
+        print("Nothing learned from ratings yet.")
+    for lesson in lessons:
+        print(_printable(f"#{lesson['id']} {lesson['text']}"))
+    return 0
 
 
 def _pulse_memory(pulse_store: Any, home: Any, value: str, extra: str) -> int:

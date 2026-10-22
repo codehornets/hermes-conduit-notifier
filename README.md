@@ -100,7 +100,7 @@ The iOS app controls which categories are enabled, whether notification previews
 - The credential is stored in the profile-aware Hermes home as `conduit-push.json` with mode `0600` on supported systems.
 - Authorization credentials are never written to logs or printed by `status`.
 - Hook callbacks enqueue bounded events; HTTPS delivery runs on a background worker and does not block the agent loop.
-- A delivery that fails on the way (no connection, a timeout, `408`, `429` or a `5xx` from the relay) is sent again with the same event ID after 1, 2 and 4 seconds, for at most about 30 seconds per event; the relay drops the repeats it already accepted. Other refusals are not retried. A `401` means the relay no longer knows this gateway (Conduit removed it, or the relay lost its data): the pairing is kept, and `status` says to pair again from Conduit until a delivery is accepted again.
+- A delivery that fails on the way (no connection, a timeout, `408`, `429` or a `5xx` from the relay) is sent again with the same event ID after 1, 2 and 4 seconds, for at most about 30 seconds per event; the relay drops the repeats it already accepted. Other refusals are not retried. A `401` means the relay no longer knows this gateway (Conduit removed it, or the relay lost its data): the pairing is kept, and `status` says to pair again from Conduit until a delivery is accepted again. A `401` or `403` also parks notifications for that pairing (plugin 0.55.1+): events are dropped for 1 minute, doubling with each refusal in a row up to 30 minutes, then the next event goes out as the probe and an accepted one (or an accepted `test`) ends the pause; a clarify question asked meanwhile uses the native prompt at once (Live Activity reports pause 30 minutes on their own). A `403` with no JSON body comes from something in front of the relay (a firewall or rate limiter) blocking this host's address: `status` says so instead of telling you to pair again, since a pairing claim meets the same block, and Conduit's pairing status reports it as `relay_blocked`.
 - Disabling or reloading the plugin (on a Hermes with plugin unload callbacks) stops its background work: notifications still queued and replies waiting for their turn's end are dropped, the delivery and Lock Screen threads end, and a call held until your call ends is kept for the next load instead of going out.
 - The health, location, maps, calendar, phone, contacts, calls and display tools refuse delegated subagents, including one whose session id a compaction replaced (`compression.in_place: false`): the plugin asks Hermes' delegation flag (Hermes 0.22+) and follows the compaction links in Hermes' session store back to the subagent it was (plugin 0.51.6+).
 - Event titles and bodies are length-limited before delivery.
@@ -1062,8 +1062,9 @@ start the agent or call a model. A resumed call appends to the same session.
 | --- | --- | --- |
 | POST | `/api/plugins/conduit_push/voice/sessions` with `{call_id, engine, session_id?, chat_id?, title?, turns: [{index, role, text, at?}]}` | `{ok, session_id, chat_id?, written, appended, created}` |
 | GET | `/api/plugins/conduit_push/voice/chat-calls?chat_id=[&call_id=]` | `{ok, chat_id, calls: [{call_id, engine, turns?: [{role, text, at}]}]}` |
-| GET | `/api/plugins/conduit_push/voice/tags` | `{ok, tags: {session_id: {kind, engine?, parent_id?, parent_title?}}}` |
+| GET | `/api/plugins/conduit_push/voice/tags` | `{ok, tags: {session_id: {kind, engine?, archived?, parent_id?, parent_title?}}}` |
 | POST | `/api/plugins/conduit_push/voice/tags` with `{session_id, kind: classic or job, parent_id?, parent_title?}` | `{ok, session_id, kind, ...}` |
+| POST | `/api/plugins/conduit_push/voice/archive` with `{session_id}` | `{ok, session_id, archived}` |
 | GET | `/api/plugins/conduit_push/voice/summary?session_id=` | `{ok, available, text, covers}` |
 | POST | `/api/plugins/conduit_push/voice/summary` with `{session_id, text, covers}` | `{ok, session_id, covers}` |
 
@@ -1092,6 +1093,23 @@ start the agent or call a model. A resumed call appends to the same session.
   session, but no session-end hooks fire: the chat goes on. A chat that no
   longer exists gets 422, and Conduit then saves the call on its own. Older
   plugins ignore `chat_id` and save a session as before.
+- A call saved as its own session (one not kept with a chat) is archived
+  when its first save lands, with Hermes' auto-archive stamp
+  (`auto_archived`), so Hermes Desktop's chat list doesn't fill up with
+  calls. Typing into the row reopens it, and Hermes then un-archives it by
+  itself, so a call continued as a chat comes back. A resumed call doesn't
+  touch the flag, a retried first save finishes an archive its first
+  attempt didn't get to (the call's tag records a done one with
+  `archived: true`), and an archive the user sets or clears stays. Conduit keeps
+  listing these rows with its calls, and Desktop's Archived view and search
+  still find them. Hermes builds without the stamp leave the row listed.
+- `voice/archive` archives a Classic voice chat (tagged `classic`) the same
+  way when the call that started it ends; Conduit sends it. A pinned or
+  already archived chat is left as it is (`archived: false`), and any other
+  session gets 422. Such a chat may still be open when its call ends, so
+  nothing reopens it: the next turn run in a voice chat archived this way
+  (a call row or a Classic chat) un-archives it from the `pre_llm_call`
+  hook, the way Hermes' reopen does.
 - A create is idempotent per `call_id`: a retried first save whose response
   was lost continues the row it made instead of starting a second one.
 - Appends and summaries go only to rows saved as voice calls; any other
@@ -1173,6 +1191,17 @@ lock, and Conduit's next send claims the chat.
   400 for a bad body, 501 on a Hermes without the ownership registry or turn markers, 503
   when the registry can't be read (ownership is never guessed), 429 past 60
   requests a minute, 504 if the takeover doesn't finish within 20 seconds (ask again: nothing is written after that, short of a write already under way).
+
+The other way round (plugin 0.58.1+): a chat Conduit opened in the dashboard
+holds its claim for as long as Conduit stays connected, which used to refuse
+the same chat in Hermes Desktop's own process long after Conduit's turn ended.
+The dashboard now lets go of Conduit's claim once the chat has been idle for a
+minute: no turn running, nothing waiting on an answer, no delegated work, wake-up
+or background process still to report, and no turn marker. The chat stays open
+in Conduit, and its next send claims it again, or meets the usual refusal and
+**Take over** if Desktop took it meanwhile. Only chats whose every client here
+is Conduit count; a chat Desktop or the web dashboard also has open in this
+process, and Bot Chats, keep their claim.
 
 ## Chats opened on Desktop (plugin 0.12+)
 
@@ -1891,7 +1920,8 @@ marked private is reported only as "at a private place".
 - **On-demand locate.** `locate` asks the phone for a fresh fix through the
   relay as a silent location push (Apple's Location Push Service Extension),
   which the phone answers only while background sharing is on and not
-  paused. At most one every 5 minutes and 30 a day per profile.
+  paused. At most one every 5 minutes and 30 a day per location store
+  (profiles reading a shared one spend its budget).
 - **Place rules.** `set_rule` keeps a Hermes cron job named
   `Place rule: <what>` that never runs on its own schedule; an arrive or
   leave event that matches the rule's place (one saved place or any), move
@@ -1900,6 +1930,23 @@ marked private is reported only as "at a private place".
   The task is anything a cron run can do. A rule fires once a day, or every
   time at least 30 minutes apart (`repeat: "every"`), never for an event
   over 15 minutes old, and never while sharing is paused.
+- **Other profiles on this host** (plugin 0.58+). Conduit binds sharing to
+  one profile, which keeps the store, key and place rules. With "Share with
+  this host's other profiles" on (`sharing.other_profiles: true`), every
+  other profile on the same host that is paired with the same iPhone (the
+  same relay installation in its `conduit-push.json`) reads that store:
+  `now`, `places`, `history`, `distance_to`, `locate` and maps lookups. A
+  locate or phone maps lookup goes through the asking profile's own pairing
+  and names the sharing profile, so the phone answers it as that profile's.
+  Reads are logged in the sharing profile's store as `<profile>: <chat>`.
+  `rules`, `set_rule` and `remove_rule` answer `other_profile`: rules stay
+  with the sharing profile. A profile that shares location itself (talking
+  or background on) always reads its own, and if several profiles share
+  with the others the first wins (default, then named ones alphabetically).
+  The fresh-position and maps budgets belong to the sharing profile's
+  store, so every profile reading it spends the same ones. Calls placed
+  from a reading profile are held back by the shared position, but the
+  places to avoid are that profile's own calls settings.
 - **No calls at places.** Calls settings `avoid_places` (place ids) and
   `avoid_unknown_place` (also hold calls when there's no recent location,
   or sharing is paused or off): a call that would ring while the user is at an

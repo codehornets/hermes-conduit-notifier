@@ -67,12 +67,16 @@ def test_every_capability_names_a_served_route_family():
         "conduit-settings": "/conduit-settings",
         "conduit-prefs": "/conduit-prefs",
         "pulse": "/pulse",
+        "pulse_feed": "/pulse/feed",
+        "pulse_model": "/pulse",
         "present-v1": "/present/",
         "health-sync": "/health/",
         "voice-tools": "/voice-tools",
         "location-sync": "/location/",
         # A fresh lookup is the location status route's `locate` answer.
         "location-locate": "/location/status",
+        # Sharing with the host's other profiles rides the ingest route.
+        "location-profiles": "/location/ingest",
         "phone-sync": "/phone/",
         "phone-alarms": "/phone/",
         "phone-contacts": "/phone/",

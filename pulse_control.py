@@ -10,7 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from . import pulse, pulse_delivery, pulse_hermes, pulse_memory
+from . import pulse, pulse_delivery, pulse_hermes, pulse_learning, pulse_memory
+from . import pulse_host as host
 
 RECENT = 5
 ITEMS = 200
@@ -170,22 +171,24 @@ def backfill_start(pulse_store: Any, home: Path, days: Optional[int] = None,
     return {"from": window[0], "to": window[1], "days": days, "resumed": resuming}
 
 
-SETTINGS = ("enabled", "memory", "daily_report", "report_profiles", "report_times", "time_zone")
+SETTINGS = ("enabled", "memory", "followups", "daily_report", "report_profiles", "report_times", "time_zone",
+            "brief_time", "model")
 
 
 def update(pulse_store: Any, body: Any) -> None:
     """Applies the settings in ``body`` (any of SETTINGS). Every value is
     checked before any is written, so a bad one changes nothing; any other
-    key is refused too. Values: booleans for "enabled", "memory" and "daily_report"; "all" or "this"
+    key is refused too. Values: booleans for "enabled", "memory", "followups" and "daily_report"; "all" or "this"
     for "report_profiles"; a list of "HH:MM" for "report_times"; an IANA
-    name, or "" for the phone's, for "time_zone"."""
+    name, or "" for the phone's, for "time_zone"; {"provider", "model"} for
+    "model" (the model Pulse's turns run on), or null for the chat's own."""
     if not isinstance(body, dict):
         raise Refused("invalid", field="")
     for field in body:
         if field not in SETTINGS:
             raise Refused("invalid", field=str(field)[:64])
     changes: dict[str, Any] = {}
-    for field in ("enabled", "memory", "daily_report"):
+    for field in ("enabled", "memory", "followups", "daily_report"):
         if field in body:
             if not isinstance(body[field], bool):
                 raise Refused("invalid", field=field)
@@ -201,13 +204,34 @@ def update(pulse_store: Any, body: Any) -> None:
         if parsed is None:
             raise Refused("invalid", field="report_times")
         changes["report_time"] = parsed
+    if "brief_time" in body:
+        value = body["brief_time"]
+        parsed = pulse.report.parse_times(value) if isinstance(value, str) and len(value) <= 5 else None
+        if parsed is None or "," in parsed:
+            raise Refused("invalid", field="brief_time")
+        changes["brief_time"] = parsed
     if "time_zone" in body:
         zone = body["time_zone"]
         if not isinstance(zone, str) or len(zone) > 64 or (zone and not pulse.report.known_zone(zone)):
             raise Refused("invalid", field="time_zone")
         changes["time_zone"] = zone
+    if "model" in body:
+        changes[pulse.MODEL] = _model(body["model"])
     for key, value in changes.items():
         pulse_store.set(key, value)
+
+
+def _model(value: Any) -> Optional[dict[str, str]]:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - {"provider", "model"}:
+        raise Refused("invalid", field="model")
+    name, provider = value.get("model"), value.get("provider", "")
+    if not isinstance(name, str) or not isinstance(provider, str) or not name.strip() \
+            or len(name) > 200 or len(provider) > 100 or not host.plain_flag_value(name) \
+            or (provider and not host.plain_flag_value(provider)):
+        raise Refused("invalid", field="model")
+    return {"provider": provider, "model": name}
 
 
 def request_report(pulse_store: Any) -> None:
@@ -232,6 +256,73 @@ def items(pulse_store: Any, kind: str = "") -> list[dict[str, Any]]:
             for item in pulse_store.open_items(kind, limit=ITEMS)]
 
 
+def followups(pulse_store: Any, limit: int = ITEMS) -> list[dict[str, Any]]:
+    """Promises Pulse checks on, most recently decided first: the journal."""
+    out = []
+    for row in pulse_store.followups(limit):
+        item = pulse_store.item(row["item_id"])
+        out.append({"id": row["item_id"], "text": item["text"] if item else "", "evidence": item["evidence"] if item else "",
+                    "profile": item["profile"] if item else "", "chat_id": item["chat_id"] if item else "",
+                    "message_id": item["message_id"] if item else None,
+                    "decision": row["decision"] or "waiting", "why": row["why"], "news": row["news"],
+                    "checks": row["checks"], "next_check_at": row["next_check_at"], "updated_at": row["updated_at"]})
+    return out
+
+
+def feed(pulse_store: Any, home: Optional[Path] = None, limit: int = pulse_learning.CARDS) -> dict[str, Any]:
+    """The Pulse screen: what Pulse brought the user, newest first, how many
+    are unseen, each kind's loudness, and the Pulse chat's id ("" when
+    there's none), which Conduit keeps behind the screen."""
+    # Pulse off: no chat stands behind the screen, whatever is titled Pulse.
+    on = home is not None and pulse_store.get("enabled")
+    chat = pulse.home_chat(pulse_store, Path(home))[0] if on else None
+    return {"cards": [pulse_learning.card_entry(card) for card in pulse_store.cards(limit)],
+            "unseen": pulse_store.unseen_cards(), "levels": pulse_learning.levels(pulse_store),
+            "home_chat_id": chat.chat_id if chat else ""}
+
+
+def see(pulse_store: Any, ids: Any, now: Optional[float] = None) -> int:
+    """Marks cards seen: a list of ids, or every card for None."""
+    if ids is not None and not (isinstance(ids, list) and len(ids) <= 500 and all(
+            isinstance(value, int) and not isinstance(value, bool) for value in ids)):
+        raise Refused("invalid", field="ids")
+    return pulse_store.see_cards(ids, time.time() if now is None else now)
+
+
+def _learning(action: Any) -> Any:
+    try:
+        return action()
+    except pulse_learning.Invalid as error:
+        raise Refused("invalid", field=error.field) from None
+
+
+def rate(pulse_store: Any, card_id: Any, rating: Any, reason: Any = "", now: Optional[float] = None) -> list[dict]:
+    """Rates a card; the lessons it made, as `learned` lists them. Refused
+    while Pulse is off, as setting a level is: a rating can move one."""
+    if not pulse_store.get("enabled"):
+        raise Refused("pulse_off")
+    now = time.time() if now is None else now
+    made = _learning(lambda: pulse_learning.rate(pulse_store, card_id, rating, reason, now=now))
+    return [pulse_learning.lesson_entry(lesson) for lesson in made if lesson]
+
+
+def learned(pulse_store: Any) -> dict[str, Any]:
+    """What ratings taught Pulse, newest first, and each kind's loudness."""
+    return {"lessons": pulse_learning.learned(pulse_store), "levels": pulse_learning.levels(pulse_store)}
+
+
+def undo(pulse_store: Any, lesson_id: Any, now: Optional[float] = None) -> bool:
+    return _learning(lambda: pulse_learning.undo(pulse_store, lesson_id, time.time() if now is None else now))
+
+
+def set_level(pulse_store: Any, kind: Any, level: Any, now: Optional[float] = None) -> Optional[dict]:
+    if not pulse_store.get("enabled"):
+        raise Refused("pulse_off")
+    lesson = _learning(lambda: pulse_learning.set_level(pulse_store, kind, level,
+                                                        time.time() if now is None else now))
+    return pulse_learning.lesson_entry(lesson) if lesson else None
+
+
 def state(pulse_store: Any, home: Path, now: Optional[float] = None) -> dict[str, Any]:
     """Everything Settings > Pulse shows, as data. Times are epoch seconds."""
     now = time.time() if now is None else now
@@ -246,6 +337,8 @@ def state(pulse_store: Any, home: Path, now: Optional[float] = None) -> dict[str
     day = datetime.fromtimestamp(now, zone).strftime("%Y-%m-%d")
     used = int(today.get("tokens", 0) or 0) if isinstance(today, dict) and today.get("day") == day else 0
     profiles = pulse_store.get("report_profiles")
+    follow_usage = pulse_store.get("followup_usage")
+    follow_usage = follow_usage if isinstance(follow_usage, dict) else {}
     return {
         "enabled": bool(pulse_store.get("enabled")),
         "running": bool(running),
@@ -253,6 +346,7 @@ def state(pulse_store: Any, home: Path, now: Optional[float] = None) -> dict[str
         "home_chat": {"id": chat.chat_id, "title": chat.title, "pinned": bool(chat.pinned)} if chat else None,
         "home_problem": problem,
         "home_title": pulse_store.get("home_title") or "Pulse",
+        "model": pulse.turn_model(pulse_store),
         "checks": pulse_store.counts(pulse.PROBE),
         "recent": [{"at": row["created_at"], "kind": row["kind"], "state": row["state"],
                     "detail": row.get("detail") or ""} for row in pulse_store.recent(RECENT)],
@@ -267,6 +361,16 @@ def state(pulse_store: Any, home: Path, now: Optional[float] = None) -> dict[str
         "other_profiles": [name for name, _ in pulse.report.profile_homes(Path(home))] if profiles == "all" else [],
         "memory": bool(pulse_store.get("memory")),
         "memory_counts": pulse_store.item_counts(),
+        "followups": bool(pulse_store.get("followups")),
+        # Follow-ups run with memory, which finds the promises: off without it.
+        "followups_active": bool(pulse_store.get("enabled") and pulse_store.get("followups")
+                                 and pulse_store.get("memory")),
+        "followup_counts": pulse_store.followup_counts(),
+        "followup_usage": {key: int(follow_usage.get(key, 0) or 0) for key in ("checks", "tokens", "failed")},
+        "levels": pulse_learning.levels(pulse_store),
+        "unseen_cards": pulse_store.unseen_cards(),
+        "brief_time": pulse.report.clock_text(pulse_store.get("brief_time") or pulse.brief.DEFAULT_TIME),
+        "held_cards": pulse_store.held_count(),
         "memory_chunks": int(usage.get("chunks", 0) or 0),
         "memory_tokens": int(usage.get("tokens", 0) or 0),
         "daily_tokens": daily_tokens(pulse_store),

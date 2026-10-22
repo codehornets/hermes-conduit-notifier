@@ -5205,13 +5205,16 @@ def save_voice_turns(body: Dict[str, Any],
                     # later flushes are no-ops. Hermes refuses appends only to rows
                     # that compression closed, so this end doesn't block them.
                     db.end_session(session_id, VOICE_END_REASON)
-                if created:
-                    if title and hasattr(db, "set_session_title"):
-                        _set_voice_title(db, session_id, title)
-                    _set_voice_tag(db, session_id, {"kind": "call", "engine": engine})
-                elif adopted and _voice_tags(db).get(session_id, {}).get("kind") != "call":
-                    # The first attempt died before tagging its row: finish it.
-                    _set_voice_tag(db, session_id, {"kind": "call", "engine": engine})
+                if created and title and hasattr(db, "set_session_title"):
+                    _set_voice_title(db, session_id, title)
+                # The tag records a successful archive, so a retried create
+                # finishes a first attempt that died before tagging or whose
+                # archive failed, and leaves alone a row the user un-archived.
+                tag = {} if created else _voice_tags(db).get(session_id, {}) if adopted else None
+                if tag is not None and (tag.get("kind") != "call" or not tag.get("archived")):
+                    archived = _archive_ended_voice_row(db, session_id)
+                    _set_voice_tag(db, session_id, {"kind": "call", "engine": engine,
+                                                    **({"archived": True} if archived else {})})
             except Exception:
                 if created:
                     _discard_new_voice_session(db, session_id)
@@ -5225,6 +5228,28 @@ def save_voice_turns(body: Dict[str, Any],
         if end_messages and on_end is not None:
             on_end(session_id, engine, end_messages)
     return result
+
+
+def _archive_ended_voice_row(db, session_id: str) -> bool:
+    """Keeps a standalone call out of Desktop's chat list (hermes-conduit#1124).
+
+    Archived with Hermes' idle-sweep stamp (``auto_archived``), not as a user
+    archive: the first turn anyone types into the row reopens it, and Hermes
+    then un-archives it by itself, so a call continued as a chat comes back.
+    Conduit still lists these rows with its calls. Only a call's first save
+    (or a retry finishing it) archives its row; a resumed call leaves the
+    flag as the user left it.
+    Hosts without the stamp keep the row visible. Never fails the save.
+    True when the row was archived."""
+    archive = getattr(db, "_auto_archive_lineage", None)
+    if archive is None:
+        return False
+    try:
+        archive(session_id)
+    except Exception:  # noqa: BLE001 — the turns are stored; the row just stays listed
+        logger.warning("Couldn't archive Conduit voice call %s", session_id, exc_info=True)
+        return False
+    return True
 
 
 def _chat_call(db, call_id: str) -> Optional[Dict[str, Any]]:
@@ -5378,6 +5403,28 @@ def set_voice_tag(body: Dict[str, Any]) -> Dict[str, Any]:
     return {"session_id": session_id, **tag}
 
 
+def archive_classic_voice_chat(body: Dict[str, Any]) -> Dict[str, Any]:
+    """A Classic voice chat a call started, archived when that call ends,
+    like a live call's own row (hermes-conduit#1124). The chat may still be
+    open in Conduit; the next turn anyone runs in it un-archives it (the
+    pre_llm_call hook), as Hermes does for a reopened row."""
+    session_id = _voice_id(body.get("session_id"), "session_id")
+    with _voice_lock():
+        db = _open_voice_db(_VOICE_WRITE)
+        try:
+            row = db.get_session(session_id)
+            if not row:
+                raise TokenError(422, "That chat no longer exists")
+            if _voice_tags(db).get(session_id, {}).get("kind") != "classic":
+                raise TokenError(422, "That chat isn't one a Classic voice call started")
+            # A pin is an explicit keep; an archived row stays as it is.
+            archived = not row.get("pinned") and not row.get("archived") \
+                and _archive_ended_voice_row(db, session_id)
+        finally:
+            db.close()
+    return {"session_id": session_id, "archived": bool(archived)}
+
+
 def voice_tags() -> Dict[str, Any]:
     db = _open_voice_db()
     try:
@@ -5499,6 +5546,14 @@ async def post_voice_tag(request: Request, response: Response, profile: Optional
     _voice_limit(write=True)
     body = await _voice_body(request)
     return {"ok": True, **(await _run_voice(profile, lambda: set_voice_tag(body), "tag"))}
+
+
+@router.post("/voice/archive")
+async def post_voice_archive(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    _voice_limit(write=True)
+    body = await _voice_body(request)
+    return {"ok": True, **(await _run_voice(profile, lambda: archive_classic_voice_chat(body), "archive"))}
 
 
 @router.get("/voice/summary")
@@ -5876,6 +5931,7 @@ async def post_session_takeover(request: Request, response: Response,
     try:
         body = await _read_json_body(request, TAKEOVER_MAX_BODY_BYTES)
         ids = _takeover_ids(body)
+        _ensure_claims_sweeper()
         # One budget for the whole dashboard, like the voice routes: the
         # profile isn't resolved yet, so a made-up name can't mint a window.
         _takeover_limiter.acquire("")
@@ -5898,6 +5954,52 @@ async def post_session_takeover(request: Request, response: Response,
     except Exception as exc:
         raise _unexpected("takeover", exc, feature="Chat takeover")
     return {"ok": True, **result}
+
+
+# The reverse direction (hermes-conduit#1123): a chat Conduit opened here keeps
+# its claim while Conduit stays connected, so Desktop's own process is refused
+# it long after Conduit's turn ended. A sweep lets go of Conduit's claims on
+# chats that sit idle; conduit_claims.py explains when. One sweeper per
+# process: a reloaded copy of this module takes over from the old one.
+_CLAIMS_SWEEPER = "_conduit_idle_claims_sweeper"
+
+
+def _claims_home() -> Any:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home()
+
+
+def _sweep_idle_claims(token: object) -> None:
+    while sys.__dict__.get(_CLAIMS_SWEEPER) is token:
+        try:
+            claims = _plugin_package_module("conduit_claims")
+            time.sleep(claims.SWEEP_S)
+            if sys.__dict__.get(_CLAIMS_SWEEPER) is token:
+                claims.sweep(_hermes_session_api(), _claims_home)
+        except Exception:  # noqa: BLE001 — keep sweeping
+            logger.debug("Conduit: idle claim sweep failed", exc_info=True)
+            time.sleep(60.0)
+
+
+def _start_claims_sweeper() -> None:
+    token = object()
+    sys.__dict__[_CLAIMS_SWEEPER] = token
+    try:
+        threading.Thread(target=_sweep_idle_claims, args=(token,), name="conduit-idle-claims", daemon=True).start()
+    except RuntimeError:
+        sys.__dict__.pop(_CLAIMS_SWEEPER, None)  # the next takeover tries again
+        logger.warning("Conduit: no thread to let go of idle chat claims")
+
+
+def _ensure_claims_sweeper() -> None:
+    """Starts the sweeper unless one runs: a takeover means Conduit chats here."""
+    if sys.__dict__.get(_CLAIMS_SWEEPER) is None:
+        _start_claims_sweeper()
+
+
+if "hermes_cli.web_server" in sys.modules:
+    _start_claims_sweeper()
 
 
 # --- Where in Conduit a message was sent (hermes-conduit#888) ----------------
@@ -6093,6 +6195,9 @@ def e2e_status(path: Any = None) -> Dict[str, Any]:
         # The relay answered 401 to this pairing's last delivery (client.py):
         # it no longer knows this gateway, so the phone should pair again.
         "relay_rejected": bool(state.get("relay_rejected_at")),
+        # Something in front of the relay answered a bare 403 (client.py):
+        # this host is blocked there, and pairing again won't get through.
+        "relay_blocked": bool(state.get("relay_blocked_at")),
     }
 
 
@@ -6242,9 +6347,15 @@ def _pair_gateway_name(raw: Any, profile: Optional[str]) -> str:
     return (name if _limiter_key(scoped) in ("", "default") else f"{name} ({scoped})")[:80]
 
 
+def _looks_like_json_object(raw: bytes) -> bool:
+    # As client.looks_like_json_object: the relay's answer, not a firewall's.
+    return raw.lstrip().removeprefix(b"\xef\xbb\xbf").lstrip().startswith(b"{")
+
+
 def _claim_pairing(relay_url: str, code: str, gateway_name: str) -> Dict[str, Any]:
     """POST /v1/pairings/claim without credentials or redirects: the relay's answer, else TokenError."""
     data = json.dumps({"pairing_code": code, "gateway_name": gateway_name}, separators=(",", ":")).encode("utf-8")
+    unreadable = False
     request = urllib.request.Request(f"{relay_url}/v1/pairings/claim", data=data, method="POST", headers={
         "Accept": "application/json", "Content-Type": "application/json",
         "User-Agent": f"Hermes-Conduit-Notifier/{_plugin_version() or 'unknown'}"})
@@ -6258,7 +6369,7 @@ def _claim_pairing(relay_url: str, code: str, gateway_name: str) -> Dict[str, An
         try:
             raw = error.read(4 * 1024)
         except (OSError, http.client.HTTPException):
-            raw = b""
+            raw, unreadable = b"", True
     except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
         raise TokenError(502, f"Couldn't reach the push relay from this host ({type(error).__name__})")
     try:
@@ -6268,7 +6379,18 @@ def _claim_pairing(relay_url: str, code: str, gateway_name: str) -> Dict[str, An
     if status == 404:
         raise TokenError(410, "This pairing code expired or was already used. Create a new one.")
     if status == 429:
+        if isinstance(body, dict) and body.get("error") == "gateway_limit_reached":
+            # Every pairing slot this phone has at the relay is taken: waiting won't free one.
+            raise TokenError(409, "The push relay holds too many pairings for this iPhone. Turn notifications off "
+                                  "and on again in Conduit's Settings > Notifications to start fresh, then pair again.")
         raise TokenError(429, "The push relay is rate limiting pairing; try again shortly")
+    if status == 403 and not unreadable and not _looks_like_json_object(raw):
+        # The relay always answers with a JSON error: a bare 403 is something
+        # in front of it (a firewall, a rate limiter) blocking this host.
+        logger.warning("Conduit plugin: something in front of the push relay answered the pairing claim "
+                       "with an empty 403: this host's address is blocked there")
+        raise TokenError(502, "Something in front of the push relay is blocking this host, so pairing can't get "
+                              "through. Pairing again won't help until the relay's operator lifts the block.")
     if not 200 <= status < 300 or not isinstance(body, dict):
         # The relay's own status stays in the log: the answer doesn't probe hosts.
         logger.warning("Conduit plugin: the push relay answered the pairing claim with HTTP %s", status)
@@ -6279,13 +6401,47 @@ def _claim_pairing(relay_url: str, code: str, gateway_name: str) -> Dict[str, An
     return body
 
 
+def _revoke_replaced_pairing(relay_url: str, credential: str) -> None:
+    """Revokes a credential that a new pairing replaced, off the pairing path.
+
+    The relay mints a new gateway per claim, so without this every re-pair
+    leaves a live gateway behind until the phone's slots run out (#250).
+    Best effort: the new pairing already works either way.
+    """
+    try:
+        url = _relay_urls().check_request_url(f"{relay_url.rstrip('/')}/v1/gateways/current")
+    except ValueError:
+        # Plain http:// off this machine (a pairing saved before HTTPS was
+        # required): the credential isn't sent there.
+        return
+
+    def revoke() -> None:
+        try:
+            status, _body = _relay_request(url, "DELETE", credential, None, PAIR_TIMEOUT_S)
+            if not 200 <= status < 300 and status != 401:
+                logger.info("Conduit plugin: the relay answered revoking the replaced pairing with HTTP %s", status)
+        except Exception as exc:
+            logger.info("Conduit plugin: the replaced pairing wasn't revoked at the relay: %s", type(exc).__name__)
+
+    try:
+        _start_revoke_thread(revoke)
+    except RuntimeError as exc:
+        # Out of threads. The pairing is saved, and this doesn't undo it.
+        logger.warning("Conduit plugin: the replaced pairing wasn't revoked at the relay: %s", exc)
+
+
+def _start_revoke_thread(target: Callable[[], None]) -> None:
+    threading.Thread(target=target, name="conduit-pair-revoke", daemon=True).start()
+
+
 def pair_profile(body: Any, profile: Optional[str] = None, path: Any = None,
                  claim: Optional[Callable[[str, str, str], Dict[str, Any]]] = None,
                  limit: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
     """Claims the phone's pairing code for this profile. Never returns the credential.
 
     `limit` runs once the request is well formed, so a mistyped code costs no
-    rate-limit slot.
+    rate-limit slot. The credential this pairing replaces is revoked at its
+    relay afterwards.
     """
     if not isinstance(body, dict):
         raise TokenError(400, "Expected a JSON object")
@@ -6331,6 +6487,10 @@ def pair_profile(body: Any, profile: Optional[str] = None, path: Any = None,
                 and previous.get("gateway_id") == state["gateway_id"]:
             state["e2e"] = previous["e2e"]
         _save_pairing_state(path, state)
+    old_credential, old_relay = previous.get("credential"), previous.get("relay_url")
+    if isinstance(old_credential, str) and old_credential and old_credential != state["credential"] \
+            and isinstance(old_relay, str) and old_relay:
+        _revoke_replaced_pairing(old_relay, old_credential)
     return {"paired": True, "installation_id": state["installation_id"], "gateway_id": state["gateway_id"],
             "gateway_name": gateway_name, "relay_url": state["relay_url"]}
 
@@ -6998,6 +7158,14 @@ async def get_pulse_memory(response: Response, kind: str = "") -> Dict[str, Any]
                               reads_only=True)
 
 
+@router.get("/pulse/followups")
+async def get_pulse_followups(response: Response) -> Dict[str, Any]:
+    """Promises Pulse checks on and its last decision for each, newest first."""
+    response.headers["Cache-Control"] = "no-store"
+    return await _pulse_route("followups", lambda control, store, home: {"followups": control.followups(store)},
+                              reads_only=True)
+
+
 @router.post("/pulse/memory/forget")
 async def post_pulse_forget(request: Request, response: Response) -> Dict[str, Any]:
     """{"id": n}: closes one remembered item; {"forgotten": false} if it wasn't open."""
@@ -7006,6 +7174,74 @@ async def post_pulse_forget(request: Request, response: Response) -> Dict[str, A
     item_id = body.get("id") if isinstance(body, dict) else None
     return await _pulse_route("forget", lambda control, store, home: {"forgotten": control.forget(store, item_id)},
                               reads_only=True)
+
+
+@router.get("/pulse/feed")
+async def get_pulse_feed(response: Response) -> Dict[str, Any]:
+    """The Pulse screen: cards newest first, how many are unseen, each kind's loudness and the Pulse chat's id."""
+    response.headers["Cache-Control"] = "no-store"
+    return await _pulse_route("feed", lambda control, store, home: control.feed(store, home), reads_only=True)
+
+
+@router.post("/pulse/feed/seen")
+async def post_pulse_seen(request: Request, response: Response) -> Dict[str, Any]:
+    """{"ids": [n, ...]} marks those cards seen, {"ids": null} every card: {"seen": count}."""
+    response.headers["Cache-Control"] = "no-store"
+    body = await _read_json_body(request, PULSE_MAX_BODY_BYTES)
+    if not isinstance(body, dict) or "ids" not in body:
+        raise HTTPException(status_code=400, detail={"code": "invalid", "field": "ids"},
+                            headers={"Cache-Control": "no-store"})
+    ids = body["ids"]
+    return await _pulse_route("seen", lambda control, store, home: {"seen": control.see(store, ids)},
+                              reads_only=True)
+
+
+@router.post("/pulse/rate")
+async def post_pulse_rate(request: Request, response: Response) -> Dict[str, Any]:
+    """{"card": n, "rating": "up"|"down", "reason": optional, for a down:
+    "not_relevant"|"already_knew"|"too_late"|"too_often"}: {"learned": [...]},
+    the lessons it made."""
+    response.headers["Cache-Control"] = "no-store"
+    body = await _read_json_body(request, PULSE_MAX_BODY_BYTES)
+    body = body if isinstance(body, dict) else {}
+    return await _pulse_route("rate", lambda control, store, home: {"learned": control.rate(
+        store, body.get("card"), body.get("rating"), body.get("reason") or "")}, reads_only=True)
+
+
+@router.get("/pulse/learned")
+async def get_pulse_learned(response: Response) -> Dict[str, Any]:
+    """What ratings taught Pulse, newest first, and each kind's loudness."""
+    response.headers["Cache-Control"] = "no-store"
+    return await _pulse_route("learned", lambda control, store, home: control.learned(store), reads_only=True)
+
+
+@router.post("/pulse/learned/undo")
+async def post_pulse_undo(request: Request, response: Response) -> Dict[str, Any]:
+    """{"id": n}: undoes one lesson; answers with what's learned now."""
+    response.headers["Cache-Control"] = "no-store"
+    body = await _read_json_body(request, PULSE_MAX_BODY_BYTES)
+    lesson_id = body.get("id") if isinstance(body, dict) else None
+
+    def action(control: Any, store: Any, home: Any) -> Dict[str, Any]:
+        return {"undone": control.undo(store, lesson_id), **control.learned(store)}
+
+    return await _pulse_route("undo", action, reads_only=True)
+
+
+@router.put("/pulse/levels")
+async def put_pulse_levels(request: Request, response: Response) -> Dict[str, Any]:
+    """{"kind": "followup", "level": "push"|"screen"|"brief"|"off"}: sets a
+    kind's loudness by hand; answers with what's learned now."""
+    response.headers["Cache-Control"] = "no-store"
+    body = await _read_json_body(request, PULSE_MAX_BODY_BYTES)
+    body = body if isinstance(body, dict) else {}
+
+    def action(control: Any, store: Any, home: Any) -> Dict[str, Any]:
+        control.set_level(store, body.get("kind"), body.get("level"))
+        return control.learned(store)
+
+    # Refused while Pulse is off, so a host that never turned it on keeps no file.
+    return await _pulse_route("levels", action, reads_only=True)
 
 
 # --- Confirm prompts Hermes shows on the phone ---------------------------------
@@ -7910,7 +8146,9 @@ def _relay_request(url: str, method: str, credential: str, payload: Optional[Dic
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with _relay_opener.open(request, timeout=timeout) as response:
+        # Plain HTTP (only ever to this machine) skips any proxy, which would see the credential in clear.
+        opener = _relay_opener if _relay_urls().is_https(url) else _direct_relay_opener
+        with opener.open(request, timeout=timeout) as response:
             raw = response.read(64 * 1024)
             status = response.status
     except urllib.error.HTTPError as error:
@@ -14082,6 +14320,10 @@ ROUTE_CAPABILITIES = (
     "conduit-settings",
     "conduit-prefs",
     "pulse",
+    # The Pulse screen: cards, ratings and lessons (/pulse/feed, /rate, /learned, /levels).
+    "pulse_feed",
+    # PUT /pulse takes "model": the model Pulse's turns run on.
+    "pulse_model",
     "present-v1",
     "health-sync",
     "voice-tools",
@@ -14090,6 +14332,9 @@ ROUTE_CAPABILITIES = (
     "phone-contacts",
     "location-sync",
     "location-locate",
+    # sharing.other_profiles: the host's other profiles paired with the
+    # same iPhone read the location (location_profiles).
+    "location-profiles",
     "pairing",
     "self-restart",
     "cron-notifications",

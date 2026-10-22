@@ -343,7 +343,8 @@ def test_no_answer_gives_a_labelled_guess_to_a_saved_place(home, monkeypatch):
 def test_a_relay_that_cant_wake_the_phone_spends_nothing(home, monkeypatch):
     store, _ = _shared(home, fix=fix("significant"))
     monkeypatch.setattr(maps, "client", FakeClient({"accepted": True, "delivered": False}))
-    assert _call({"action": "lookup", "query": "Heathrow"})["error"] == "not_set_up"
+    answer = _call({"action": "lookup", "query": "Heathrow"})
+    assert answer["error"] == "not_set_up" and "reason" not in answer
     with sqlite3.connect(store.path) as db:
         assert db.execute("SELECT COUNT(*) FROM maps").fetchone()[0] == 0
 
@@ -496,8 +497,10 @@ def test_directions_from_me_at_area_detail_leave_out_the_first_turns(home, apple
 
 def test_keep_maps_on_the_phone_turns_the_host_engine_off(home, apple, monkeypatch):
     _shared(home, sharing=maps_sharing(maps_host=False), fix=fix("significant"))
-    monkeypatch.setattr(maps, "client", FakeClient({"accepted": True, "delivered": False}))
-    assert _call({"action": "lookup", "query": "Heathrow"})["error"] == "not_set_up"
+    monkeypatch.setattr(maps, "client", FakeClient({"accepted": True, "delivered": False, "reason": "no_location_token"}))
+    answer = _call({"action": "lookup", "query": "Heathrow"})
+    assert answer["error"] == "not_set_up" and answer["reason"] == "no_location_token"
+    assert "no location push token" in answer["note"]
     assert apple.urls == []
 
 
@@ -669,6 +672,19 @@ def test_navigate_sends_a_go_prompt_carrying_where_to(home, monkeypatch):
     assert event["type"] == "phone.changes" and event["event_id"] == f"present:{answer['prompt_id']}"
     assert event["mode"] == "alert" and event["profile"] == "work"
     assert store.reads()[0]["action"] == "maps navigate"
+
+
+def test_navigate_from_another_profile_is_logged_under_it(home, monkeypatch):
+    work = home / "profiles" / "work"
+    for path in (home, work):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "conduit-push.json").write_text(json.dumps({"credential": "c", "installation_id": "installation-1"}))
+    store, _ = _shared(work, sharing=maps_sharing(other_profiles=True), fix=fix("significant"))
+    _present(home)
+    monkeypatch.setattr(maps, "client", Enqueued())
+    answer = _call({"action": "navigate", "to": "Heathrow Terminal 5"}, profile="default", session_id="session-1")
+    assert answer["ok"] is True
+    assert store.reads()[0]["session_title"] == "default: Trip planning"
 
 
 def test_navigate_to_a_saved_place_names_it_and_gives_no_link(home, monkeypatch):

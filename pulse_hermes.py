@@ -40,6 +40,7 @@ class TurnRows:
     failed: bool  # Hermes marked the turn failed
     closed: bool  # a later user row exists, so the turn is over
     prompt: str = ""  # the tagged user row's own text
+    reply_id: Optional[int] = None  # the reply's messages.id
 
 
 def _connect(home: Path) -> sqlite3.Connection:
@@ -100,9 +101,9 @@ def find_turn(home: Path, *, chat_id: str, tag: str, since: float) -> Optional[T
     user_id, session_id = users[0]["id"], users[0]["session_id"]
     prompt = users[0]["content"] if isinstance(users[0]["content"], str) else ""
     rows = _run(home, (
-        "SELECT role, content, display_kind FROM messages WHERE session_id = ? AND id > ? ORDER BY id"
+        "SELECT id, role, content, display_kind FROM messages WHERE session_id = ? AND id > ? ORDER BY id"
     ), (session_id, user_id))
-    reply, failed, closed = "", False, False
+    reply, reply_id, failed, closed = "", None, False, False
     for row in rows:
         if row["role"] == "user":
             closed = True
@@ -114,8 +115,8 @@ def find_turn(home: Path, *, chat_id: str, tag: str, since: float) -> Optional[T
             continue
         text = row["content"].strip() if isinstance(row["content"], str) else ""
         if text:
-            reply = text
-    return TurnRows(session_id, reply, failed, closed, prompt)
+            reply, reply_id = text, row["id"]
+    return TurnRows(session_id, reply, failed, closed, prompt, reply_id)
 
 
 # The chats a person had: every session but ``excluded`` (the home chat's
@@ -160,14 +161,16 @@ def chat_activity(home: Path, *, exclude_chat: str, since: float,
 
 
 def chat_messages(home: Path, *, chat_id: str, after_id: int, since: float, max_chars: int,
-                  limit: int, until: Optional[float] = None) -> list[sqlite3.Row]:
+                  limit: int, until: Optional[float] = None, newest: bool = False) -> list[sqlite3.Row]:
     """One chat's visible user and assistant rows after row ``after_id`` and
-    time ``since`` (up to ``until``), oldest first, each cut to ``max_chars``."""
-    return _run(home, (
+    time ``since`` (up to ``until``), oldest first, each cut to ``max_chars``:
+    the first ``limit`` of them, or with ``newest`` the last."""
+    rows = _run(home, (
         "SELECT id, role, substr(content, 1, ?) AS content, timestamp FROM messages "
         "WHERE session_id = ? AND id > ? AND timestamp > ? AND timestamp <= ? AND role IN ('user', 'assistant') "
-        "AND active = 1 AND display_kind IS NULL ORDER BY id LIMIT ?"
+        f"AND active = 1 AND display_kind IS NULL ORDER BY id {'DESC' if newest else ''} LIMIT ?"
     ), (max_chars, chat_id, after_id, since, float("inf") if until is None else until, limit))
+    return rows[::-1] if newest else rows
 
 
 def user_text_after(home: Path, *, session_id: str, tag: str) -> list[str]:

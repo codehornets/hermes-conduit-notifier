@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import threading
 import time
@@ -28,7 +29,7 @@ from typing import Any, Callable
 
 from hermes_constants import get_hermes_home
 
-from . import call_watches, client, session_titles
+from . import call_watches, client, location_profiles, session_titles
 from .conduit_first import LOCATION_FIRST
 from .events import push_event
 from .location_store import (
@@ -130,7 +131,13 @@ def register(ctx: Any, *, is_child: Callable[[Any], bool], profile: Callable[[],
 
 
 def _store() -> LocationStore:
-    return LocationStore(get_hermes_home())
+    return _shared_store()[0]
+
+
+def _shared_store() -> tuple[LocationStore, str | None]:
+    """This profile's store, or the one another profile on this host shares
+    with it (and that profile's name)."""
+    return location_profiles.store_for(get_hermes_home(), LocationStore)
 
 
 def available() -> bool:
@@ -162,7 +169,13 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
         return {"ok": False, "error": "subagent",
                 "note": "Only the main conversation can read the user's location. Report back; the main agent can look."}
     action = args.get("action")
-    store = _store()
+    store, owner = _shared_store()
+    if owner is not None and action in ("rules", "set_rule", "remove_rule"):
+        return {"ok": False, "error": "other_profile",
+                "note": f"The user shares their location with this profile through the {owner} profile, and place "
+                        f"rules live there. Ask them to set place rules from a chat with {owner}."}
+    # Reads through another profile's store are logged there under this one.
+    session_label = profile if owner is not None else ""
     if action == "rules":
         # Nothing stored (never shared, or wiped): nothing read, and a log
         # row would bring the wiped file back.
@@ -183,13 +196,14 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
         return _set_rule(store, view, args.get("rule"))
     now = store.clock()
     if sharing_paused(view["sharing"], now):
-        _log(store, action, session)
+        _log(store, action, session, session_label)
         return {"ok": False, "error": "paused",
                 "note": "The user has paused location sharing (or turned it off) in Conduit. Don't guess where they "
                         "are; ask them if it matters."}
-    _log(store, action, session)
+    _log(store, action, session, session_label)
     if action == "locate":
-        return _locate(store, view, profile, sleep)
+        # The phone answers a locate for the profile sharing is bound to.
+        return _locate(store, view, owner or profile, sleep)
     return _read(store, view, action, args, now)
 
 
@@ -387,6 +401,31 @@ def _history(store: LocationStore, view: dict[str, Any], args: dict[str, Any], n
 # --- Fresh lookup --------------------------------------------------------------------
 
 
+_REASON = re.compile(r"[a-z_]{1,40}")
+
+
+def not_delivered(kind: str, answer: dict[str, Any], what: str) -> dict[str, Any]:
+    """A request the relay couldn't hand to the phone (``delivered: false``),
+    with the relay's reason (#287): logged, and kept in the tool result."""
+    reason = answer.get("reason")
+    # The relay's own short code (no_location_token), nothing else: it goes
+    # to the log and to the model.
+    if not isinstance(reason, str) or not _REASON.fullmatch(reason):
+        reason = None
+    logger.info("Conduit %s request not delivered by the relay: %s", kind, reason or "no reason given")
+    return {"ok": False, "error": "not_set_up", "note": not_delivered_note(reason, what),
+            **({"reason": reason} if reason else {})}
+
+
+def not_delivered_note(reason: str | None, what: str) -> str:
+    if reason == "no_location_token":
+        return (f"The phone can't answer {what} yet: the notification relay has no location push token for it. "
+                "The user can fix this by updating Conduit and opening it with background location sharing on "
+                "(on an older Conduit, opening its Settings > Notifications sends the token until it next starts).")
+    return (f"The phone can't answer {what} yet (Conduit or the notification relay needs updating, "
+            "or background sharing was just turned on).")
+
+
 def _locate(store: LocationStore, view: dict[str, Any], profile: str, sleep: Callable[[float], None]) -> dict[str, Any]:
     if not view["sharing"].get("background"):
         return {"ok": False, "error": "background_off",
@@ -408,9 +447,8 @@ def _locate(store: LocationStore, view: dict[str, Any], profile: str, sleep: Cal
                 "note": "The phone couldn't be asked just now. Use action now."}
     if isinstance(answer, dict) and answer.get("delivered") is False:
         store.cancel_locate(locate_id)
-        return {**_fix_view(view, store.clock()), "ok": False, "error": "not_set_up",
-                "note": "The phone can't answer fresh lookups yet (Conduit or the notification relay needs updating, "
-                        "or background sharing was just turned on). Use action now."}
+        blocked = not_delivered("locate", answer, "fresh lookups")
+        return {**_fix_view(view, store.clock()), **blocked, "note": blocked["note"] + " Use action now."}
     waited = 0.0
     while waited < LOCATE_WAIT_S:
         sleep(LOCATE_POLL_S)
@@ -579,9 +617,15 @@ def _place_view(place: dict[str, Any]) -> dict[str, Any]:
     return {"name": place["name"], "kind": place["kind"]}
 
 
-def _log(store: LocationStore, action: str, session: str) -> None:
+def _log(store: LocationStore, action: str, session: str, profile: str = "") -> None:
+    """``profile``: the profile reading another one's store, named in the
+    title so the user sees who read."""
     try:
-        store.log_read(action, session, session_titles.title(session) if session else "")
+        title = session_titles.title(session) if session else ""
+        if profile:
+            name = location_profiles.label(profile)
+            title = f"{name}: {title}" if title else name
+        store.log_read(action, session, title)
     except Exception:  # noqa: BLE001 — the read still answers
         logger.warning("conduit_push: could not log a location read", exc_info=True)
 

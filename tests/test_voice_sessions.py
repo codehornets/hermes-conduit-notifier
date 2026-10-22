@@ -222,6 +222,113 @@ def test_first_save_tags_the_session_as_a_call(client, hermes, engine):
     assert tags == {session_id: {"kind": "call", "engine": engine}}
 
 
+def _archives_like_hermes(monkeypatch, fail=False):
+    """Hermes' idle-sweep archive: stamps auto_archived only on rows it hides."""
+    def archive(self, session_id):
+        if fail:
+            raise RuntimeError("database is locked")
+        row = self.store.sessions[session_id]
+        if not row.get("archived"):
+            row["archived"] = row["auto_archived"] = 1
+        return True
+    monkeypatch.setattr(FakeSessionDB, "_auto_archive_lineage", archive, raising=False)
+
+
+@pytest.mark.parametrize("engine", ["gemini-live", "gpt-live", "grok-live", "local-live"])
+def test_a_standalone_call_is_auto_archived_when_it_ends(client, hermes, monkeypatch, engine):
+    # hermes-conduit#1124: kept out of Desktop's list, back once someone types in it.
+    _archives_like_hermes(monkeypatch)
+    session_id = save(client, engine=engine, turns=turns(("user", "hi"), ("assistant", "hello"))).json()["session_id"]
+    row = hermes.stores["default"].sessions[session_id]
+    assert row["archived"] == 1 and row["auto_archived"] == 1
+    assert row["end_reason"] == api.VOICE_END_REASON
+
+
+def test_a_resumed_call_leaves_the_archive_flag_as_the_user_left_it(client, hermes, monkeypatch):
+    _archives_like_hermes(monkeypatch)
+    first = save(client, turns=turns(("user", "hi"))).json()
+    row = hermes.stores["default"].sessions[first["session_id"]]
+    row["archived"] = row["auto_archived"] = 0  # un-archived in Desktop or Conduit
+    again = save(client, session_id=first["session_id"], call_id="call-2", turns=turns(("user", "again"))).json()
+    assert again["appended"] == 1 and row["archived"] == 0
+
+
+def test_a_retried_create_archives_a_row_its_first_attempt_left_unfinished(client, hermes, monkeypatch):
+    first = save(client, turns=turns(("user", "hi"))).json()
+    store = hermes.stores["default"]
+    assert "archived" not in store.sessions[first["session_id"]]
+    store.meta[api.VOICE_TAGS_KEY] = "{}"  # the first attempt died before tagging, so before archiving
+    _archives_like_hermes(monkeypatch)
+    again = save(client, turns=turns(("user", "hi"))).json()
+    assert again["session_id"] == first["session_id"] and not again["created"]
+    assert store.sessions[first["session_id"]]["archived"] == 1
+
+
+def test_a_retried_create_heals_an_archive_that_failed(client, hermes, monkeypatch):
+    _archives_like_hermes(monkeypatch, fail=True)
+    first = save(client, turns=turns(("user", "hi"))).json()
+    row = hermes.stores["default"].sessions[first["session_id"]]
+    assert "archived" not in row
+    _archives_like_hermes(monkeypatch)
+    save(client, turns=turns(("user", "hi")))
+    assert row["archived"] == 1
+    tags = client.get(f"{BASE}/voice/tags").json()["tags"]
+    assert tags[first["session_id"]] == {"kind": "call", "engine": "gemini-live", "archived": True}
+
+
+def test_a_retried_create_leaves_an_un_archive_alone(client, hermes, monkeypatch):
+    _archives_like_hermes(monkeypatch)
+    first = save(client, turns=turns(("user", "hi"))).json()
+    row = hermes.stores["default"].sessions[first["session_id"]]
+    row["archived"] = row["auto_archived"] = 0  # the user kept it as a chat
+    again = save(client, turns=turns(("user", "hi"))).json()
+    assert again["session_id"] == first["session_id"] and row["archived"] == 0
+
+
+def test_an_older_host_or_a_failed_archive_keeps_the_call_listed_and_saved(client, hermes, monkeypatch):
+    plain = save(client, turns=turns(("user", "hi"))).json()
+    assert plain["created"] and "archived" not in hermes.stores["default"].sessions[plain["session_id"]]
+    _archives_like_hermes(monkeypatch, fail=True)
+    failed = save(client, call_id="call-2", turns=turns(("user", "hello"))).json()
+    assert failed["created"] and failed["written"] == 1
+    assert "archived" not in hermes.stores["default"].sessions[failed["session_id"]]
+
+
+def test_the_hook_reads_the_tags_the_routes_write():
+    spec = importlib.util.spec_from_file_location("conduit_voice_archive_keys", ROOT / "voice_archive.py")
+    voice_archive = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(voice_archive)
+    assert voice_archive.VOICE_TAGS_KEY == api.VOICE_TAGS_KEY
+    assert voice_archive.ARCHIVED_KINDS == api.VOICE_TAG_KINDS - {"job"}
+
+
+def test_a_classic_voice_chat_is_archived_when_its_call_ends(client, hermes, monkeypatch):
+    _archives_like_hermes(monkeypatch)
+    assert client.post(f"{BASE}/voice/tags", json={"session_id": "classic-1", "kind": "classic"}).status_code == 200
+    FakeSessionDB.stores["default"].sessions["classic-1"] = {"id": "classic-1", "end_reason": None}
+    response = client.post(f"{BASE}/voice/archive", json={"session_id": "classic-1"})
+    assert response.status_code == 200 and response.json()["archived"] is True
+    assert response.headers["cache-control"] == "no-store"
+    row = hermes.stores["default"].sessions["classic-1"]
+    assert row["archived"] == 1 and row["auto_archived"] == 1
+
+
+def test_only_an_unpinned_unarchived_classic_voice_chat_is_archived(client, hermes, monkeypatch):
+    _archives_like_hermes(monkeypatch)
+    client.post(f"{BASE}/voice/tags", json={"session_id": "pinned", "kind": "classic"})
+    client.post(f"{BASE}/voice/tags", json={"session_id": "job-1", "kind": "job"})
+    sessions = FakeSessionDB.stores["default"].sessions
+    sessions["pinned"] = {"id": "pinned", "end_reason": None, "pinned": 1}
+    sessions["job-1"] = {"id": "job-1", "end_reason": None}
+    sessions["chat"] = {"id": "chat", "end_reason": None}
+    assert client.post(f"{BASE}/voice/archive", json={"session_id": "pinned"}).json()["archived"] is False
+    assert "archived" not in sessions["pinned"]
+    for session_id in ("job-1", "chat"):
+        assert client.post(f"{BASE}/voice/archive", json={"session_id": session_id}).status_code == 422
+        assert "archived" not in sessions[session_id]
+    assert client.post(f"{BASE}/voice/archive", json={"session_id": "gone"}).status_code == 422
+
+
 def test_nothing_to_save_creates_no_session(client, hermes):
     body = save(client, turns=[]).json()
     assert body["session_id"] is None
