@@ -2101,7 +2101,7 @@ def test_pulse_routes(remembering, db, monkeypatch):
     assert http.put(f"{base}/levels", json={"kind": "followup", "level": "screen"}).json()["levels"] == {
         "followup": "screen"}
     assert http.put(f"{base}/levels", json={"kind": "followup", "level": "loud"}).status_code == 400
-    assert "pulse" in api.ROUTE_CAPABILITIES
+    assert "pulse" in api.ROUTE_CAPABILITIES and "pulse_feed" in api.ROUTE_CAPABILITIES
     # A host that never turned Pulse on is answered without a file left behind.
     fresh = home / "fresh"
     fresh.mkdir()
@@ -2112,7 +2112,8 @@ def test_pulse_routes(remembering, db, monkeypatch):
     assert http.get(f"{base}/followups").json()["followups"] == []
     assert http.get(f"{base}/feed").json()["cards"] == []
     assert http.get(f"{base}/learned").json()["lessons"] == []
-    assert http.post(f"{base}/rate", json={"card": 1, "rating": "up"}).json()["detail"]["field"] == "card"
+    rated = http.post(f"{base}/rate", json={"card": 1, "rating": "up"})
+    assert rated.status_code == 409 and rated.json()["detail"]["code"] == "pulse_off"
     assert http.post(f"{base}/report").json()["detail"]["code"] == "pulse_off"
     assert http.post(f"{base}/backfill", json={"action": "stop"}).json()["detail"]["code"] == "not_running"
     assert http.post(f"{base}/memory/forget", json={"id": 1}).json()["forgotten"] is False

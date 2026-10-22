@@ -18,7 +18,8 @@ code, not as a hint to a model:
   - ``too_often``: the kind moves to the morning brief at once.
 
 Each change is a lesson row; the Pulse screen lists them and undoing one
-puts Pulse back the way it was.
+puts Pulse back the way it was for what comes next (promises a rule already
+closed stay closed, checks already brought forward stay sooner).
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ RATINGS = ("up", "down")
 REASONS = ("not_relevant", "already_knew", "too_late", "too_often")
 # Net thumbs, one way, that move a kind a step along the ladder.
 STEP_AT = 2
+# Rating scores are a shared setting changed by swap; this many lost races in a row is a bug, not load.
+SWAP_TRIES = 50
 SOONER = 0.5
 MAX_SOONER = 2
 SCORES = "rating_scores"
@@ -111,11 +114,18 @@ class Invalid(ValueError):
 
 
 def _lesson(pulse_store: store.PulseStore, kind: str, what: str, *, value: str = "", card: Optional[dict] = None,
-            cause: str, now: float) -> dict:
+            cause: str, now: float, unless: tuple = (), limit: int = 0,
+            expect: Optional[str] = None) -> Optional[dict]:
+    """The lesson added, or None when ``limit`` like it are in force already
+    (or, for a level, when the kind is at that level already)."""
     row = {"kind": kind, "what": what, "value": value, "profile": card["profile"] if card else "",
            "chat_id": card["chat_id"] if card and what == RULE else "", "card_id": card["id"] if card else None,
            "cause": cause, "created_at": now}
-    row["id"] = pulse_store.add_lesson(row)
+    changes_from = DEFAULT_LEVELS.get(kind, "push") if what == LEVEL else None
+    lesson_id = pulse_store.add_lesson(row, unless=unless, limit=limit, changes_from=changes_from, expect=expect)
+    if lesson_id is None:
+        return None
+    row["id"] = lesson_id
     return row
 
 
@@ -140,13 +150,14 @@ def set_level(pulse_store: store.PulseStore, kind: str, level_name: str, now: fl
 def _change_score(pulse_store: store.PulseStore, kind: str, change: Any) -> int:
     """Applies ``change`` (old score -> new) to the kind's score with a swap,
     so the CLI and the dashboard rating at once don't lose a thumb."""
-    while True:
+    for _ in range(SWAP_TRIES):
         stored = pulse_store.get(SCORES)
         scores = dict(stored) if isinstance(stored, dict) else {}
         current = scores.get(kind) if isinstance(scores.get(kind), int) else 0
         scores[kind] = change(current)
         if pulse_store.swap(SCORES, stored, scores):
             return scores[kind]
+    raise RuntimeError("Pulse rating scores kept changing; try again")
 
 
 def _scores_reset(pulse_store: store.PulseStore, kind: str) -> None:
@@ -177,34 +188,43 @@ def rate(pulse_store: store.PulseStore, card_id: Any, rating: Any, reason: Any =
     kind = card["kind"]
     delta = (1 if rating == "up" else -1) - {"up": 1, "down": -1}.get(card["rating"], 0)
     made: list[dict] = []
-    if reason == "not_relevant" and not muted_by(pulse_store, kind, card["profile"], card["chat_id"]):
+    if reason == "not_relevant":
         made.append(_lesson(pulse_store, kind, RULE, value=_clip(card["title"], TOPIC_LIMIT), card=card,
-                            cause="not relevant", now=now))
-    elif reason == "already_knew" and not skips_seen(pulse_store, kind):
-        made.append(_lesson(pulse_store, kind, SEEN, card=card, cause="already knew", now=now))
-    elif reason == "too_late" and len(pulse_store.lessons(kind, SOONER_LESSON)) < MAX_SOONER:
-        made.append(_lesson(pulse_store, kind, SOONER_LESSON, card=card, cause="too late", now=now))
-        if kind == "followup":  # checks already booked come sooner too
+                            cause="not relevant", now=now, unless=("profile", "chat_id", "value"), limit=1))
+    elif reason == "already_knew":
+        made.append(_lesson(pulse_store, kind, SEEN, card=card, cause="already knew", now=now, limit=1))
+    elif reason == "too_late":
+        sooner = _lesson(pulse_store, kind, SOONER_LESSON, card=card, cause="too late", now=now, limit=MAX_SOONER)
+        made.append(sooner)
+        if sooner and kind == "followup":  # checks already booked come sooner too
             pulse_store.sooner_followups(SOONER, now)
     elif reason == "too_often" and LEVELS.index(level(pulse_store, kind)) < LEVELS.index("brief"):
         made.append(set_level(pulse_store, kind, "brief", now, cause="too often", card=card))
         return made
     if not delta:
         return made
-    current_level = level(pulse_store, kind)
     step: dict[str, Any] = {}
 
     def change(score: int) -> int:
         # The step and the score going back to 0 are one swap, so two
         # ratings at once can't both spend the same two thumbs.
+        # The level is read on each try, so a move made meanwhile counts.
         new = max(-STEP_AT, min(STEP_AT, score + delta))
-        step["to"] = _step(current_level, louder=new > 0) if abs(new) >= STEP_AT else None
+        step["from"] = level(pulse_store, kind)
+        step["to"] = _step(step["from"], louder=new > 0) if abs(new) >= STEP_AT else None
         return 0 if step["to"] else new
 
     _change_score(pulse_store, kind, change)
     if step.get("to"):
-        made.append(_lesson(pulse_store, kind, LEVEL, value=step["to"], card=card,
-                            cause=f"{STEP_AT} thumbs {'up' if delta > 0 else 'down'}", now=now))
+        cause = f"{STEP_AT} thumbs {'up' if delta > 0 else 'down'}"
+        lesson = _lesson(pulse_store, kind, LEVEL, value=step["to"], card=card, cause=cause, now=now,
+                         expect=step["from"])
+        if lesson is None:  # the level moved meanwhile: the spent thumbs step from where it is now
+            moved = level(pulse_store, kind)
+            to = _step(moved, louder=delta > 0)
+            if to:
+                lesson = _lesson(pulse_store, kind, LEVEL, value=to, card=card, cause=cause, now=now, expect=moved)
+        made.append(lesson)
     return made
 
 

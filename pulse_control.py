@@ -275,7 +275,10 @@ def _learning(action: Any) -> Any:
 
 
 def rate(pulse_store: Any, card_id: Any, rating: Any, reason: Any = "", now: Optional[float] = None) -> list[dict]:
-    """Rates a card; the lessons it made, as `learned` lists them."""
+    """Rates a card; the lessons it made, as `learned` lists them. Refused
+    while Pulse is off, as setting a level is: a rating can move one."""
+    if not pulse_store.get("enabled"):
+        raise Refused("pulse_off")
     now = time.time() if now is None else now
     made = _learning(lambda: pulse_learning.rate(pulse_store, card_id, rating, reason, now=now))
     return [pulse_learning.lesson_entry(lesson) for lesson in made if lesson]
@@ -291,6 +294,8 @@ def undo(pulse_store: Any, lesson_id: Any, now: Optional[float] = None) -> bool:
 
 
 def set_level(pulse_store: Any, kind: Any, level: Any, now: Optional[float] = None) -> Optional[dict]:
+    if not pulse_store.get("enabled"):
+        raise Refused("pulse_off")
     lesson = _learning(lambda: pulse_learning.set_level(pulse_store, kind, level,
                                                         time.time() if now is None else now))
     return pulse_learning.lesson_entry(lesson) if lesson else None

@@ -781,12 +781,40 @@ class PulseStore:
                 "WHERE id=? AND rating=? AND reason=?",
                 (rating, reason, now, now, card["id"], card["rating"], card["reason"])).rowcount)
 
-    def add_lesson(self, row: dict[str, Any]) -> int:
+    def add_lesson(self, row: dict[str, Any], *, unless: Sequence[str] = (), limit: int = 0,
+                   changes_from: Optional[str] = None, expect: Optional[str] = None) -> Optional[int]:
+        """Adds a lesson; with ``limit``, only while fewer than that many in
+        force match its kind, what and the ``unless`` columns; with
+        ``changes_from`` (the value when none is in force), only when the
+        newest in force of its kind and what has another value (and, with
+        ``expect``, has that one: a step from it isn't laid over a move
+        made meanwhile). All are
+        checked in the same transaction, so two writers at once can't both
+        add one."""
         _check_columns(row, LESSON_COLUMNS)
+        _check_columns(dict.fromkeys(unless), tuple(row))
         with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if limit:
+                match = ["kind", "what", *unless]
+                count = conn.execute("SELECT COUNT(*) FROM lessons WHERE undone_at IS NULL AND "
+                                     + " AND ".join(f"{column}=?" for column in match),
+                                     tuple(row[column] for column in match)).fetchone()[0]
+                if count >= limit:
+                    conn.execute("ROLLBACK")
+                    return None
+            if changes_from is not None:
+                newest = conn.execute("SELECT value FROM lessons WHERE undone_at IS NULL AND kind=? AND what=? "
+                                      "ORDER BY id DESC LIMIT 1", (row["kind"], row["what"])).fetchone()
+                current = newest["value"] if newest else changes_from
+                if current == row["value"] or (expect is not None and current != expect):
+                    conn.execute("ROLLBACK")
+                    return None
             columns = ", ".join(row)
-            return int(conn.execute(f"INSERT INTO lessons({columns}) VALUES({', '.join('?' * len(row))})",
-                                    tuple(row.values())).lastrowid)
+            lesson_id = int(conn.execute(f"INSERT INTO lessons({columns}) VALUES({', '.join('?' * len(row))})",
+                                         tuple(row.values())).lastrowid)
+            conn.execute("COMMIT")
+        return lesson_id
 
     def lessons(self, kind: Optional[str] = None, what: Optional[str] = None) -> list[dict]:
         """The lessons still in force, oldest first."""

@@ -331,3 +331,91 @@ def test_held_cards_older_than_a_month_can_be_pruned(live):
     assert live.store.prune_cards(1) == 0
     assert live.store.prune_cards(1, held_before=1.5) == 2
     assert live.store.held_count() == 1
+
+
+def test_two_not_relevant_ratings_from_one_chat_make_one_rule(live):
+    first, second = told_card(live), told_card(live, "Another one.")
+    control.rate(live.store, first["id"], "down", "not_relevant")
+    made = control.rate(live.store, second["id"], "down", "not_relevant")
+    assert [lesson["what"] for lesson in made] == ["level"]  # two downs step the ladder; no second rule
+    assert len(learning.rules(live.store, "followup")) == 1
+
+
+def test_not_relevant_on_another_topic_in_the_same_chat_adds_its_rule(live):
+    first = told_card(live)
+    with live.store._connect() as db:
+        db.execute("UPDATE cards SET title = 'Another topic' WHERE id = ?", (first["id"],))
+    second = told_card(live, "Another one.")
+    control.rate(live.store, first["id"], "down", "not_relevant")
+    control.rate(live.store, second["id"], "down", "not_relevant")
+    assert len(learning.rules(live.store, "followup")) == 2
+
+
+def test_a_level_already_in_force_adds_no_second_lesson_even_past_the_early_check(live):
+    assert learning.set_level(live.store, "followup", "screen", 1.0)
+    row = {"kind": "followup", "what": learning.LEVEL, "value": "screen", "profile": "", "chat_id": "",
+           "card_id": None, "cause": "set", "created_at": 2.0}
+    assert live.store.add_lesson(row, changes_from="push") is None  # a racing set lands here
+    assert live.store.add_lesson(dict(row, value="push"), changes_from="push")
+    assert live.store.add_lesson(dict(row, value="push"), changes_from="push") is None
+    assert [lesson["value"] for lesson in live.store.lessons("followup", learning.LEVEL)] == ["screen", "push"]
+    # A step worked out from "push" isn't laid over a move to "brief" made meanwhile.
+    assert live.store.add_lesson(dict(row, value="brief"), changes_from="push")
+    assert live.store.add_lesson(dict(row, value="screen"), changes_from="push", expect="push") is None
+    assert learning.level(live.store, "followup") == "brief"
+
+
+def test_a_step_refused_over_a_move_made_meanwhile_steps_from_the_new_level(live, monkeypatch):
+    first, second = told_card(live), told_card(live, "Another one.")
+    control.rate(live.store, first["id"], "down")
+    real = live.store.swap
+    row = {"kind": "followup", "what": learning.LEVEL, "value": "screen", "profile": "", "chat_id": "",
+           "card_id": None, "cause": "set", "created_at": 2.0}
+
+    def swap(key, old, new):  # another writer moves the level just as the thumbs are spent
+        if key == learning.SCORES:
+            monkeypatch.setattr(live.store, "swap", real)
+            assert live.store.add_lesson(row)
+        return real(key, old, new)
+
+    monkeypatch.setattr(live.store, "swap", swap)
+    made = control.rate(live.store, second["id"], "down")
+    assert learning.level(live.store, "followup") == "brief"
+    assert [lesson["what"] for lesson in made] == ["level"]
+
+
+def test_ratings_are_refused_while_pulse_is_off(live):
+    card = told_card(live)
+    live.store.set("enabled", False)
+    with pytest.raises(control.Refused) as refused:
+        control.rate(live.store, card["id"], "down", "too_often")
+    assert refused.value.code == "pulse_off"
+    assert live.store.card(card["id"])["rating"] == ""
+
+
+def test_cli_refuses_ids_too_long_for_a_number(live, monkeypatch):
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: live.home))
+    assert cli._pulse(types.SimpleNamespace(pulse_action="rate", value="9" * 5000, extra="up")) == 2
+    assert cli._pulse(types.SimpleNamespace(pulse_action="learned", value="undo", extra="9" * 5000)) == 2
+
+
+def test_levels_are_refused_while_pulse_is_off(live, monkeypatch, capsys):
+    import sys
+    import types
+    live.store.set("enabled", False)
+    with pytest.raises(control.Refused) as refused:
+        control.set_level(live.store, "followup", "screen")
+    assert refused.value.code == "pulse_off"
+    monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: live.home))
+    assert cli._pulse(types.SimpleNamespace(pulse_action="learned", value="followup", extra="screen")) == 1
+    assert cli._pulse(types.SimpleNamespace(pulse_action="rate", value="²", extra="up")) == 2
+
+
+def test_cli_learned_set_on_a_host_that_never_turned_pulse_on_leaves_no_file(tmp_path, monkeypatch):
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, "hermes_constants", types.SimpleNamespace(get_hermes_home=lambda: tmp_path))
+    assert cli._pulse(types.SimpleNamespace(pulse_action="learned", value="followup", extra="screen")) == 1
+    assert not (tmp_path / store.DB_NAME).exists()
