@@ -15,7 +15,7 @@ from hermes_constants import get_hermes_home
 
 from . import (call_tool, call_watches, calls, clarify_loop, client, conduit_first, cron_runs, desktop_selected,
                health_tool, live_activity, location_tool, maps_tool, phone_tool, present_tool, pulse, reply_sources,
-               settings_tool, show_tool, turn_surface)
+               settings_tool, show_tool, turn_surface, voice_archive)
 from .session_titles import title as _session_title, titled as _titled
 from .client import enqueue
 from .events import approval_decision, clarification_text, event_id, is_silent_response, plain_text, push_event
@@ -557,6 +557,11 @@ def _pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         _note_turn_start(kwargs.get("turn_id"))
         _start_parent_turn(session_id, kwargs.get("turn_id"))
         _quietly(live_activity.reporter.turn_started, session_id)
+        # A voice chat archived when its call ended is in use again (#1124).
+        try:
+            voice_archive.bring_back(get_hermes_home(), session_id)
+        except Exception:  # noqa: BLE001 — a hook must never break the turn
+            logger.debug("conduit_push: voice chat un-archive check failed", exc_info=True)
     notes = [
         None if child else calls.outcome_note(session_id),
         None if child else _turn_surface_note(kwargs.get("platform"), kwargs.get("user_message")),
