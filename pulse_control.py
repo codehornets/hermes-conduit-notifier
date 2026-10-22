@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from . import pulse, pulse_delivery, pulse_hermes, pulse_memory
+from . import pulse, pulse_delivery, pulse_hermes, pulse_learning, pulse_memory
 
 RECENT = 5
 ITEMS = 200
@@ -170,7 +170,8 @@ def backfill_start(pulse_store: Any, home: Path, days: Optional[int] = None,
     return {"from": window[0], "to": window[1], "days": days, "resumed": resuming}
 
 
-SETTINGS = ("enabled", "memory", "followups", "daily_report", "report_profiles", "report_times", "time_zone")
+SETTINGS = ("enabled", "memory", "followups", "daily_report", "report_profiles", "report_times", "time_zone",
+            "brief_time")
 
 
 def update(pulse_store: Any, body: Any) -> None:
@@ -201,6 +202,12 @@ def update(pulse_store: Any, body: Any) -> None:
         if parsed is None:
             raise Refused("invalid", field="report_times")
         changes["report_time"] = parsed
+    if "brief_time" in body:
+        value = body["brief_time"]
+        parsed = pulse.report.parse_times(value) if isinstance(value, str) and len(value) <= 5 else None
+        if parsed is None or "," in parsed:
+            raise Refused("invalid", field="brief_time")
+        changes["brief_time"] = parsed
     if "time_zone" in body:
         zone = body["time_zone"]
         if not isinstance(zone, str) or len(zone) > 64 or (zone and not pulse.report.known_zone(zone)):
@@ -243,6 +250,50 @@ def followups(pulse_store: Any, limit: int = ITEMS) -> list[dict[str, Any]]:
                     "decision": row["decision"] or "waiting", "why": row["why"], "news": row["news"],
                     "checks": row["checks"], "next_check_at": row["next_check_at"], "updated_at": row["updated_at"]})
     return out
+
+
+def feed(pulse_store: Any, limit: int = pulse_learning.CARDS) -> dict[str, Any]:
+    """The Pulse screen: what Pulse brought the user, newest first, how many
+    are unseen, and each kind's loudness."""
+    return {"cards": [pulse_learning.card_entry(card) for card in pulse_store.cards(limit)],
+            "unseen": pulse_store.unseen_cards(), "levels": pulse_learning.levels(pulse_store)}
+
+
+def see(pulse_store: Any, ids: Any, now: Optional[float] = None) -> int:
+    """Marks cards seen: a list of ids, or every card for None."""
+    if ids is not None and not (isinstance(ids, list) and len(ids) <= 500 and all(
+            isinstance(value, int) and not isinstance(value, bool) for value in ids)):
+        raise Refused("invalid", field="ids")
+    return pulse_store.see_cards(ids, time.time() if now is None else now)
+
+
+def _learning(action: Any) -> Any:
+    try:
+        return action()
+    except pulse_learning.Invalid as error:
+        raise Refused("invalid", field=error.field) from None
+
+
+def rate(pulse_store: Any, card_id: Any, rating: Any, reason: Any = "", now: Optional[float] = None) -> list[dict]:
+    """Rates a card; the lessons it made, as `learned` lists them."""
+    now = time.time() if now is None else now
+    made = _learning(lambda: pulse_learning.rate(pulse_store, card_id, rating, reason, now=now))
+    return [pulse_learning.lesson_entry(lesson) for lesson in made if lesson]
+
+
+def learned(pulse_store: Any) -> dict[str, Any]:
+    """What ratings taught Pulse, newest first, and each kind's loudness."""
+    return {"lessons": pulse_learning.learned(pulse_store), "levels": pulse_learning.levels(pulse_store)}
+
+
+def undo(pulse_store: Any, lesson_id: Any, now: Optional[float] = None) -> bool:
+    return _learning(lambda: pulse_learning.undo(pulse_store, lesson_id, time.time() if now is None else now))
+
+
+def set_level(pulse_store: Any, kind: Any, level: Any, now: Optional[float] = None) -> Optional[dict]:
+    lesson = _learning(lambda: pulse_learning.set_level(pulse_store, kind, level,
+                                                        time.time() if now is None else now))
+    return pulse_learning.lesson_entry(lesson) if lesson else None
 
 
 def state(pulse_store: Any, home: Path, now: Optional[float] = None) -> dict[str, Any]:
@@ -288,6 +339,10 @@ def state(pulse_store: Any, home: Path, now: Optional[float] = None) -> dict[str
                                  and pulse_store.get("memory")),
         "followup_counts": pulse_store.followup_counts(),
         "followup_usage": {key: int(follow_usage.get(key, 0) or 0) for key in ("checks", "tokens", "failed")},
+        "levels": pulse_learning.levels(pulse_store),
+        "unseen_cards": pulse_store.unseen_cards(),
+        "brief_time": pulse.report.clock_text(pulse_store.get("brief_time") or pulse.brief.DEFAULT_TIME),
+        "held_cards": pulse_store.held_count(),
         "memory_chunks": int(usage.get("chunks", 0) or 0),
         "memory_tokens": int(usage.get("tokens", 0) or 0),
         "daily_tokens": daily_tokens(pulse_store),

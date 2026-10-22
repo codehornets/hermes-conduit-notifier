@@ -59,6 +59,8 @@ DEFAULTS: dict[str, Any] = {
     # Follow-ups (pulse_followup): Pulse checks on what Hermes promised and
     # brings the news to the home chat. On while Pulse and memory are.
     "followups": True,
+    # The morning brief (pulse_brief): when cards held for it go out, local time.
+    "brief_time": "08:00",
     "memory_since": None,
     "memory_run_at": 0.0,
     "memory_requested": False,
@@ -164,6 +166,44 @@ CREATE TABLE IF NOT EXISTS followups (
     updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS followups_due ON followups(next_check_at);
+-- What Pulse brought the user (pulse_learning), for Conduit's Pulse screen,
+-- with the user's rating of each.
+CREATE TABLE IF NOT EXISTS cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    item_id INTEGER,
+    -- The loudness it went out at: push, screen or brief.
+    level TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    quote TEXT NOT NULL DEFAULT '',
+    news TEXT NOT NULL DEFAULT '',
+    why TEXT NOT NULL DEFAULT '',
+    profile TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    chat_title TEXT NOT NULL DEFAULT '',
+    message_id INTEGER,
+    created_at REAL NOT NULL,
+    seen_at REAL,
+    briefed_at REAL,
+    rating TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    rated_at REAL
+);
+CREATE INDEX IF NOT EXISTS cards_created ON cards(created_at);
+-- What ratings taught Pulse (pulse_learning): each row changes what Pulse
+-- does until it's undone.
+CREATE TABLE IF NOT EXISTS lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    what TEXT NOT NULL,
+    value TEXT NOT NULL DEFAULT '',
+    profile TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    card_id INTEGER,
+    cause TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    undone_at REAL
+);
 CREATE TABLE IF NOT EXISTS backfill_marks (
     profile TEXT NOT NULL,
     chat_id TEXT NOT NULL,
@@ -185,6 +225,17 @@ MARKS = ("watermarks", "backfill_marks")
 def _check_marks(marks: str) -> None:
     if marks not in MARKS:  # named into SQL
         raise ValueError(f"unknown marks table {marks!r}")
+
+CARD_COLUMNS = ("kind", "item_id", "level", "title", "quote", "news", "why", "profile", "chat_id", "chat_title",
+                "message_id", "created_at")
+LESSON_COLUMNS = ("kind", "what", "value", "profile", "chat_id", "card_id", "cause", "created_at")
+
+
+def _check_columns(row: dict, allowed: tuple) -> None:
+    unknown = set(row) - set(allowed)
+    if unknown:  # named into SQL
+        raise ValueError(f"unknown columns {sorted(unknown)!r}")
+
 
 # How far a replacement follows earlier replacements to the item still current.
 MAX_CHAIN = 20
@@ -349,6 +400,13 @@ class PulseStore:
             rows = conn.execute("SELECT * FROM attempts WHERE substr(item_id, -?) = ? ORDER BY created_at, attempt",
                                 (len(suffix), suffix)).fetchall()
         return [dict(row) for row in rows]
+
+    def retire_attempts(self, suffix: str) -> None:
+        """Moves an item's attempts out of ``attempts_for_suffix``'s reach: a
+        follow-up's next news is sent and settled on its own attempts."""
+        with _lock, self._connect() as conn:
+            conn.execute("UPDATE attempts SET item_id = item_id || '-done' WHERE substr(item_id, -?) = ?",
+                         (len(suffix), suffix))
 
     def attempts_since(self, kind: str, since: float) -> list[dict]:
         with self._connect() as conn:
@@ -612,6 +670,13 @@ class PulseStore:
                     conn.execute("UPDATE followups SET next_check_at=NULL, decision='closed', updated_at=? "
                                  "WHERE item_id=?", (now, row["item_id"]))
 
+    def sooner_followups(self, factor: float, now: float) -> None:
+        """Brings every waiting check closer by ``factor`` (never before now)."""
+        with _lock, self._connect() as conn:
+            conn.execute("UPDATE followups SET next_check_at = ? + (next_check_at - ?) * ?, updated_at=? "
+                         "WHERE next_check_at > ? AND decision IN ('', 'wait', 'check failed')",
+                         (now, now, factor, now, now))
+
     def due_followups(self, now: float) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM followups WHERE next_check_at IS NOT NULL AND next_check_at <= ? "
@@ -640,6 +705,104 @@ class PulseStore:
         with self._connect() as conn:
             rows = conn.execute("SELECT decision, COUNT(*) AS n FROM followups GROUP BY decision").fetchall()
         return {(row["decision"] or "waiting"): row["n"] for row in rows}
+
+    # Cards and lessons (pulse_learning) --------------------------------------
+
+    def add_card(self, row: dict[str, Any]) -> int:
+        _check_columns(row, CARD_COLUMNS)
+        with _lock, self._connect() as conn:
+            columns = ", ".join(row)
+            return int(conn.execute(f"INSERT INTO cards({columns}) VALUES({', '.join('?' * len(row))})",
+                                    tuple(row.values())).lastrowid)
+
+    def card(self, card_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
+        return dict(row) if row else None
+
+    def cards(self, limit: int = 100) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM cards ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def unseen_cards(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM cards WHERE seen_at IS NULL").fetchone()[0])
+
+    def see_cards(self, ids: Optional[list[int]], now: float) -> int:
+        """Marks cards seen: these, or every one when ``ids`` is None."""
+        with _lock, self._connect() as conn:
+            if ids is None:
+                return conn.execute("UPDATE cards SET seen_at=? WHERE seen_at IS NULL", (now,)).rowcount
+            if not ids:
+                return 0
+            return conn.execute(f"UPDATE cards SET seen_at=? WHERE seen_at IS NULL AND id IN ({','.join('?' * len(ids))})",
+                                (now, *ids)).rowcount
+
+    def card_for(self, kind: str, item_id: int, news: str) -> Optional[int]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT id FROM cards WHERE kind=? AND item_id=? AND news=?",
+                               (kind, item_id, news)).fetchone()
+        return int(row["id"]) if row else None
+
+    def held_count(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM cards WHERE level='brief' AND briefed_at IS NULL")
+                       .fetchone()[0])
+
+    def held_cards(self, limit: int) -> list[dict]:
+        """Cards waiting for the morning brief, oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM cards WHERE level='brief' AND briefed_at IS NULL "
+                                "ORDER BY created_at, id LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def brief_cards(self, ids: list[int], now: float) -> None:
+        if not ids:
+            return
+        with _lock, self._connect() as conn:
+            conn.execute(f"UPDATE cards SET briefed_at=? WHERE briefed_at IS NULL AND id IN ({','.join('?' * len(ids))})",
+                         (now, *ids))
+
+    def prune_cards(self, keep: int, held_before: float = 0.0) -> int:
+        """Drops the oldest cards past ``keep``, but not one still held for the
+        brief unless it was made before ``held_before`` (no brief for weeks)."""
+        with _lock, self._connect() as conn:
+            return conn.execute(
+                "DELETE FROM cards WHERE (NOT (level='brief' AND briefed_at IS NULL) OR created_at < ?) AND id NOT IN "
+                "(SELECT id FROM cards ORDER BY created_at DESC, id DESC LIMIT ?)", (held_before, keep)).rowcount
+
+    def rate_card(self, card: dict, *, rating: str, reason: str, now: float) -> bool:
+        """Rates ``card`` only if its rating is still the one read (another
+        process may have rated it since); whether it did."""
+        with _lock, self._connect() as conn:
+            return bool(conn.execute(
+                "UPDATE cards SET rating=?, reason=?, rated_at=?, seen_at=COALESCE(seen_at, ?) "
+                "WHERE id=? AND rating=? AND reason=?",
+                (rating, reason, now, now, card["id"], card["rating"], card["reason"])).rowcount)
+
+    def add_lesson(self, row: dict[str, Any]) -> int:
+        _check_columns(row, LESSON_COLUMNS)
+        with _lock, self._connect() as conn:
+            columns = ", ".join(row)
+            return int(conn.execute(f"INSERT INTO lessons({columns}) VALUES({', '.join('?' * len(row))})",
+                                    tuple(row.values())).lastrowid)
+
+    def lessons(self, kind: Optional[str] = None, what: Optional[str] = None) -> list[dict]:
+        """The lessons still in force, oldest first."""
+        query, args = "SELECT * FROM lessons WHERE undone_at IS NULL", []
+        if kind is not None:
+            query, args = query + " AND kind=?", args + [kind]
+        if what is not None:
+            query, args = query + " AND what=?", args + [what]
+        with self._connect() as conn:
+            rows = conn.execute(query + " ORDER BY id", args).fetchall()
+        return [dict(row) for row in rows]
+
+    def undo_lesson(self, lesson_id: int, now: float) -> bool:
+        with _lock, self._connect() as conn:
+            return bool(conn.execute("UPDATE lessons SET undone_at=? WHERE id=? AND undone_at IS NULL",
+                                     (now, lesson_id)).rowcount)
 
     def item_counts(self) -> dict[str, int]:
         with self._connect() as conn:
