@@ -1862,7 +1862,8 @@ marked private is reported only as "at a private place".
 - **On-demand locate.** `locate` asks the phone for a fresh fix through the
   relay as a silent location push (Apple's Location Push Service Extension),
   which the phone answers only while background sharing is on and not
-  paused. At most one every 5 minutes and 30 a day per profile.
+  paused. At most one every 5 minutes and 30 a day per location store
+  (profiles reading a shared one spend its budget).
 - **Place rules.** `set_rule` keeps a Hermes cron job named
   `Place rule: <what>` that never runs on its own schedule; an arrive or
   leave event that matches the rule's place (one saved place or any), move
@@ -1871,6 +1872,23 @@ marked private is reported only as "at a private place".
   The task is anything a cron run can do. A rule fires once a day, or every
   time at least 30 minutes apart (`repeat: "every"`), never for an event
   over 15 minutes old, and never while sharing is paused.
+- **Other profiles on this host** (plugin 0.58+). Conduit binds sharing to
+  one profile, which keeps the store, key and place rules. With "Share with
+  this host's other profiles" on (`sharing.other_profiles: true`), every
+  other profile on the same host that is paired with the same iPhone (the
+  same relay installation in its `conduit-push.json`) reads that store:
+  `now`, `places`, `history`, `distance_to`, `locate` and maps lookups. A
+  locate or phone maps lookup goes through the asking profile's own pairing
+  and names the sharing profile, so the phone answers it as that profile's.
+  Reads are logged in the sharing profile's store as `<profile>: <chat>`.
+  `rules`, `set_rule` and `remove_rule` answer `other_profile`: rules stay
+  with the sharing profile. A profile that shares location itself (talking
+  or background on) always reads its own, and if several profiles share
+  with the others the first wins (default, then named ones alphabetically).
+  The fresh-position and maps budgets belong to the sharing profile's
+  store, so every profile reading it spends the same ones. Calls placed
+  from a reading profile are held back by the shared position, but the
+  places to avoid are that profile's own calls settings.
 - **No calls at places.** Calls settings `avoid_places` (place ids) and
   `avoid_unknown_place` (also hold calls when there's no recent location,
   or sharing is paused or off): a call that would ring while the user is at an

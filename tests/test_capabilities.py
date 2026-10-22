@@ -75,6 +75,8 @@ def test_every_capability_names_a_served_route_family():
         "location-sync": "/location/",
         # A fresh lookup is the location status route's `locate` answer.
         "location-locate": "/location/status",
+        # Sharing with the host's other profiles rides the ingest route.
+        "location-profiles": "/location/ingest",
         "phone-sync": "/phone/",
         "phone-alarms": "/phone/",
         "phone-contacts": "/phone/",

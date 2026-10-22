@@ -674,6 +674,19 @@ def test_navigate_sends_a_go_prompt_carrying_where_to(home, monkeypatch):
     assert store.reads()[0]["action"] == "maps navigate"
 
 
+def test_navigate_from_another_profile_is_logged_under_it(home, monkeypatch):
+    work = home / "profiles" / "work"
+    for path in (home, work):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "conduit-push.json").write_text(json.dumps({"credential": "c", "installation_id": "installation-1"}))
+    store, _ = _shared(work, sharing=maps_sharing(other_profiles=True), fix=fix("significant"))
+    _present(home)
+    monkeypatch.setattr(maps, "client", Enqueued())
+    answer = _call({"action": "navigate", "to": "Heathrow Terminal 5"}, profile="default", session_id="session-1")
+    assert answer["ok"] is True
+    assert store.reads()[0]["session_title"] == "default: Trip planning"
+
+
 def test_navigate_to_a_saved_place_names_it_and_gives_no_link(home, monkeypatch):
     _shared(home, fix=fix("significant"))
     present = _present(home)
