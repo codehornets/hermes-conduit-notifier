@@ -5876,6 +5876,7 @@ async def post_session_takeover(request: Request, response: Response,
     try:
         body = await _read_json_body(request, TAKEOVER_MAX_BODY_BYTES)
         ids = _takeover_ids(body)
+        _ensure_claims_sweeper()
         # One budget for the whole dashboard, like the voice routes: the
         # profile isn't resolved yet, so a made-up name can't mint a window.
         _takeover_limiter.acquire("")
@@ -5898,6 +5899,52 @@ async def post_session_takeover(request: Request, response: Response,
     except Exception as exc:
         raise _unexpected("takeover", exc, feature="Chat takeover")
     return {"ok": True, **result}
+
+
+# The reverse direction (hermes-conduit#1123): a chat Conduit opened here keeps
+# its claim while Conduit stays connected, so Desktop's own process is refused
+# it long after Conduit's turn ended. A sweep lets go of Conduit's claims on
+# chats that sit idle; conduit_claims.py explains when. One sweeper per
+# process: a reloaded copy of this module takes over from the old one.
+_CLAIMS_SWEEPER = "_conduit_idle_claims_sweeper"
+
+
+def _claims_home() -> Any:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home()
+
+
+def _sweep_idle_claims(token: object) -> None:
+    while sys.__dict__.get(_CLAIMS_SWEEPER) is token:
+        try:
+            claims = _plugin_package_module("conduit_claims")
+            time.sleep(claims.SWEEP_S)
+            if sys.__dict__.get(_CLAIMS_SWEEPER) is token:
+                claims.sweep(_hermes_session_api(), _claims_home)
+        except Exception:  # noqa: BLE001 — keep sweeping
+            logger.debug("Conduit: idle claim sweep failed", exc_info=True)
+            time.sleep(60.0)
+
+
+def _start_claims_sweeper() -> None:
+    token = object()
+    sys.__dict__[_CLAIMS_SWEEPER] = token
+    try:
+        threading.Thread(target=_sweep_idle_claims, args=(token,), name="conduit-idle-claims", daemon=True).start()
+    except RuntimeError:
+        sys.__dict__.pop(_CLAIMS_SWEEPER, None)  # the next takeover tries again
+        logger.warning("Conduit: no thread to let go of idle chat claims")
+
+
+def _ensure_claims_sweeper() -> None:
+    """Starts the sweeper unless one runs: a takeover means Conduit chats here."""
+    if sys.__dict__.get(_CLAIMS_SWEEPER) is None:
+        _start_claims_sweeper()
+
+
+if "hermes_cli.web_server" in sys.modules:
+    _start_claims_sweeper()
 
 
 # --- Where in Conduit a message was sent (hermes-conduit#888) ----------------

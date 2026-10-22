@@ -1174,6 +1174,17 @@ lock, and Conduit's next send claims the chat.
   when the registry can't be read (ownership is never guessed), 429 past 60
   requests a minute, 504 if the takeover doesn't finish within 20 seconds (ask again: nothing is written after that, short of a write already under way).
 
+The other way round (plugin 0.58.1+): a chat Conduit opened in the dashboard
+holds its claim for as long as Conduit stays connected, which used to refuse
+the same chat in Hermes Desktop's own process long after Conduit's turn ended.
+The dashboard now lets go of Conduit's claim once the chat has been idle for a
+minute: no turn running, nothing waiting on an answer, no delegated work, wake-up
+or background process still to report, and no turn marker. The chat stays open
+in Conduit, and its next send claims it again, or meets the usual refusal and
+**Take over** if Desktop took it meanwhile. Only chats whose every client here
+is Conduit count; a chat Desktop or the web dashboard also has open in this
+process, and Bot Chats, keep their claim.
+
 ## Chats opened on Desktop (plugin 0.12+)
 
 Conduit's Unread filter can count a chat as read when you have it open in
