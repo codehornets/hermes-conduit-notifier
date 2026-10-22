@@ -48,7 +48,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
                             "'all-profiles' or 'this-profile'; "
                             "for memory: a kind to list, 'now', 'on', 'off', 'forget' and an item number, "
                             "or 'backfill'; "
-                            "for followups: 'on' or 'off', or nothing to list them; "
+                            "for followups: 'on', 'off', 'now' (check everything now, for testing), or nothing to list them; "
                             "for rate: the card number; "
                             "for learned: 'undo' and a lesson number, or a kind and a loudness to set")
     pulse.add_argument("extra", nargs="?", default="",
@@ -220,7 +220,7 @@ def _pulse(args: argparse.Namespace) -> int:
               + (" Nothing was changed." if action in ("followups", "learned") and (args.value or "").strip() else ""))
         return 1 if action in ("probe", "rate") or (action == "learned" and (args.value or "").strip()) \
             or (action == "memory" and (args.value or "").strip() in ("now", "forget")) \
-            or (action == "followups" and (args.value or "").strip() == "on") else 0
+            or (action == "followups" and (args.value or "").strip() in ("on", "now")) else 0
     pulse_store = pulse.open_store(home)
     if action in ("on", "off"):
         pulse_store.set("enabled", action == "on")
@@ -445,14 +445,31 @@ def _pulse_followups(pulse_store: Any, home: Any, value: str) -> int:
     from . import pulse, pulse_followup
     if value in ("on", "off"):
         pulse_store.set("followups", value == "on")
+        if value == "off":
+            pulse_store.set(pulse_followup.NOW_REQUESTED, None)  # a `now` not yet taken doesn't wait for "on"
         print("Pulse follow-ups are off: what Hermes promised and what you said you'd do are no longer checked on."
               if value == "off" else
               "Pulse follow-ups are on: Pulse checks on what Hermes promised and reminds you of what you said "
               "you'd do, in its chat."
               + ("" if pulse_store.get("memory") else " They need memory too: `hermes conduit-push pulse memory on`."))
         return 0
+    if value == "now":
+        from . import pulse_learning
+        off = [name for name, on in (("Pulse", pulse_store.get("enabled")), ("memory", pulse_store.get("memory")),
+                                     ("follow-ups", pulse_store.get("followups")),
+                                     ("follow-ups' loudness", pulse_learning.level(pulse_store, pulse_followup.FOLLOWUP)
+                                      != "off")) if not on]
+        if off:
+            print(f"Off: {', '.join(off)}. Turn it on first.")
+            return 1
+        pulse_store.set(pulse_followup.NOW_REQUESTED, time.time())
+        pulse_store.set("memory_requested", True)
+        print("Asked the dashboard to check every promise and to-do now, and to let today's reminders go out again "
+              f"(still {pulse_followup.REMINDERS_PER_DAY} a day); see `hermes conduit-push pulse followups` in a "
+              "minute or two. Meant for testing: each check is a model call.")
+        return 0
     if value:
-        print("Usage: hermes conduit-push pulse followups [on|off]")
+        print("Usage: hermes conduit-push pulse followups [on|off|now]")
         return 2
     rows = pulse_store.followups(MEMORY_LIST)
     if not rows:
