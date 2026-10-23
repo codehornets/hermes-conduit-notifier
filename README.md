@@ -2176,10 +2176,12 @@ seals the answers back. This host opens no inbound route of its own.
   the renewal starts with jobs of its own. A ticket whose home the plugin
   can't read is refused (403).
 - **Follow-ups** (plugin 0.10): a grant that can start or cancel jobs also
-  carries `interrupt_job` (`{job_id, message}`), as does one that names it. It puts the
+  carries `interrupt_job` (`{job_id, message, kind?}`), as does one that names it. It puts the
   user's words into a job Hermes is still working on, through Hermes'
   `session.redirect` (a steer on a Hermes without it), as Conduit's phone
-  calls do: Hermes keeps the work so far and the job's result still comes as
+  calls do. With `kind: "add"` (plugin 0.65.1) the words only add to the
+  work, so they go in as a `session.steer` instead, falling back to the
+  redirect when Hermes refuses or lacks the steer: Hermes keeps the work so far and the job's result still comes as
   news. The answer is `{ok, outcome, title?, error?}`, the outcome being
   `interrupted`, `queued` (taken right after the step Hermes is finishing),
   `finished`, `failed` or `unknown_job`; follow-ups to one job go one at a

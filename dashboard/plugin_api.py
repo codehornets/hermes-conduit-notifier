@@ -9479,7 +9479,8 @@ async def post_watch_tool_revoke(request: Request, response: Response, profile: 
 # interrupt_job puts the user's words into a job Hermes is still working on
 # (a correction, "hold that", "never mind"), as the phone's live calls do
 # (Conduit #451/#455): Hermes' session.redirect, which keeps the work so far
-# and ends the turn with one completion. It comes with every grant that can
+# and ends the turn with one completion. One with kind "add" only adds to the
+# work, so it is steered in instead (Conduit #1076). It comes with every grant that can
 # start or cancel jobs, so the Watch never needs to name it (an older plugin
 # would refuse a grant that did); named, it is taken rather than refused.
 
@@ -9571,6 +9572,13 @@ class WatchJobError(Exception):
         message = str(self).lower()
         return (self.code in (4010, -32601) or "does not support active-turn redirect" in message
                 or "method not found" in message or "unknown method" in message)
+
+    @property
+    def unsupported_steer(self) -> bool:
+        """Hermes has no session.steer (Conduit's AppState.isUnsupportedSteer)."""
+        message = str(self).lower()
+        return (self.code == -32601 or "method not found" in message
+                or ("unknown method" in message and "session.steer" in message))
 
 
 def _hermes_session_api() -> Any:
@@ -10337,6 +10345,8 @@ class _WatchJobs:
         """
         wanted = str(args.get("job_id") or "").strip()
         words = str(args.get("message") or "").strip()
+        # kind "add" only adds to the work: steered, not redirected (Conduit #1076).
+        adds = str(args.get("kind") or "").strip().lower() == "add"
         if not wanted:
             return {"ok": False, "status": 400, "detail": "job_id is required"}
         if not words:
@@ -10356,7 +10366,7 @@ class _WatchJobs:
                 return {"ok": True, "outcome": "failed", "title": job.title,
                         "error": "Hermes is still taking the user's last words for this job."}
             try:
-                outcome = self._follow_up(job, words, deadline)
+                outcome = self._follow_up(job, words, deadline, adds=adds)
             finally:
                 job.follow_up_lock.release()
         finally:
@@ -10364,7 +10374,7 @@ class _WatchJobs:
                 self.follow_ups_in_flight -= 1
         return {"ok": True, "title": job.title, **outcome}
 
-    def _follow_up(self, job: _WatchJob, words: str, deadline: float) -> Dict[str, Any]:
+    def _follow_up(self, job: _WatchJob, words: str, deadline: float, adds: bool = False) -> Dict[str, Any]:
         attempts = waits = 0
         while True:
             with self.lock:
@@ -10380,7 +10390,7 @@ class _WatchJobs:
             if sid:
                 attempts += 1
                 try:
-                    result = self._redirect(sid, words, timeout=max(1.0, deadline - time.monotonic()))
+                    result = self._redirect(sid, words, timeout=max(1.0, deadline - time.monotonic()), adds=adds)
                 except WatchJobError as exc:
                     if not was_queued:
                         self._end_follow_up(job)
@@ -10416,9 +10426,24 @@ class _WatchJobs:
                 return {"outcome": "failed", "error": f"Hermes wasn't working on \"{job.title}\" just then."}
             time.sleep(WATCH_FOLLOW_UP_RETRY_S)
 
-    def _redirect(self, sid: str, words: str, timeout: float = WATCH_JOB_RPC_TIMEOUT_S) -> str:
+    def _redirect(self, sid: str, words: str, timeout: float = WATCH_JOB_RPC_TIMEOUT_S, adds: bool = False) -> str:
         """Hermes' answer: "redirected", "queued" or "not_running". A Hermes
-        without redirect gets a steer, as the phone sends it."""
+        without redirect gets a steer, as the phone sends it. An addition
+        (``adds``) is steered into the turn, keeping its direction; a Hermes
+        that refuses the steer, or has none, gets the redirect instead, as on
+        the phone (VoiceBackgroundJobSupervisor, AppState.isUnsupportedSteer)."""
+        if adds:
+            started = time.monotonic()
+            try:
+                status = self.rpc("session.steer", {"session_id": sid, "text": words}, timeout=timeout).get("status")
+            except WatchJobError as exc:
+                if not exc.unsupported_steer:
+                    raise
+            else:
+                if str(status or "").lower() != "rejected":
+                    return "redirected"
+            # The redirect gets what is left of the follow-up's time, not a second budget.
+            timeout = max(1.0, timeout - (time.monotonic() - started))
         try:
             status = self.rpc("session.redirect", {"session_id": sid, "text": words}, timeout=timeout).get("status")
         except WatchJobError as exc:
