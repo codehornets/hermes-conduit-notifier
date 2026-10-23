@@ -584,6 +584,17 @@ def test_no_distance_offers_locate_only_with_background_sharing(home):
     assert "locate" not in _call({"action": "distance_to", "place": "Home"})["note"]
 
 
+def test_a_places_only_fix_the_settings_no_longer_explain_blames_nothing():
+    # Stamped places only by a setting since changed: neither cause is sure.
+    view = {"sharing": sharing(), "places": {}}
+    note = tool._no_distance_note(view, {"precision": "places", "source": "message", "place_id": None}, {"name": "Home"})
+    assert "private" not in note and "the user chose" not in note
+    # Only the fix's own layer counts.
+    view = {"sharing": sharing(background_precision="places"), "places": {}}
+    note = tool._no_distance_note(view, {"precision": "places", "source": "message", "place_id": None}, {"name": "Home"})
+    assert "the user chose" not in note
+
+
 def test_a_spoken_no_distance_note_leaves_out_locate():
     # Voice calls have no locate action.
     answer = tool._spoken({"ok": False, "note": "The last fix carried no distances." + tool.LOCATE_HINT + " Otherwise."})

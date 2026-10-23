@@ -34,7 +34,7 @@ from .conduit_first import LOCATION_FIRST
 from .events import push_event
 from .location_store import (
     ANY_PLACE, MAX_RULES, MAX_TASK_CHARS, MAX_WHAT_CHARS, RULE_EVENTS, RULE_REPEATS, WEEKDAYS, LocationError,
-    LocationStore, clean_task, clean_text, parse_hours, sharing_paused,
+    TALKING_SOURCES, LocationStore, clean_task, clean_text, parse_hours, sharing_paused,
 )
 
 logger = logging.getLogger("hermes.plugins.conduit_push")
@@ -372,9 +372,13 @@ def _no_distance_note(view: dict[str, Any], fix: dict[str, Any], place: dict[str
     if fix["precision"] == "places":
         # The store also stamps a fix taken at a private place as places only.
         at = view["places"].get(fix.get("place_id")) or {}
-        if at.get("private") or "places" not in (sharing.get("talking_precision"), sharing.get("background_precision")):
+        if at.get("private"):
             return "Distances aren't shared for the last fix, which was taken at a place the user keeps private."
-        return "Distances aren't shared at the 'places only' detail the user chose."
+        layer = "talking" if fix.get("source") in TALKING_SOURCES else "background"
+        if sharing.get(f"{layer}_precision") == "places":
+            return "Distances aren't shared at the 'places only' detail the user chose."
+        # A setting since changed, or a place no longer private: neither is sure.
+        return "The last fix was shared at the 'places only' detail, so it carries no distances."
     # A lookup is a background fix: at places only it carries no distances either.
     hint = LOCATE_HINT if sharing.get("background") and sharing.get("background_precision") != "places" else ""
     if not (fix.get("distances_m") or {}):
