@@ -542,6 +542,29 @@ def test_distance_to_and_places_respect_private(home):
     assert {"name": "a private place", "private": True} in _call({"action": "places"})["places"]
 
 
+def test_no_distance_blames_the_fix_when_it_carried_none(home):
+    # The usual cause: a background fix without distances, not a setting the
+    # user never touched, which the note used to claim.
+    _shared(home, fix=fix(distances_m={}))
+    answer = _call({"action": "distance_to", "place": "Home"})
+    assert answer["error"] == "no_distance"
+    assert "carried no distances" in answer["note"] and "places only" not in answer["note"]
+
+
+def test_no_distance_at_places_only_keeps_that_explanation(home):
+    _shared(home, sharing=sharing(talking_precision="places", background_precision="places"), fix=fix())
+    answer = _call({"action": "distance_to", "place": "Home"})
+    assert answer["error"] == "no_distance"
+    assert answer["note"] == "Distances aren't shared at the 'places only' detail the user chose."
+
+
+def test_no_distance_names_a_place_added_after_the_fix(home):
+    _shared(home, fix=fix(distances_m={"p_work": 4321}))
+    answer = _call({"action": "distance_to", "place": "Home"})
+    assert answer["error"] == "no_distance"
+    assert "Home" in answer["note"] and "may have been added after" in answer["note"]
+
+
 def test_a_paused_user_is_never_guessed(home):
     _shared(home, sharing=sharing(paused_until="2099-01-01T00:00:00+00:00"))
     assert _call({"action": "now"})["error"] == "paused"
