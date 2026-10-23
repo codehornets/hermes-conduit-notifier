@@ -11,7 +11,7 @@ It uses only the Node.js standard library (Node 22.13 or later, for `node:sqlite
 ```shell
 cd mailbox/deploy
 
-# 1. Optional: a registration token and limits
+# 1. Set PUBLIC_URL; optionally a registration token and limits
 cp .env.example .env
 
 # 2. Create the data directory, owned by the image's node user (uid 1000)
@@ -24,18 +24,19 @@ docker compose up -d
 
 If you skip step 2, Docker creates `data/` owned by root on a Linux host. The mailbox runs as `node`, can't write there, and exits at startup naming the directory.
 
-The mailbox listens on port 9130. Put it behind an HTTPS reverse proxy, at the root of its own host name: owners sign the request path, so the proxy must pass it on unchanged, with no path prefix. The Compose file joins the external `pangolin` network and sets `TRUST_PROXY=1`; change both to match your proxy. With `TRUST_PROXY` set, the mailbox rate-limits by the address the outermost trusted proxy appended to `X-Forwarded-For`. That holds only when every request comes through the proxy, so don't publish port 9130 or share its network with anything else. The proxy must also append that address (Traefik, which Pangolin uses, does by default): a request without it counts against the proxy's own address, which every client then shares.
+The mailbox listens on port 9130. Put it behind an HTTPS reverse proxy, at the root of its own host name, and set `PUBLIC_URL` to that URL. Owners sign its host name and the request path, so the proxy must pass the path on unchanged, with no prefix. The Compose file joins the external `pangolin` network and sets `TRUST_PROXY=1`; change both to match your proxy. With `TRUST_PROXY` set, the mailbox rate-limits by the address the outermost trusted proxy appended to `X-Forwarded-For`. That holds only when nothing but the proxy can reach port 9130: anything else that can picks the address it's counted as, and could get a real client turned away. So don't publish the port, and if other containers share the proxy's network, give the mailbox a network of its own that only the proxy also joins. The proxy must also append that address (Traefik, which Pangolin uses, does by default): a request without it counts against the proxy's own address, which every client then shares.
 
 Without Docker, from this directory:
 
 ```shell
-DATA_PATH=./data/mailbox.sqlite npm start
+PUBLIC_URL=http://127.0.0.1:9130 DATA_PATH=./data/mailbox.sqlite npm start
 npm test
 ```
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATA_PATH` | required | The SQLite file. Its directory must be writable, because SQLite keeps its `-wal` and `-shm` files beside it. |
+| `PUBLIC_URL` | required | The URL owners reach the mailbox at, such as `https://rooms.example.com`, with no path. Their signatures are checked against its host name. |
 | `HOST`, `PORT` | `127.0.0.1`, `9130` | Where the mailbox listens. |
 | `TRUST_PROXY` | `0` | How many reverse proxies are in front of the mailbox (0 to 10). |
 | `MAILBOX_REGISTRATION_TOKEN` | empty | Empty means open registration. When it's set (at least 16 characters, no spaces), only a registration that sends it as `Mailbox-Registration` can make an inbox. |
@@ -56,10 +57,10 @@ Authorization: Mailbox-Ed25519 ts=<unix seconds>,nonce=<16 to 64 base64url chara
 The signature covers these UTF-8 bytes, with each `\n` a newline:
 
 ```
-mailbox-v1\n<METHOD>\n<path and query, exactly as sent>\n<ts>\n<nonce>\n<base64url SHA-256 of the body>
+mailbox-v1\n<METHOD>\n<host>\n<path and query, exactly as sent>\n<ts>\n<nonce>\n<base64url SHA-256 of the body>
 ```
 
-The timestamp must be within 300 seconds of the mailbox's clock, and each signature is accepted once. Ed25519 signs the same bytes the same way, so use a fresh random nonce for every request. Otherwise a retry, or a second poll in the same second, looks like a replay.
+`<host>` is the host of the URL the owner reaches the mailbox at, the way a URL parser gives it: lowercase, with the port only when it isn't the scheme's default (`rooms.milim.dev`). The mailbox checks it against its own `PUBLIC_URL`, never the request's `Host` header, so a request signed for one mailbox can't pass at another, though an inbox has the same id on both. The timestamp must be within 300 seconds of the mailbox's clock, and each signature is accepted once. Ed25519 signs the same bytes the same way, so use a fresh random nonce for every request. Otherwise a retry, or a second poll in the same second, looks like a replay.
 
 **Send tokens.** An owner gives each linked installation a secret send token, and registers the token's SHA-256 (unpadded base64url) under a sender id it picks (`[A-Za-z0-9_-]{1,64}`). The sender sends `Authorization: Bearer <token>`. The mailbox stores only the hash.
 
@@ -72,9 +73,11 @@ The timestamp must be within 300 seconds of the mailbox's clock, and each signat
 | `PUT /v1/inboxes/{inbox}/senders/{sender}` `{"token_sha256"}` | owner | Adds a sender or gives it a new token (204). Its pending envelopes stay. |
 | `DELETE /v1/inboxes/{inbox}/senders/{sender}` | owner | Removes the sender and drops what it left (204, or 404 if there was none). |
 | `GET /v1/inboxes/{inbox}/senders` | owner | `{"senders": [{"sender", "pending", "last_sent_at"}]}` |
-| `POST /v1/inboxes/{inbox}/envelopes` (raw bytes) | sender, with an optional `Idempotency-Key` (`[A-Za-z0-9_.:-]{1,128}`) | Stores the envelope and answers `{"seq", "expires_at"}` (201). The same key again, while that envelope is pending, returns it (200) instead of storing a copy. |
+| `POST /v1/inboxes/{inbox}/envelopes` (raw bytes) | sender, with an optional `Idempotency-Key` (`[A-Za-z0-9_.:-]{1,128}`) | Stores the envelope and answers `{"expires_at"}` (201). The same key again, while that envelope is pending, answers the same (200) instead of storing a copy. |
 | `GET /v1/inboxes/{inbox}/envelopes?after=&limit=&wait=` | owner | Envelopes after `seq` `after`, oldest first: `{"envelopes": [{"seq", "sender", "received_at", "body"}], "next"}`, with each body in standard base64. `limit` is 1 to 100 (default 50). With `wait` (seconds, cut to `max_wait_seconds`), an empty inbox holds the request until an envelope arrives or the wait ends. Poll again with `after=next`. |
 | `POST /v1/inboxes/{inbox}/ack` `{"through"}`, `{"seqs"}` or both | owner | Deletes the envelopes up to and including `through`, and those listed in `seqs` (up to 100), and answers `{"deleted"}`. |
+
+**Seqs.** Each inbox numbers its own envelopes, so the numbers say nothing about other inboxes' traffic. Senders aren't told the seq: the gap since a sender's last one would say how much the inbox got from other links. An inbox's first seq is its creation time in Unix seconds times 1,000, plus 1, and each envelope after takes the next, so `after=0` reads from the start. An inbox made again under the same key numbers on past the earlier one, unless that one averaged more than a thousand envelopes a second. Registration answers 201 only when it makes the inbox, so start again from `after=0` then.
 
 Every error is `{"error": "<code>"}`. An unknown inbox, a wrong token, and a bad or replayed signature all get 401 `unauthorized`, and an unknown inbox takes as long to refuse as a bad signature, so neither the answer nor its timing says whether an inbox exists. The other codes:
 
@@ -118,7 +121,7 @@ Registering a new inbox counts against the registration rates; registering one t
 
 ## What the mailbox keeps
 
-- For each inbox: its public key, when it was made, and when its owner last made a request.
+- For each inbox: its public key, when it was made, when its owner last made a request, and the last seq it gave an envelope.
 - For each sender: the id its owner chose, the SHA-256 of its token, and when it last sent.
 - For each pending envelope: its sealed bytes, its size, the sender id, its idempotency key, and when it arrived and expires.
 

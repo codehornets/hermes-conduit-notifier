@@ -25,26 +25,28 @@ export function tokenHash(token) {
   return sha256(Buffer.from(token, 'utf8'));
 }
 
-// What an owner signs: the method, the request target as sent (path and
-// query), the timestamp, a nonce and the body's hash, so none can be
-// swapped. Ed25519 signs the same bytes the same way, so the nonce is what
-// lets an owner send one request twice in a second (a retry, a second poll).
-export function signedString({ method, target, ts, nonce, body }) {
-  return Buffer.from(`mailbox-v1\n${method}\n${target}\n${ts}\n${nonce}\n${sha256(body)}`, 'utf8');
+// What an owner signs: the method, the mailbox's host name (an inbox is
+// named after its key on every mailbox, so this keeps a request for one
+// from passing at another), the request target as sent (path and query),
+// the timestamp, a nonce and the body's hash, so none can be swapped.
+// Ed25519 signs the same bytes the same way, so the nonce is what lets an
+// owner send one request twice in a second (a retry, a second poll).
+export function signedString({ method, host, target, ts, nonce, body }) {
+  return Buffer.from(`mailbox-v1\n${method}\n${host}\n${target}\n${ts}\n${nonce}\n${sha256(body)}`, 'utf8');
 }
 
 // The signature, when `authorization` signs this request with `key` within
 // the window, and until when it must be remembered: past that, its
 // timestamp is refused anyway. Undefined otherwise. Whether the signature
 // was used before is the ReplayCache's to say.
-export function verifyOwnerSignature({ key, method, target, body, authorization, now }) {
+export function verifyOwnerSignature({ key, method, host, target, body, authorization, now }) {
   const match = AUTHORIZATION_PATTERN.exec(typeof authorization === 'string' ? authorization : '');
   if (!match) return undefined;
   const ts = Number(match[1]);
   if (Math.abs(now - ts) > SIGNATURE_WINDOW_SECONDS) return undefined;
   try {
     const publicKey = createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: key.toString('base64url') }, format: 'jwk' });
-    const message = signedString({ method, target, ts: match[1], nonce: match[2], body });
+    const message = signedString({ method, host, target, ts: match[1], nonce: match[2], body });
     if (!verify(null, message, publicKey, Buffer.from(match[3], 'base64url'))) return undefined;
   } catch {
     return undefined;

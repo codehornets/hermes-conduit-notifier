@@ -12,9 +12,9 @@ function owner() {
 }
 
 // Built by hand from the protocol, not with the module's own helper.
-function authorization(privateKey, { method, target, ts, nonce = 'nonce-0123456789ab', body = '' }) {
+function authorization(privateKey, { method, host = 'rooms.example', target, ts, nonce = 'nonce-0123456789ab', body = '' }) {
   const bodyHash = body === '' ? EMPTY_BODY_SHA256 : createHash('sha256').update(body).digest('base64url');
-  const message = Buffer.from(`mailbox-v1\n${method}\n${target}\n${ts}\n${nonce}\n${bodyHash}`);
+  const message = Buffer.from(`mailbox-v1\n${method}\n${host}\n${target}\n${ts}\n${nonce}\n${bodyHash}`);
   return `Mailbox-Ed25519 ts=${ts},nonce=${nonce},sig=${sign(null, message, privateKey).toString('base64url')}`;
 }
 
@@ -43,7 +43,7 @@ test('a request signed by the inbox key within five minutes is the owner\'s, kep
   const { key, privateKey } = owner();
   const target = '/v1/inboxes/x/envelopes?after=0&wait=25';
   const header = authorization(privateKey, { method: 'GET', target, ts: 1_000_000 });
-  const request = { key, method: 'GET', target, body: Buffer.alloc(0), authorization: header };
+  const request = { key, method: 'GET', host: 'rooms.example', target, body: Buffer.alloc(0), authorization: header };
   const expected = { signature: signatureOf(header), until: 1_000_301 };
 
   assert.deepEqual(verifyOwnerSignature({ ...request, now: 1_000_299 }), expected);
@@ -56,20 +56,23 @@ test('a stale, altered or foreign request is not the owner\'s', () => {
   const body = Buffer.from('{"through":7}');
   const target = '/v1/inboxes/x/ack';
   const header = authorization(privateKey, { method: 'POST', target, ts: 1_000_000, body });
-  const base = { key, method: 'POST', target, body, authorization: header, now: 1_000_000 };
+  const base = { key, method: 'POST', host: 'rooms.example', target, body, authorization: header, now: 1_000_000 };
 
   assert.equal(verifyOwnerSignature({ ...base, now: 1_000_301 }), undefined, 'too old');
   assert.equal(verifyOwnerSignature({ ...base, now: 999_699 }), undefined, 'too far ahead');
   assert.equal(verifyOwnerSignature({ ...base, body: Buffer.from('{"through":9}') }), undefined, 'another body');
   assert.equal(verifyOwnerSignature({ ...base, target: '/v1/inboxes/y/ack' }), undefined, 'another path');
+  assert.equal(verifyOwnerSignature({ ...base, host: 'rooms.elsewhere' }), undefined, 'another mailbox');
   assert.equal(verifyOwnerSignature({ ...base, method: 'PUT' }), undefined, 'another method');
   assert.equal(verifyOwnerSignature({ ...base, key: other.key }), undefined, 'another key');
   const signature = signatureOf(header);
   assert.equal(verifyOwnerSignature({ ...base, authorization: header.replace('nonce-0123456789ab', 'nonce-0123456789ac') }), undefined,
     'another nonce');
   const unsigned = createHash('sha256').update(body).digest('base64url');
-  const withoutNonce = `Mailbox-Ed25519 ts=1000000,sig=${sign(null, Buffer.from(`mailbox-v1\nPOST\n${target}\n1000000\n${unsigned}`),
+  const withoutNonce = `Mailbox-Ed25519 ts=1000000,sig=${sign(null, Buffer.from(`mailbox-v1\nPOST\nrooms.example\n${target}\n1000000\n${unsigned}`),
     privateKey).toString('base64url')}`;
+  const withoutHost = authorization(privateKey, { method: 'POST', host: '', target, ts: 1_000_000, body });
+  assert.equal(verifyOwnerSignature({ ...base, authorization: withoutHost }), undefined, 'signed without the host');
   for (const bad of [undefined, '', 'Bearer abc', 'Mailbox-Ed25519 ts=1000000', 'Mailbox-Ed25519 sig=abc,ts=1000000', withoutNonce,
     `Mailbox-Ed25519 ts=1000000,nonce=short,sig=${signature}`, `Mailbox-Ed25519 ts=1000000,nonce=${'n'.repeat(65)},sig=${signature}`,
     `Mailbox-Ed25519 ts=1000000,nonce=nonce 0123456789ab,sig=${signature}`]) {

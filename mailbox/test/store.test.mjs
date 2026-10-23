@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -43,6 +44,32 @@ test('an envelope waits in its inbox, oldest first, until acknowledged', () => {
   assert.deepEqual(store.inboxStatus(inbox), { pending: 1, pending_bytes: 5, senders: 1 });
   assert.equal(store.ack(inbox, { seqs: [sent[2].seq, sent[2].seq + 100] }), 1);
   assert.deepEqual(store.list(inbox), []);
+});
+
+test('each inbox numbers its own envelopes, from when it was made', () => {
+  const { store } = open();
+  const inboxA = withSender(store, KEY_A);
+  const inboxB = withSender(store, KEY_B);
+
+  const first = store.put(inboxA, 'laifu', Buffer.from('a1'));
+  store.put(inboxB, 'laifu', Buffer.from('b1'));
+  store.put(inboxB, 'laifu', Buffer.from('b2'));
+  const second = store.put(inboxA, 'laifu', Buffer.from('a2'));
+
+  assert.equal(first.seq, 1_000_000_001, 'a thousand a second from its creation time');
+  assert.equal(second.seq, first.seq + 1, 'another inbox\'s envelopes leave no gap');
+  assert.deepEqual(store.list(inboxB).map((envelope) => envelope.seq), [1_000_000_001, 1_000_000_002]);
+});
+
+test('an inbox made again under the same key numbers on past what its owner saw', () => {
+  const { store, clock } = open();
+  const inbox = withSender(store);
+  const seen = [1, 2, 3].map(() => store.put(inbox, 'laifu', Buffer.from('x')).seq).at(-1);
+  store.deleteInbox(inbox);
+
+  clock.now += 1;
+  withSender(store);
+  assert.ok(store.put(inbox, 'laifu', Buffer.from('y')).seq > seen);
 });
 
 test('after and limit page through an inbox, and a page stops at its byte budget', () => {
@@ -118,6 +145,23 @@ test('a repeated idempotency key returns the pending envelope instead of a copy'
   assert.equal(store.list(inbox).length, 2);
   store.ack(inbox, { through: first.seq });
   assert.notEqual(store.put(inbox, 'laifu', Buffer.from('dispatch'), 'msg-1').seq, first.seq, 'once acknowledged, a new envelope');
+});
+
+test('an idempotency key whose envelope expired stores a new one in its place', () => {
+  const { store, clock } = open({ ttlSeconds: 100, maxTotalBytes: 25 });
+  const inboxA = withSender(store, KEY_A);
+  const inboxB = withSender(store, KEY_B);
+  const expired = store.put(inboxA, 'laifu', Buffer.alloc(10), 'msg-1');
+  clock.now += 50;
+  const kept = store.put(inboxB, 'laifu', Buffer.alloc(10));
+  assert.equal(kept.seq, expired.seq, 'two inboxes made in the same second');
+
+  clock.now += 50;
+  // Room for it only once the expired envelope's bytes are given back.
+  const again = store.put(inboxA, 'laifu', Buffer.alloc(10), 'msg-1');
+  assert.equal(again.duplicate, false);
+  assert.ok(again.seq > expired.seq);
+  assert.deepEqual(store.list(inboxB).map((envelope) => envelope.seq), [kept.seq], 'the other inbox\'s envelope with that seq stays');
 });
 
 test('removing a sender drops what it left and stops its token', () => {
@@ -200,6 +244,33 @@ test('expired envelopes stop showing and are pruned; idle inboxes are deleted', 
   assert.equal(store.senderFor(inbox, 'hash-laifu'), undefined);
 });
 
+test('pruning drops every idle inbox at once, with its senders and envelopes, and gives back their bytes', () => {
+  const { store, clock } = open({ inboxIdleDays: 1, maxTotalBytes: 30 });
+  const idle = [KEY_A, KEY_B, Buffer.alloc(32, 3)].map((key) => withSender(store, key));
+  for (const inbox of idle) store.put(inbox, 'laifu', Buffer.alloc(10));
+
+  clock.now += 86_400;
+  const active = withSender(store, Buffer.alloc(32, 4));
+  assert.deepEqual(store.prune(), { envelopes: 3, inboxes: 3 });
+  for (const inbox of idle) {
+    assert.equal(store.inboxKey(inbox), undefined);
+    assert.equal(store.senderFor(inbox, 'hash-laifu'), undefined);
+  }
+  assert.ok(store.inboxKey(active));
+  assert.ok(store.put(active, 'laifu', Buffer.alloc(30)).seq, 'their bytes were given back');
+});
+
+test('a full disk is reported as such, and the store keeps working', () => {
+  const { store } = open();
+  const inbox = withSender(store);
+  // SQLite undoes the whole transaction itself when the file can't grow.
+  store.db.exec(`PRAGMA max_page_count = ${store.db.prepare('PRAGMA page_count').get().page_count + 2}`);
+  assert.throws(() => store.put(inbox, 'laifu', Buffer.alloc(200_000)), /database or disk is full/);
+
+  store.db.exec('PRAGMA max_page_count = 1073741823');
+  assert.ok(store.put(inbox, 'laifu', Buffer.from('fits')).seq);
+});
+
 test('deleting an inbox removes its senders and envelopes', () => {
   const { store } = open({ maxTotalBytes: 10 });
   const inbox = withSender(store);
@@ -227,6 +298,28 @@ test('envelopes, senders and the storage total survive a restart', () => {
     refused(() => second.store.put(inbox, 'laifu', Buffer.alloc(7)), 'mailbox_full', 507);
     assert.ok(second.store.put(inbox, 'laifu', Buffer.alloc(6)).seq > sent.seq);
     second.store.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a database from an earlier or later mailbox is refused, saying what to do', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'mailbox-store-'));
+  try {
+    const first = join(directory, 'first-release.sqlite');
+    const old = new DatabaseSync(first);
+    // The first release's tables, which numbered envelopes across the whole mailbox.
+    old.exec(`CREATE TABLE inboxes (id TEXT PRIMARY KEY, key BLOB NOT NULL, created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL);
+      CREATE TABLE envelopes (seq INTEGER PRIMARY KEY AUTOINCREMENT, inbox TEXT NOT NULL)`);
+    old.close();
+    assert.throws(() => open({}, first), /numbered envelopes across the whole mailbox.*move it aside/s);
+
+    const later = join(directory, 'later.sqlite');
+    open({}, later).store.close();
+    const newer = new DatabaseSync(later);
+    newer.exec('PRAGMA user_version = 99');
+    newer.close();
+    assert.throws(() => open({}, later), /newer mailbox/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

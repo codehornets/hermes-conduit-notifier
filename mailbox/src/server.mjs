@@ -35,7 +35,7 @@ const jsonLog = {
 // The mailbox's HTTP server over `store`. Nothing it logs names an inbox,
 // a sender, a token or a signature: only routes, statuses and timings.
 export function createMailbox({
-  store, limits, registrationToken, proxyHops = 0,
+  store, limits, publicHost, registrationToken, proxyHops = 0,
   // Room for twelve minutes of owner requests per inbox: a signature is
   // remembered for ten at most.
   replay = new ReplayCache(12 * limits.ownerRequestsPerMinutePerInbox),
@@ -171,7 +171,8 @@ export function createMailbox({
     if (store.senderFor(inbox, tokenHash(bearer[1])) !== sender) throw new MailboxError('unauthorized', 401);
     const receipt = store.put(inbox, sender, body, idempotencyKey ?? null);
     if (!receipt.duplicate) polls.wake(inbox);
-    sendJson(response, receipt.duplicate ? 200 : 201, { seq: receipt.seq, expires_at: receipt.expires_at });
+    // Not its seq: the gap since a sender's last one would say how much the inbox gets from its other links.
+    sendJson(response, receipt.duplicate ? 200 : 201, { expires_at: receipt.expires_at });
   }
 
   // Envelopes after `after`, oldest first. With `wait`, an empty inbox holds
@@ -212,8 +213,11 @@ export function createMailbox({
     return body;
   }
 
+  // Checked against the mailbox's own host name, never the Host header,
+  // which anything that reaches the mailbox directly can set.
   function ownerSignature(request, key, body, now) {
-    return verifyOwnerSignature({ key, method: request.method, target: request.url, body, authorization: request.headers.authorization, now });
+    return verifyOwnerSignature({ key, method: request.method, host: publicHost, target: request.url, body,
+      authorization: request.headers.authorization, now });
   }
 
   // Claims an owner's checked signature, then counts the request against its
@@ -401,6 +405,12 @@ function clientAddress(request, proxyHops) {
 
 export function readConfig(env = process.env) {
   if (!env.DATA_PATH) throw new Error('DATA_PATH is required.');
+  if (!env.PUBLIC_URL) throw new Error('PUBLIC_URL is required: the URL owners reach the mailbox at, such as https://rooms.example.com.');
+  const publicUrl = URL.parse(env.PUBLIC_URL);
+  if (!['http:', 'https:'].includes(publicUrl?.protocol) || publicUrl.pathname !== '/' || publicUrl.search || publicUrl.username
+    || publicUrl.password) {
+    throw new Error('PUBLIC_URL must be the http(s) URL of the mailbox\'s own host name, with no path: https://rooms.example.com');
+  }
   const proxyHops = env.TRUST_PROXY && /^\d{1,2}$/.test(env.TRUST_PROXY) ? Number(env.TRUST_PROXY) : env.TRUST_PROXY ? NaN : 0;
   if (!Number.isInteger(proxyHops) || proxyHops > 10) {
     throw new Error('TRUST_PROXY must be the number of reverse proxies in front of the mailbox (0 to 10).');
@@ -412,7 +422,9 @@ export function readConfig(env = process.env) {
   if (registrationToken !== undefined && !/^[\x21-\x7e]{16,256}$/.test(registrationToken)) {
     throw new Error('MAILBOX_REGISTRATION_TOKEN must be at least 16 characters, with no spaces.');
   }
-  return { host: env.HOST || '127.0.0.1', port, dataPath: env.DATA_PATH, proxyHops, registrationToken, limits: limitsFromEnv(env) };
+  // Owners sign the host as their URL parser gives it: lowercase, with a port only when it isn't the scheme's.
+  return { host: env.HOST || '127.0.0.1', port, publicHost: publicUrl.host, dataPath: env.DATA_PATH, proxyHops, registrationToken,
+    limits: limitsFromEnv(env) };
 }
 
 // SQLite opens a missing file by creating it, so a data directory the
@@ -439,14 +451,16 @@ function main() {
   assertDataDirectoryWritable(config.dataPath);
   const store = new MailboxStore(config.dataPath, config.limits);
   store.prune();
-  const mailbox = createMailbox({ store, limits: config.limits, registrationToken: config.registrationToken, proxyHops: config.proxyHops });
+  const mailbox = createMailbox({ store, limits: config.limits, publicHost: config.publicHost, registrationToken: config.registrationToken,
+    proxyHops: config.proxyHops });
   // A port in use or a host it can't bind, as a log line rather than a stack.
   mailbox.server.on('error', (error) => {
     jsonLog.error({ message: 'server error', error: error.message });
     process.exit(1);
   });
   mailbox.server.listen(config.port, config.host, () => {
-    jsonLog.info({ message: 'Rooms mailbox listening', host: config.host, port: config.port, registration: config.registrationToken ? 'token' : 'open' });
+    jsonLog.info({ message: 'Rooms mailbox listening', host: config.host, port: config.port, publicHost: config.publicHost,
+      registration: config.registrationToken ? 'token' : 'open' });
   });
   const shutdown = async () => {
     try {
