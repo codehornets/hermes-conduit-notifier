@@ -10,7 +10,7 @@ from typing import Any
 
 # Keep in sync with plugin.yaml. Reported on every event so the relay can
 # expose per-gateway compatibility state to the app (Settings > Notifications).
-PLUGIN_VERSION = "0.64.2"
+PLUGIN_VERSION = "0.65.0"
 PLUGIN_CAPABILITIES = [
     "approval-decisions",
     "clarify-loop",
@@ -57,6 +57,7 @@ def event_id(prefix: str, *parts: Any) -> str:
 # SESSION_KEY_MAX_BYTES), and so do the stores the dashboard loads by path
 # (calls_store, present_store, settings_store), which keep their own copy.
 SESSION_KEY_MAX_BYTES = 512
+_TITLE_LABEL = re.compile(r"^[a-z_]+(\.[a-z_]+){1,2}\Z")
 _SESSION_KEY_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -79,6 +80,8 @@ def push_event(
     profile: str = "default",
     title: str = "",
     body: str = "",
+    title_label: str = "",
+    session_title: str = "",
     decision: dict[str, Any] | None = None,
     call: dict[str, Any] | None = None,
     mode: str | None = None,
@@ -99,6 +102,15 @@ def push_event(
         event["title"] = _clean(title, 120)
     if body:
         event["body"] = _clean(body, 500)
+    # Conduit writes the title in its own language (#1144): `title_label`
+    # names which one (an event type, or `phone.<kind>`), and the chat's
+    # title rides on its own instead of glued into `title`. `title` stays for
+    # older apps and the relay.
+    if isinstance(title_label, str) and _TITLE_LABEL.match(title_label):
+        event["title_label"] = title_label
+    chat_title = _clean(session_title, 120) if isinstance(session_title, str) else ""
+    if chat_title:
+        event["session_title"] = chat_title
     # `decision` carries the structured card content that lets Conduit render
     # an answerable card from the push payload alone, without the one-shot
     # gateway stream event (which is missed while the app is backgrounded).
@@ -171,6 +183,9 @@ def sanitize_call(value: Any) -> dict[str, Any] | None:
     if not session_ids:
         return None
     call: dict[str, Any] = {"id": call_id, "kind": kind, "session_ids": session_ids[:4]}
+    if value.get("origin") == "alert":
+        # Hermes called on its own about a failed turn (alert calls).
+        call["origin"] = "alert"
     title = _clean(value.get("title") if isinstance(value.get("title"), str) else "", 120)
     if title:
         call["title"] = title
@@ -206,6 +221,10 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
     if event.get("type") == "phone.changes" and event.get("mode") in PHONE_CHANGE_MODES:
         # How the relay wakes the phone: routing, not content.
         redacted["mode"] = event["mode"]
+    label = event.get("title_label")
+    if isinstance(label, str) and _TITLE_LABEL.match(label):
+        # Which title the phone writes: not content, so it stays.
+        redacted["title_label"] = label
     decision = sanitize_decision(event.get("decision")) if event.get("decision") is not None else {}
     if decision.get("kind") == "approval":
         # Unknown labels never transit; fall back to the always-valid subset
@@ -238,7 +257,7 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
     if call:
         # The job's title and the reason are chat content; its id, outcome
         # and sessions route.
-        redacted["call"] = {key: call[key] for key in ("id", "kind", "session_ids")}
+        redacted["call"] = {key: call[key] for key in ("id", "kind", "session_ids", "origin") if key in call}
     locate = event.get("locate") if event.get("type") == "location.requested" else None
     locate_id = locate.get("id") if isinstance(locate, dict) else None
     if isinstance(locate_id, str) and _LOCATE_ID.match(locate_id):

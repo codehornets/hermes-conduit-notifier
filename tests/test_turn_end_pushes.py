@@ -209,6 +209,25 @@ def test_a_background_task_that_outlives_its_turn_notifies(pushed):
     assert _types(pushed) == ["background_task.finished"]
 
 
+@pytest.mark.parametrize("status, label, body", [
+    ("completed", "background_task.finished", None),
+    (None, "background_task.finished", None),
+    ("failed", None, "A delegated task failed."),
+    ("timeout", None, "A delegated task timeout."),
+])
+def test_a_summaryless_background_task_lets_the_phone_word_only_a_finish(pushed, status, label, body):
+    # Conduit writes a finish's title and line in its own language (#1144);
+    # any other ending keeps the host's words, which say how it ended.
+    plugin._pre_llm_call(session_id="p", turn_id="t")
+    plugin._on_session_end(session_id="p", turn_id="t", completed=True, failed=False, interrupted=False)
+    plugin._subagent_start(child_session_id="c")
+    plugin._subagent_stop(parent_session_id="p", parent_turn_id="t", child_session_id="c",
+                          **({"child_status": status} if status else {}))
+    [event] = pushed
+    assert event.get("title_label") == label
+    assert event.get("body") == body
+
+
 def test_a_subagent_without_a_parent_turn_id_notifies(pushed):
     plugin._pre_llm_call(session_id="p", turn_id="t")
     _subagent(parent_turn="")

@@ -1897,3 +1897,13 @@ def test_voice_lists_alarms_and_contacts_reads_once_shared(client):
     status = _voice_read(client, handset, "conduit_phone", {"action": "status"}, call_id="voice-00000004")
     assert status["error"] == "not_shared"
     assert phone.PhoneStore(client.home).changes(20) == []
+
+
+def test_every_change_kind_names_a_title_label_conduit_reads():
+    # A kind the label pattern drops would leave the phone with the host's
+    # English title (#1144).
+    events = sys.modules["conduit_push.events"]
+    store = sys.modules["conduit_push.phone_store"]
+    for kind in store.CHANGE_KINDS:
+        assert events._TITLE_LABEL.match(f"phone.{kind}"), kind
+        assert events._TITLE_LABEL.match(f"phone.auto.{kind}"), kind

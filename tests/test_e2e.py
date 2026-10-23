@@ -464,3 +464,21 @@ def test_provisioning_is_rate_limited(state_file):
 def test_open_event_reports_malformed_envelopes_as_e2e_errors(outgoing):
     with pytest.raises(e2e.E2EError):
         e2e.open_event(outgoing, _keys(), installation_id=INSTALLATION, gateway_id=GATEWAY)
+
+
+def test_the_title_label_and_chat_title_ride_inside_the_envelope():
+    keys = _keys()
+    event = {
+        "event_id": "approval:1",
+        "type": "approval.needed",
+        "session_id": "sess-1",
+        "title": "Approval needed · Quarterly numbers",
+        "title_label": "approval.needed",
+        "session_title": "Quarterly numbers",
+    }
+    sealed = e2e.seal_event(event, keys, installation_id=INSTALLATION, gateway_id=GATEWAY, now=1_760_000_000)
+    assert "Quarterly numbers" not in json.dumps(sealed)
+    assert "title_label" not in sealed and "session_title" not in sealed
+    inner = e2e.open_event(sealed, keys, installation_id=INSTALLATION, gateway_id=GATEWAY)
+    assert inner["title_label"] == "approval.needed"
+    assert inner["session_title"] == "Quarterly numbers"

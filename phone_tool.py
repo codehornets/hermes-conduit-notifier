@@ -528,8 +528,16 @@ def _nudge(change: dict[str, Any], profile: str) -> None:
     try:
         auto = change["auto"]
         title = _AUTO_TITLES.get(change["kind"], "Hermes has a change for you") if auto else _TITLES[change["kind"]]
+        # Conduit writes the title in its own language from the label (#1144).
+        if not auto:
+            label = f"phone.{change['kind']}"
+        elif change["kind"] in _AUTO_TITLES:
+            label = f"phone.auto.{change['kind']}"
+        else:
+            label = "phone.change"
         client.enqueue(push_event("phone.changes", identifier=f"phone:{change['id']}", profile=profile,
-                                  title=title, body=change["summary"], mode="background" if auto else "alert"))
+                                  title=title, title_label=label, body=change["summary"],
+                                  mode="background" if auto else "alert"))
     except Exception:  # noqa: BLE001
         logger.warning("conduit_push: could not nudge the phone about a calendar change", exc_info=True)
 

@@ -51,7 +51,7 @@ MAX_CT_CHARS = 2600
 # Fields that carry content. Everything else on an event stays visible to the
 # relay because it routes on it.
 INNER_FIELDS = ("title", "body", "session_id", "profile", "gateway", "stored_session_id", "decision", "call",
-                "locate", "maps")
+                "locate", "maps", "title_label", "session_title")
 
 KID_PATTERN = re.compile(r"^[0-9a-f]{32}\Z")
 _B64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]*\Z")
@@ -242,7 +242,7 @@ def seal_event(
     if envelope is None:
         # Only routing survives; the phone shows the generic banner.
         inner = {key: value for key, value in inner.items() if key in ("session_id", "profile", "stored_session_id", "call",
-                                                                     "locate")}
+                                                                     "locate", "maps")}
         envelope = attempt(inner)
     if envelope is None:
         raise E2EError("the event does not fit an encrypted push")

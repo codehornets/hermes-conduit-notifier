@@ -499,3 +499,61 @@ def test_a_call_carries_why_hermes_calls_and_redaction_drops_it():
     assert sanitize_call({**CALL, "kind": "question"})["kind"] == "question"
     assert sanitize_call({**CALL, "reason": 5}).get("reason") is None
     assert "reason" not in redact_event(event)["call"]
+
+
+def test_push_event_names_its_title_and_sends_the_chat_title_on_its_own():
+    # Conduit writes the title in its own language (#1144).
+    event = push_event(
+        "approval.needed",
+        identifier="approval:1",
+        session_id="sess-1",
+        title="Approval needed · Deploy",
+        title_label="approval.needed",
+        session_title="Deploy\nthe app " + "x" * 200,
+    )
+    assert event["title_label"] == "approval.needed"
+    assert event["session_title"].startswith("Deploy the app ") and len(event["session_title"]) == 120
+    assert event["title"] == "Approval needed · Deploy"
+    assert push_event("phone.changes", identifier="phone:1", title_label="phone.auto.add_event")["title_label"] == (
+        "phone.auto.add_event")
+
+
+@pytest.mark.parametrize("label", ["", "approval", "Approval.Needed", "a.b.c.d", "phone.add event", 5])
+def test_push_event_drops_a_malformed_title_label(label):
+    assert "title_label" not in push_event("approval.needed", identifier="approval:1", title_label=label)
+
+
+def test_redact_event_keeps_the_title_label_but_not_the_chat_title():
+    event = push_event(
+        "turn.failed",
+        identifier="failure:1",
+        session_id="sess-1",
+        title="Turn failed · Secret plan",
+        title_label="turn.failed",
+        session_title="Secret plan",
+    )
+    redacted = redact_event(event)
+    assert redacted["title_label"] == "turn.failed"
+    assert "session_title" not in redacted
+    assert "title" not in redacted
+
+
+def test_an_alert_call_says_so_and_keeps_it_through_redaction():
+    event = push_event(
+        "call.requested",
+        identifier="call:0123456789abcdef01234567",
+        session_id="rt-1",
+        title="Hermes wants to talk",
+        title_label="call.requested",
+        body="Hermes ran into a problem with your request.",
+        call={**CALL, "kind": "failed", "origin": "alert"},
+    )
+    assert event["call"]["origin"] == "alert"
+    assert redact_event(event)["call"]["origin"] == "alert"
+    assert "origin" not in sanitize_call({**CALL, "origin": "something else"})
+
+
+def test_redact_event_drops_a_hand_built_malformed_title_label():
+    event = {"event_id": "approval:1", "type": "approval.needed", "title_label": "approval.needed\nINJECTED"}
+    assert "title_label" not in redact_event(event)
+    assert "session_title" not in push_event("approval.needed", identifier="approval:1", session_title=5)

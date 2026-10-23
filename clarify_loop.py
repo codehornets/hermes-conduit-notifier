@@ -27,7 +27,7 @@ import uuid
 from typing import Any, Callable
 
 from . import calls, client
-from .session_titles import titled
+from .session_titles import title as chat_title, titled
 from .events import (
     card_choice_labels,
     clarify_decision,
@@ -128,6 +128,8 @@ def middleware(is_child_session: Callable[[str], bool] | None = None, **kwargs: 
         session_id=session_id,
         profile=profile,
         title=titled("Input needed", session_id),
+        title_label="input.needed",
+        session_title=chat_title(session_id),
         body=question,
         decision=clarify_decision(
             request_id=request_id,

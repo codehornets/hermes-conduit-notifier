@@ -376,6 +376,8 @@ def call_event(watch: dict[str, Any], outcome: str, *, session_id: str, profile:
     call = {"id": watch["id"], "kind": outcome, "title": title, "session_ids": watch["session_ids"]}
     if reason:
         call["reason"] = reason
+    if watch.get("origin") == "alert":
+        call["origin"] = "alert"
     return push_event(
         "call.requested",
         # From the watch: a resend of this call is the same event to the relay.
@@ -383,6 +385,7 @@ def call_event(watch: dict[str, Any], outcome: str, *, session_id: str, profile:
         session_id=session_id,
         profile=profile,
         title=CALL_TITLE,
+        title_label="call.requested",
         body=body,
         call=call,
     )
