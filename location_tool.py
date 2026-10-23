@@ -375,7 +375,8 @@ def _no_distance_note(view: dict[str, Any], fix: dict[str, Any], place: dict[str
         if at.get("private") or "places" not in (sharing.get("talking_precision"), sharing.get("background_precision")):
             return "Distances aren't shared for the last fix, which was taken at a place the user keeps private."
         return "Distances aren't shared at the 'places only' detail the user chose."
-    hint = LOCATE_HINT if sharing.get("background") else ""
+    # A lookup is a background fix: at places only it carries no distances either.
+    hint = LOCATE_HINT if sharing.get("background") and sharing.get("background_precision") != "places" else ""
     if not (fix.get("distances_m") or {}):
         return ("The last fix carried no distances, which the phone leaves out of some fixes (a background "
                 f"arrival or a move usually has none).{hint} Otherwise say where they were without a distance.")

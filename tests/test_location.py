@@ -580,6 +580,8 @@ def test_no_distance_offers_locate_only_with_background_sharing(home):
     _shared(home, sharing=sharing(background=False), fix=fix(distances_m={}))
     note = _call({"action": "distance_to", "place": "Home"})["note"]
     assert "locate" not in note and "without a distance" in note
+    _shared(home, sharing=sharing(background_precision="places"), fix=fix(distances_m={}))
+    assert "locate" not in _call({"action": "distance_to", "place": "Home"})["note"]
 
 
 def test_a_spoken_no_distance_note_leaves_out_locate():
