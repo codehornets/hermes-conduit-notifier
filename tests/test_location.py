@@ -571,6 +571,9 @@ def test_no_distance_at_a_private_place_does_not_blame_the_setting(home):
     answer = _call({"action": "distance_to", "place": "Home"})
     assert answer["error"] == "no_distance"
     assert "private" in answer["note"] and "the user chose" not in answer["note"]
+    # Even when one layer is places only, a fix at a private place says so.
+    _shared(home, sharing=sharing(background_precision="places"), fix=fix(place_id="p_clinic"))
+    assert "private" in _call({"action": "distance_to", "place": "Home"})["note"]
 
 
 def test_no_distance_offers_locate_only_with_background_sharing(home):

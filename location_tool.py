@@ -370,10 +370,11 @@ def _no_distance_note(view: dict[str, Any], fix: dict[str, Any], place: dict[str
     those sent the reader chasing a setting the user never touched."""
     sharing = view["sharing"]
     if fix["precision"] == "places":
-        if "places" in (sharing.get("talking_precision"), sharing.get("background_precision")):
-            return "Distances aren't shared at the 'places only' detail the user chose."
         # The store also stamps a fix taken at a private place as places only.
-        return "Distances aren't shared for the last fix, which was taken at a place the user keeps private."
+        at = view["places"].get(fix.get("place_id")) or {}
+        if at.get("private") or "places" not in (sharing.get("talking_precision"), sharing.get("background_precision")):
+            return "Distances aren't shared for the last fix, which was taken at a place the user keeps private."
+        return "Distances aren't shared at the 'places only' detail the user chose."
     hint = LOCATE_HINT if sharing.get("background") else ""
     if not (fix.get("distances_m") or {}):
         return ("The last fix carried no distances, which the phone leaves out of some fixes (a background "
