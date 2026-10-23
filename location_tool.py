@@ -227,9 +227,10 @@ def voice_description() -> str:
             + VOICE_NOTE)
 
 
-def voice_shared(store: LocationStore) -> bool:
-    """Whether any device has shared location here (the voice list offers the tool)."""
-    return store.snapshot() is not None
+def voice_shared(store: LocationStore, device_id: str | None = None) -> bool:
+    """Whether any device (or ``device_id``, the calling one) has shared
+    location here (the voice list offers the tool)."""
+    return store.snapshot(device_id) is not None
 
 
 def voice_parameters() -> dict[str, Any]:

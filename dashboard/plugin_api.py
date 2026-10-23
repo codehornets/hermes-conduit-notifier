@@ -106,6 +106,9 @@ REQUEST_TIMEOUT_S = 15.0
 # bursts, but stop a looping client from burning the host's Gemini quota.
 MINT_LIMIT = 20
 MINT_WINDOW_S = 60.0
+# Keys one limiter tracks at once. Keys are profile names a scope accepted,
+# so this only bites a host with that many profiles busy in one window.
+LIMITER_MAX_KEYS = 256
 # A voice lookup is one query; cap a looping client well above that.
 SEARCH_LIMIT = 30
 SEARCH_WINDOW_S = 60.0
@@ -385,11 +388,13 @@ class _MintLimiter:
         window_s: float,
         clock: Callable[[], float] = time.monotonic,
         message: str = "Too many Gemini Live token requests; try again shortly",
+        max_keys: int = LIMITER_MAX_KEYS,
     ) -> None:
         self.limit = limit
         self.message = message
         self.window_s = window_s
         self.clock = clock
+        self.max_keys = max_keys
         self._mints: Dict[str, deque] = {}
         self._lock = threading.Lock()
 
@@ -403,6 +408,10 @@ class _MintLimiter:
             for stale in [k for k, q in self._mints.items() if not q or now - q[-1] >= self.window_s]:
                 del self._mints[stale]
             if limit <= 0:
+                raise TokenError(429, self.message)
+            # A full map turns new keys away, so it stays bounded whatever
+            # callers send; the dashboard's own profile ("") always fits.
+            if key and key not in self._mints and len(self._mints) >= self.max_keys:
                 raise TokenError(429, self.message)
             mints = self._mints.setdefault(key, deque())
             while mints and now - mints[0] >= self.window_s:
@@ -475,6 +484,32 @@ async def _run_scoped(
             return fn()
 
     return await asyncio.get_running_loop().run_in_executor(executor, scoped)
+
+
+def _limited(limiter: "_MintLimiter", profile: Optional[str], fn: Callable[[], _Scoped]) -> Callable[[], _Scoped]:
+    """``fn`` behind a slot of ``limiter``, for ``_run_scoped``: the slot is
+    taken inside the scope, so a ?profile= the scope refuses gets no bucket."""
+    def run() -> _Scoped:
+        limiter.acquire(_limiter_key(profile))
+        return fn()
+
+    return run
+
+
+async def _scoped_acquire(limiter: "_MintLimiter", profile: Optional[str]) -> None:
+    """A slot of ``limiter`` taken before a route reads its body, once
+    Hermes' scope has accepted ``profile`` (an unknown one is refused there
+    and never gets a bucket)."""
+    try:
+        await _run_scoped(profile, lambda: limiter.acquire(_limiter_key(profile)))
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        # A broken scope is the host's failure, named like the routes' own.
+        raise _unexpected("profile check", exc, feature="Conduit")
 
 
 _search_executor = ThreadPoolExecutor(max_workers=SEARCH_WORKERS, thread_name_prefix="conduit-web-search")
@@ -1174,7 +1209,12 @@ GPT_LIVE_PERSONA = (
 )
 
 _gpt_live_executor = ThreadPoolExecutor(max_workers=GPT_LIVE_WORKERS, thread_name_prefix="conduit-gpt-live")
-_gpt_live_status_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="conduit-gpt-live-status")
+GPT_LIVE_STATUS_WORKERS = 2
+_gpt_live_status_executor = ThreadPoolExecutor(max_workers=GPT_LIVE_STATUS_WORKERS,
+                                               thread_name_prefix="conduit-gpt-live-status")
+# A timed-out status read keeps its worker until Hermes answers, so a check
+# finding every worker busy is turned away (503) rather than queued behind them.
+_gpt_live_status_slots = threading.BoundedSemaphore(GPT_LIVE_STATUS_WORKERS)
 _gpt_live_limiter = _MintLimiter(GPT_LIVE_LIMIT, GPT_LIVE_WINDOW_S,
                                  message="Too many GPT-Live session requests; try again shortly")
 _gpt_live_api_daily = _MintLimiter(GPT_LIVE_API_DAILY_CALLS, GPT_LIVE_DAY_S,
@@ -1755,9 +1795,35 @@ def create_gpt_live_session(
 @router.get("/gpt-live/status")
 async def get_gpt_live_status(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
+    # The slot is freed exactly once: by the read when it ran, else by this
+    # request (a read it gave up on before it started never runs).
+    state = {"started": False, "abandoned": False}
+    state_lock = threading.Lock()
+
+    def status() -> Dict[str, Any]:
+        with state_lock:
+            if state["abandoned"]:
+                return {}
+            state["started"] = True
+        try:
+            return gpt_live_status()
+        finally:
+            _gpt_live_status_slots.release()
+
+    if not _gpt_live_status_slots.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="GPT-Live status is still waiting on Hermes; try again shortly",
+                            headers={"Cache-Control": "no-store"})
     try:
-        return {"ok": True, **(await asyncio.wait_for(
-            _run_scoped(profile, gpt_live_status, _gpt_live_status_executor), timeout=GPT_LIVE_REQUEST_TIMEOUT_S))}
+        try:
+            result = await asyncio.wait_for(_run_scoped(profile, status, _gpt_live_status_executor),
+                                            timeout=GPT_LIVE_REQUEST_TIMEOUT_S)
+        except BaseException:
+            with state_lock:
+                if not state["started"]:
+                    state["abandoned"] = True
+                    _gpt_live_status_slots.release()
+            raise
+        return {"ok": True, **result}
     except asyncio.TimeoutError:
         logger.warning("GPT-Live status for Conduit timed out after %ss", GPT_LIVE_REQUEST_TIMEOUT_S)
         raise HTTPException(status_code=504, detail="GPT-Live status timed out", headers={"Cache-Control": "no-store"})
@@ -2846,7 +2912,10 @@ LOCAL_LIVE_VERIFIED_TTL_S = 30.0
 # naming one profile cost no less than they did.
 LOCAL_LIVE_KEY_CHECK_LIMIT = 60
 LOCAL_LIVE_KEY_CHECK_TOTAL_LIMIT = 300
-_local_live_key_check_limiter = _MintLimiter(LOCAL_LIVE_KEY_CHECK_LIMIT, 60.0, message="Too many Local Live key checks")
+# Its keys are bounded by the total budget below (a refused check gives its
+# slot back), so a flood of made-up profile names never fills it.
+_local_live_key_check_limiter = _MintLimiter(LOCAL_LIVE_KEY_CHECK_LIMIT, 60.0, message="Too many Local Live key checks",
+                                             max_keys=LOCAL_LIVE_KEY_CHECK_TOTAL_LIMIT + 1)
 _local_live_key_check_total_limiter = _MintLimiter(LOCAL_LIVE_KEY_CHECK_TOTAL_LIMIT, 60.0,
                                                    message="Too many Local Live key checks")
 
@@ -3357,9 +3426,18 @@ async def post_local_live_key(response: Response, profile: Optional[str] = None)
     if not _local_live_profile_can_carry_key(profile):
         raise HTTPException(status_code=400, detail=LOCAL_LIVE_PROFILE_NAME_REASON, headers={"Cache-Control": "no-store"})
     try:
-        key = await _run_scoped(profile, lambda: local_live_key(profile, rotate=True), _speech_server_executor)
+        key = await asyncio.wait_for(
+            _run_scoped(profile, lambda: local_live_key(profile, rotate=True), _speech_server_executor),
+            timeout=SPEECH_SERVER_SETUP_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        # The worker can't be stopped: the rotation may still land, which a
+        # retry (or the status route's key) then picks up.
+        raise HTTPException(status_code=504, detail="Local Live key rotation timed out", headers={"Cache-Control": "no-store"})
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
     except Exception as exc:
         raise _unexpected("key", exc, feature="Local Live")
     return {"ok": True, "api_key": key}
@@ -6247,7 +6325,8 @@ async def get_e2e(response: Response, profile: Optional[str] = None) -> Dict[str
         return {"ok": True, **(await _run_scoped(profile, e2e_status))}
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
-    except HTTPException:
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
         raise
     except Exception as exc:
         raise _unexpected("status", exc, feature="Encrypted notifications")
@@ -6258,12 +6337,13 @@ async def post_e2e(request: Request, response: Response, profile: Optional[str] 
     # The body is a secret: never cached on the way back either.
     response.headers["Cache-Control"] = "no-store"
     try:
-        _e2e_limiter.acquire(_limiter_key(profile))
+        await _scoped_acquire(_e2e_limiter, profile)
         body = await _read_json_body(request, E2E_MAX_BODY_BYTES)
         return {"ok": True, **(await _run_scoped(profile, lambda: provision_e2e(body)))}
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
-    except HTTPException:
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
         raise
     except Exception as exc:
         raise _unexpected("key", exc, feature="Encrypted notifications")
@@ -6568,8 +6648,7 @@ async def _cron_route(profile: Optional[str], response: Response, fn: Callable[[
                       route: str, feature: str = "Cron notifications") -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     try:
-        _cron_limiter.acquire(_limiter_key(profile))
-        return {"ok": True, **(await _run_scoped(profile, fn))}
+        return {"ok": True, **(await _run_scoped(profile, _limited(_cron_limiter, profile, fn)))}
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     except HTTPException as exc:
@@ -6692,8 +6771,8 @@ async def put_chat_on_screen(request: Request, response: Response, profile: Opti
     no_store = {"Cache-Control": "no-store"}
     try:
         body = await _read_json_body(request, ON_SCREEN_MAX_BODY_BYTES)
-        _on_screen_limiter.acquire(_limiter_key(profile))
-        return {"ok": True, **(await _run_scoped(profile, lambda: set_chat_on_screen(body)))}
+        return {"ok": True, **(await _run_scoped(
+            profile, _limited(_on_screen_limiter, profile, lambda: set_chat_on_screen(body))))}
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers=no_store)
     except HTTPException as exc:
@@ -6844,8 +6923,7 @@ async def _calls_route(profile: Optional[str], response: Response, fn: Callable[
                        route: str) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     try:
-        _calls_limiter.acquire(_limiter_key(profile))
-        return {"ok": True, **(await _run_scoped(profile, fn))}
+        return {"ok": True, **(await _run_scoped(profile, _limited(_calls_limiter, profile, fn)))}
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     except HTTPException as exc:
@@ -6947,8 +7025,8 @@ async def put_conduit_settings(request: Request, response: Response, profile: Op
     response.headers["Cache-Control"] = "no-store"
     body = await _read_json_body(request, CONDUIT_SETTINGS_MAX_BODY_BYTES)
     try:
-        _conduit_settings_limiter.acquire(_limiter_key(profile))
-        return {"ok": True, **(await _run_scoped(profile, lambda: sync_conduit_settings(body)))}
+        return {"ok": True, **(await _run_scoped(
+            profile, _limited(_conduit_settings_limiter, profile, lambda: sync_conduit_settings(body))))}
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     except HTTPException as exc:
@@ -7011,8 +7089,7 @@ def conduit_prefs(action: str, body: Any = None, *, replace: bool = False) -> Di
 
 async def _prefs_route(profile: Optional[str], run: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
     try:
-        _conduit_prefs_limiter.acquire(_limiter_key(profile))
-        return {"ok": True, **(await _run_scoped(profile, run))}
+        return {"ok": True, **(await _run_scoped(profile, _limited(_conduit_prefs_limiter, profile, run)))}
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     except HTTPException as exc:
@@ -7296,8 +7373,8 @@ async def post_present_exchange(request: Request, response: Response, profile: O
     response.headers["Cache-Control"] = "no-store"
     body = await _read_json_body(request, PRESENT_MAX_BODY_BYTES)
     try:
-        _present_exchange_limiter.acquire(_limiter_key(profile))
-        return {"ok": True, **(await _run_scoped(profile, lambda: exchange_present(body)))}
+        return {"ok": True, **(await _run_scoped(
+            profile, _limited(_present_exchange_limiter, profile, lambda: exchange_present(body))))}
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     except HTTPException as exc:
@@ -7412,10 +7489,7 @@ async def get_health_status(response: Response, profile: Optional[str] = None,
 @router.post("/health/key")
 async def post_health_key(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    try:
-        _health_key_limiter.acquire(_limiter_key(profile))
-    except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    await _scoped_acquire(_health_key_limiter, profile)
     body = await _read_json_body(request, HEALTH_MAX_KEY_BODY_BYTES)
     return await _health_route(response, profile, lambda: _health_call(lambda store: store.register_key(body)), "key")
 
@@ -7423,20 +7497,14 @@ async def post_health_key(request: Request, response: Response, profile: Optiona
 @router.post("/health/ingest")
 async def post_health_ingest(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    try:
-        _health_ingest_limiter.acquire(_limiter_key(profile))
-    except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    await _scoped_acquire(_health_ingest_limiter, profile)
     body = await _read_json_body(request, HEALTH_MAX_INGEST_BODY_BYTES)
     return await _health_route(response, profile, lambda: _health_call(lambda store: store.ingest(body)), "upload")
 
 
 @router.post("/health/wipe")
 async def post_health_wipe(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
-    try:
-        _health_wipe_limiter.acquire(_limiter_key(profile))
-    except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    await _scoped_acquire(_health_wipe_limiter, profile)
     body = await _read_json_body(request, HEALTH_MAX_KEY_BODY_BYTES)
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Expected a JSON object", headers={"Cache-Control": "no-store"})
@@ -7508,14 +7576,19 @@ def _voice_tool_modules() -> Dict[str, Tuple[Any, Any, Any, str]]:
     return modules
 
 
-def _voice_tool_entries() -> Dict[str, Dict[str, Any]]:
-    """Voice-readable tools by name: their schema, and which sealed key they use."""
+def _voice_tool_entries(devices: Optional[Dict[str, Optional[str]]] = None) -> Dict[str, Dict[str, Any]]:
+    """Voice-readable tools by name: their schema, and which sealed key they
+    use. ``devices`` names the calling device per sealed key ("health",
+    "location", "phone"): a tool is then offered as that device shares it,
+    since its reads see that device alone; without one, as any device does."""
+    devices = devices or {}
     entries: Dict[str, Dict[str, Any]] = {}
     for name, (tool, store_class, _, key) in _voice_tool_modules().items():
         # A store that can't be read (damaged file) hides that tool alone.
         try:
             store = store_class(_calls_home())
-            if not tool.voice_shared(store):
+            device_id = (devices.get(key) or "").strip()
+            if not (tool.voice_shared(store, device_id) if device_id else tool.voice_shared(store)):
                 continue
             entries[name] = {
                 "key": key,
@@ -7528,7 +7601,7 @@ def _voice_tool_entries() -> Dict[str, Dict[str, Any]]:
     # A problem there takes only those tools off the list.
     try:
         phone = _plugin_package_module("phone_tool")
-        offered = phone.voice_tools(phone.PhoneStore(_calls_home()))
+        offered = phone.voice_tools(phone.PhoneStore(_calls_home()), (devices.get("phone") or "").strip() or None)
     except Exception:  # noqa: BLE001
         logger.warning("Conduit voice tools: the calendar and phone tools couldn't be listed", exc_info=True)
         offered = {}
@@ -7537,8 +7610,8 @@ def _voice_tool_entries() -> Dict[str, Dict[str, Any]]:
     return entries
 
 
-def voice_tools_list() -> Dict[str, Any]:
-    return {"tools": [{"name": name, **entry} for name, entry in _voice_tool_entries().items()]}
+def voice_tools_list(devices: Optional[Dict[str, Optional[str]]] = None) -> Dict[str, Any]:
+    return {"tools": [{"name": name, **entry} for name, entry in _voice_tool_entries(devices).items()]}
 
 
 def voice_tools_call(envelope: Any) -> Dict[str, Any]:
@@ -7617,22 +7690,21 @@ async def _voice_tools_route(response: Response, profile: Optional[str], fn: Cal
 
 
 @router.get("/voice-tools")
-async def get_voice_tools(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+async def get_voice_tools(response: Response, profile: Optional[str] = None, health_device: Optional[str] = None,
+                          location_device: Optional[str] = None,
+                          phone_device: Optional[str] = None) -> Dict[str, Any]:
+    """The tools a call may use. Conduit names its own device in each store
+    (``*_device``), so it's offered only what that device's reads can answer."""
     response.headers["Cache-Control"] = "no-store"
-    try:
-        _voice_tools_limiter.acquire(_limiter_key(profile))
-    except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
-    return await _voice_tools_route(response, profile, voice_tools_list, "list")
+    await _scoped_acquire(_voice_tools_limiter, profile)
+    devices = {"health": health_device, "location": location_device, "phone": phone_device}
+    return await _voice_tools_route(response, profile, lambda: voice_tools_list(devices), "list")
 
 
 @router.post("/voice-tools/call")
 async def post_voice_tools_call(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    try:
-        _voice_tools_limiter.acquire(_limiter_key(profile))
-    except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    await _scoped_acquire(_voice_tools_limiter, profile)
     body = await _read_json_body(request, VOICE_TOOLS_MAX_BODY_BYTES)
     return await _voice_tools_route(response, profile, lambda: voice_tools_call(body), "call")
 
@@ -7708,13 +7780,6 @@ async def _location_route(response: Response, profile: Optional[str], fn: Callab
         raise _unexpected(name, exc, feature="Location sharing")
 
 
-def _location_limit(limiter: Any, profile: Optional[str]) -> None:
-    try:
-        limiter.acquire(_limiter_key(profile))
-    except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
-
-
 def _start_rule_jobs(fired: Any) -> list:
     """Starts the scheduled job of each place rule an ingest set off; runs
     inside the profile's scope. The rule already counts as run today, so a
@@ -7782,7 +7847,7 @@ async def get_location_status(response: Response, profile: Optional[str] = None,
 @router.post("/location/key")
 async def post_location_key(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    _location_limit(_location_key_limiter, profile)
+    await _scoped_acquire(_location_key_limiter, profile)
     body = await _read_json_body(request, LOCATION_MAX_KEY_BODY_BYTES)
     return await _location_route(response, profile,
                                  lambda: _location_call(lambda store: store.register_key(body)), "key")
@@ -7792,7 +7857,7 @@ async def post_location_key(request: Request, response: Response, profile: Optio
 async def post_location_ingest(request: Request, response: Response,
                                profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    _location_limit(_location_ingest_limiter, profile)
+    await _scoped_acquire(_location_ingest_limiter, profile)
     body = await _read_json_body(request, LOCATION_MAX_INGEST_BODY_BYTES)
     return await _location_route(response, profile, lambda: _location_ingest(body), "upload")
 
@@ -7810,7 +7875,7 @@ _location_maps_limiter = _MintLimiter(LOCATION_MAPS_LIMIT, LOCATION_MAPS_WINDOW_
 @router.get("/location/maps/{request_id}")
 async def get_location_maps(request_id: str, response: Response, profile: Optional[str] = None,
                             device_id: Optional[str] = None, kid: Optional[str] = None) -> Dict[str, Any]:
-    _location_limit(_location_maps_limiter, profile)
+    await _scoped_acquire(_location_maps_limiter, profile)
     return await _location_route(response, profile, lambda: _location_call(
         lambda store: store.maps_request(request_id, device_id, kid)), "maps request")
 
@@ -7819,7 +7884,7 @@ async def get_location_maps(request_id: str, response: Response, profile: Option
 async def post_location_maps(request_id: str, request: Request, response: Response,
                              profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    _location_limit(_location_maps_limiter, profile)
+    await _scoped_acquire(_location_maps_limiter, profile)
     body = await _read_json_body(request, LOCATION_MAX_MAPS_BODY_BYTES)
     return await _location_route(response, profile, lambda: _location_call(
         lambda store: store.answer_maps(request_id, body)), "maps answer")
@@ -7842,13 +7907,13 @@ async def get_location_rules(response: Response, profile: Optional[str] = None) 
 
 @router.delete("/location/rules/{rule_id}")
 async def delete_location_rule(rule_id: str, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
-    _location_limit(_location_wipe_limiter, profile)
+    await _scoped_acquire(_location_wipe_limiter, profile)
     return await _location_route(response, profile, lambda: _location_remove_rule(rule_id), "rule delete")
 
 
 @router.post("/location/wipe")
 async def post_location_wipe(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
-    _location_limit(_location_wipe_limiter, profile)
+    await _scoped_acquire(_location_wipe_limiter, profile)
     body = await _read_json_body(request, LOCATION_MAX_KEY_BODY_BYTES)
     no_store = {"Cache-Control": "no-store"}
     if not isinstance(body, dict):
@@ -7931,13 +7996,6 @@ async def _phone_route(response: Response, profile: Optional[str], fn: Callable[
         raise _unexpected(name, exc, feature="Calendar sharing")
 
 
-def _phone_limit(limiter: Any, profile: Optional[str]) -> None:
-    try:
-        limiter.acquire(_limiter_key(profile))
-    except TokenError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
-
-
 @router.get("/phone/status")
 async def get_phone_status(response: Response, profile: Optional[str] = None,
                            device_id: Optional[str] = None) -> Dict[str, Any]:
@@ -7948,7 +8006,7 @@ async def get_phone_status(response: Response, profile: Optional[str] = None,
 @router.post("/phone/key")
 async def post_phone_key(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    _phone_limit(_phone_key_limiter, profile)
+    await _scoped_acquire(_phone_key_limiter, profile)
     body = await _read_json_body(request, PHONE_MAX_KEY_BODY_BYTES)
     return await _phone_route(response, profile, lambda: _phone_call(lambda store: store.register_key(body)), "key")
 
@@ -7956,7 +8014,7 @@ async def post_phone_key(request: Request, response: Response, profile: Optional
 @router.post("/phone/ingest")
 async def post_phone_ingest(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    _phone_limit(_phone_ingest_limiter, profile)
+    await _scoped_acquire(_phone_ingest_limiter, profile)
     body = await _read_json_body(request, PHONE_MAX_INGEST_BODY_BYTES)
     return await _phone_route(response, profile, lambda: _phone_call(lambda store: store.ingest(body)), "upload")
 
@@ -7964,14 +8022,14 @@ async def post_phone_ingest(request: Request, response: Response, profile: Optio
 @router.post("/phone/exchange")
 async def post_phone_exchange(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
-    _phone_limit(_phone_exchange_limiter, profile)
+    await _scoped_acquire(_phone_exchange_limiter, profile)
     body = await _read_json_body(request, PHONE_MAX_EXCHANGE_BODY_BYTES)
     return await _phone_route(response, profile, lambda: _phone_call(lambda store: store.exchange(body)), "exchange")
 
 
 @router.post("/phone/wipe")
 async def post_phone_wipe(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
-    _phone_limit(_phone_wipe_limiter, profile)
+    await _scoped_acquire(_phone_wipe_limiter, profile)
     body = await _read_json_body(request, PHONE_MAX_KEY_BODY_BYTES)
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Expected a JSON object", headers={"Cache-Control": "no-store"})
@@ -14295,7 +14353,7 @@ async def get_artifacts(response: Response, profile: Optional[str] = None, befor
             _artifacts_slots.release()
 
     try:
-        _artifacts_limiter.acquire(_limiter_key(profile))
+        await _scoped_acquire(_artifacts_limiter, profile)
         if not _artifacts_slots.acquire(blocking=False):
             raise HTTPException(status_code=503, detail="Hermes is still reading artifacts; try again shortly",
                                 headers={"Cache-Control": "no-store"})
