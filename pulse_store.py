@@ -262,10 +262,19 @@ NOTICED = "noticed"
 # The report attempts split into such cards, newest last: their typed
 # ratings aren't read, so an item isn't counted twice.
 SPLIT_REPORTS = "split_reports"
+# The items_json of a split report's ratings row: it holds no ratings and takes none.
+SPLIT_ITEMS = '"split"'
 
 CARD_COLUMNS = ("kind", "item_id", "level", "title", "quote", "news", "why", "profile", "chat_id", "chat_title",
                 "message_id", "topic", "created_at")
 LESSON_COLUMNS = ("kind", "what", "value", "profile", "chat_id", "card_id", "cause", "created_at")
+
+
+def _listed(conn: Any, key: str) -> list[str]:
+    """A list setting's entries, as strings ([] when unset or not a list)."""
+    found = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+    value = json.loads(found["value_json"]) if found else None
+    return [str(entry) for entry in value] if isinstance(value, list) else []
 
 
 def _check_columns(row: dict, allowed: tuple) -> None:
@@ -468,10 +477,15 @@ class PulseStore:
     # Report ratings -------------------------------------------------------
 
     def set_ratings(self, attempt_id: str, items_json: str, ratings_json: str) -> bool:
-        """Stores a report's items and ratings; True when they changed."""
+        """Stores a report's items and ratings; True when they changed. A
+        report split into cards takes none: it's rated on its cards."""
         with _lock, self._connect() as conn:
+            if str(attempt_id) in _listed(conn, SPLIT_REPORTS):
+                return False
             row = conn.execute("SELECT items_json, ratings_json FROM report_ratings WHERE attempt_id=?",
                                (attempt_id,)).fetchone()
+            if row is not None and row["items_json"] == SPLIT_ITEMS:
+                return False
             if row is not None and (row["items_json"], row["ratings_json"]) == (items_json, ratings_json):
                 return False
             conn.execute(
@@ -777,23 +791,29 @@ class PulseStore:
         """Adds these cards in one transaction, all or none. With ``attempt``,
         it's appended to each list setting in ``marks`` (the last ``keep``)
         in the same write, so the mark can't be lost apart from the cards;
-        and an attempt the first of them already holds adds nothing (another
-        process got there first)."""
+        and an attempt any of them already holds adds nothing (another
+        process got there first). A report split into cards (SPLIT_REPORTS in
+        ``marks``) loses its typed ratings in the same write: it's rated on
+        its cards from then on, so an item counts once."""
         for row in rows:
             _check_columns(row, CARD_COLUMNS)
         with _lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                lists = {}
-                for key in marks if attempt else ():
-                    found = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
-                    value = json.loads(found["value_json"]) if found else None
-                    lists[key] = [str(entry) for entry in value] if isinstance(value, list) else []
-                if marks and attempt and attempt in lists[marks[0]]:
+                lists = {key: _listed(conn, key) for key in (marks if attempt else ())}
+                if marks and attempt and any(attempt in listed for listed in lists.values()):
                     conn.execute("ROLLBACK")
                     return []
                 ids = [int(conn.execute(f"INSERT INTO cards({', '.join(row)}) VALUES({', '.join('?' * len(row))})",
                                         tuple(row.values())).lastrowid) for row in rows]
+                if SPLIT_REPORTS in lists:
+                    # Its typed ratings go, and the row stays as a mark that
+                    # outlasts the trimmed list, so none are read back later.
+                    conn.execute(
+                        "INSERT INTO report_ratings(attempt_id, items_json, ratings_json, updated_at) "
+                        "VALUES(?, ?, '[]', ?) ON CONFLICT(attempt_id) DO UPDATE SET "
+                        "items_json=excluded.items_json, ratings_json='[]', updated_at=excluded.updated_at",
+                        (attempt, SPLIT_ITEMS, time.time()))
                 for key, value in lists.items():
                     conn.execute("INSERT INTO settings(key, value_json) VALUES(?, ?) "
                                  "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
