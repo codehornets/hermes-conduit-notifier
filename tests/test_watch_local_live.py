@@ -1328,3 +1328,135 @@ def test_a_resumed_chats_runner_knows_about_the_card_before_it_hears_hermes(call
     _run(scenario())
     # Both the first stream and the rejoin attached the listener last.
     assert attached == [(True, True), (True, True)]
+
+
+# --- A hung speech server, and a spent grant ------------------------------------
+
+
+def test_a_speech_server_that_stops_answering_ends_the_session_and_frees_its_slot(call, monkeypatch):
+    monkeypatch.setattr(api, "WATCH_AUDIO_UPSTREAM_QUIET_S", 0.3)
+    monkeypatch.setattr(api, "WATCH_AUDIO_UPSTREAM_QUIET_CHECK_S", 0.02)
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        watch = Watch()
+        assert (await _start(bridge, socket, watch))["type"] == "started"
+        upstream = call.speech.sockets[0]
+        # Answered, then a quiet stretch with nothing asked: a pause, not a hang.
+        await bridge._handle(watch.event({"type": "session.update", "session": {"type": "realtime"}}))
+        await _until(lambda: upstream.received)
+        upstream.push({"type": "session.updated"})
+        await _until(lambda: watch.events(socket, "session.updated"))
+        await bridge._handle(watch.seal(1, b"\x01\x00"))
+        await asyncio.sleep(0.6)
+        assert bridge.session is not None and not watch.events(socket, "error")
+        # Asked and never answered: the session ends and says so.
+        await bridge._handle(watch.event({"type": "response.create"}))
+        await _until(lambda: watch.events(socket, "ended"), timeout=3)
+        assert watch.events(socket, "error") == [{"type": "error", "code": "unreachable",
+                                                  "message": "The speech server stopped answering"}]
+        assert watch.events(socket, "ended")[-1]["reason"] == "error"
+        assert upstream.closed and bridge.session is None
+        assert bridge.slots.used == 0
+
+    _run(scenario())
+
+
+def test_a_hello_past_the_grants_streams_is_told_to_start_the_call_again(call, monkeypatch):
+    monkeypatch.setattr(api, "WATCH_AUDIO_STREAMS_PER_GRANT", 2)
+    monkeypatch.setattr(api, "WATCH_AUDIO_REFUSALS_PER_GRANT", 1)
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        first = Watch()
+        assert (await _start(bridge, socket, first))["type"] == "started"
+        assert (await _start(bridge, socket, Watch()))["type"] == "started"
+        spent = Watch()
+        refused = await _start(bridge, socket, spent)
+        assert refused == {"type": "error", "code": "streams_spent",
+                           "message": "This call can't reconnect to Hermes again. Start the call again."}
+        # The rejoin it stood for ended the call's session, and its start
+        # went nowhere.
+        assert bridge.session is None and bridge.stream is None
+        assert len(call.speech.sockets) == 2
+        # Past the refusals, and a spent id again: nothing more is sealed.
+        before = len(socket.sent)
+        await bridge._handle(Watch().hello())
+        await bridge._handle(first.hello())
+        assert len(socket.sent) == before
+
+    _run(scenario())
+
+
+def test_a_speech_server_waiting_on_a_hermes_turn_is_not_hung(call, monkeypatch):
+    monkeypatch.setattr(api, "WATCH_AUDIO_UPSTREAM_QUIET_S", 0.3)
+    monkeypatch.setattr(api, "WATCH_AUDIO_UPSTREAM_QUIET_CHECK_S", 0.02)
+
+    async def scenario():
+        bridge = _bridge()
+        socket = await _attach(bridge)
+        watch = Watch()
+        assert (await _start(bridge, socket, watch))["type"] == "started"
+        await bridge._handle(watch.event({"type": "response.create"}))
+        await bridge.session.call.start_turn("Look something up")
+        await _until(lambda: call.hermes.prompts())
+        # The server is quiet while Hermes takes its time: the call goes on.
+        await asyncio.sleep(0.8)
+        assert bridge.session is not None and not watch.events(socket, "error")
+        await bridge._end_session("test")
+
+    _run(scenario())
+
+
+def test_a_provider_answering_just_as_the_hang_check_fires_keeps_the_call():
+    async def scenario():
+        bridge = types.SimpleNamespace(clock=time.monotonic, grant=types.SimpleNamespace(profile=None))
+        session = api._WatchAudioSession(bridge, None, {})
+        checks = []
+
+        async def hung():
+            # The first check saw a debt that was answered before the verdict.
+            checks.append(1)
+            if len(checks) > 1:
+                await asyncio.Event().wait()
+
+        session._hung = hung
+        # A fresh debt: owed, but not for long.
+        session.asked('{"type":"response.create"}')
+        assert session.owed_event == "response.create"
+        reader = asyncio.get_running_loop().create_future()
+        tasks = []
+        waiting = asyncio.ensure_future(session._wait_or_hang(reader, tasks))
+        await _until(lambda: len(checks) == 2)
+        assert not waiting.done()
+        reader.set_result(None)
+        assert await waiting is False
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    _run(scenario())
+
+
+def test_an_answer_that_arrives_while_its_event_is_still_sending_pays_it():
+    async def scenario():
+        bridge = types.SimpleNamespace(clock=time.monotonic, grant=types.SimpleNamespace(profile=None))
+        session = api._WatchAudioSession(bridge, None, {})
+
+        class Upstream:
+            async def send(self, text):
+                # The provider's reply is read before the send returns.
+                session.answered()
+
+        class Dropped:
+            async def send(self, text):
+                raise ConnectionError("gone")
+
+        await session.send_asking(Upstream(), '{"session":{"type":"realtime"},"type":"session.update"}')
+        assert session.owed_since is None
+        await session.send_asking(Dropped(), '{"type":"response.create"}')
+        assert session.owed_since is None
+
+    _run(scenario())

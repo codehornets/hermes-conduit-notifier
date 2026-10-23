@@ -13,6 +13,14 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.63.3 (2026-10-23)
+
+### Fixes
+- A Watch call that has reconnected too many times is told to start again, so
+  it ends at once instead of waiting for a reply that never comes.
+- A Watch call on Grok or Local Live whose voice service stops answering ends
+  after about a minute and frees its place, so other Watch calls can start.
+
 ## 0.63.2 (2026-10-23)
 
 ### Security

@@ -284,7 +284,8 @@ def test_the_watch_rejoining_gets_a_fresh_stream(paired, monkeypatch):
 class FakeXai:
     """A realtime socket that answers like xAI's, on its own thread."""
 
-    def __init__(self, reply_seconds=1.0):
+    def __init__(self, reply_seconds=1.0, answers=True):
+        self.answers = answers
         self.reply = b"".join(struct.pack("<h", int(8000 * math.sin(i / 10))) for i in range(int(24_000 * reply_seconds)))
         self.appended = bytearray()
         self.headers = []
@@ -307,7 +308,7 @@ class FakeXai:
                     await connection.send(json.dumps({"type": "session.updated", "session": event["session"]}))
                 elif kind == "input_audio_buffer.append":
                     self.appended += base64.b64decode(event["audio"])
-                elif kind == "response.create":
+                elif kind == "response.create" and self.answers:
                     await connection.send(json.dumps({"type": "response.created"}))
                     await connection.send(json.dumps({"type": "response.output_audio.delta",
                                                       "delta": base64.b64encode(self.reply).decode()}))
@@ -385,6 +386,36 @@ def test_grok_without_a_sign_in_tells_the_watch(paired, monkeypatch):
     error, ended = asyncio.run(call())
     assert error == (3, {"type": "error", "code": "unavailable", "message": api.GROK_LIVE_NO_CREDENTIAL})
     assert ended == (3, {"type": "ended", "engine": "grok", "reason": "error"})
+
+
+def test_grok_that_stops_answering_ends_the_session_and_says_so(paired, monkeypatch):
+    xai = FakeXai(answers=False)
+    try:
+        monkeypatch.setattr(api, "GROK_LIVE_URL", f"ws://127.0.0.1:{xai.port}/v1/realtime")
+        monkeypatch.setattr(api, "grok_live_credentials", lambda: ("xai-secret", "subscription"))
+        monkeypatch.setattr(api, "WATCH_AUDIO_UPSTREAM_QUIET_S", 0.5)
+        monkeypatch.setattr(api, "WATCH_AUDIO_UPSTREAM_QUIET_CHECK_S", 0.05)
+        grant = api.open_watch_grant({"tools": ["web_search"], "audio": True}, profile=None, path=paired)
+
+        async def call():
+            watch = Watch(grant)
+            await watch.connect()
+            await watch.control({"type": "start", "engine": "grok"})
+            assert (await watch.receive())[1]["type"] == "started"
+            await watch.send(2, json.dumps({"type": "session.update", "session": {}}).encode())
+            assert (await watch.receive())[1]["type"] == "session.updated"
+            # Nothing asked: the quiet is the conversation's.
+            await watch.send(1, os.urandom(640))
+            with pytest.raises(asyncio.TimeoutError):
+                await watch.receive(1.0)
+            await watch.send(2, b'{"type":"response.create"}')
+            return [await watch.receive(5), await watch.receive(5)]
+
+        error, ended = asyncio.run(call())
+        assert error == (3, {"type": "error", "code": "unreachable", "message": "xAI stopped answering"})
+        assert ended == (3, {"type": "ended", "engine": "grok", "reason": "error"})
+    finally:
+        xai.close()
 
 
 # --- GPT-Live through the real WebRTC helper -----------------------------------------------
