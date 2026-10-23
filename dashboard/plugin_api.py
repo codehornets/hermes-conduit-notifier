@@ -14457,6 +14457,8 @@ ROUTE_CAPABILITIES = (
     "location-profiles",
     "pairing",
     "self-restart",
+    # POST /self/update runs the whole update on the host and notifies.
+    "self-update",
     "cron-notifications",
     "reply-sources",
     "chat-on-screen",
@@ -14676,3 +14678,367 @@ async def post_self_restart(response: Response) -> Dict[str, Any]:
     except Exception as exc:
         raise _unexpected("restart", exc, feature="Restart")
 
+
+
+# --- Self update --------------------------------------------------------------
+#
+# The whole update on the host, so Conduit can hand it over and be closed:
+# Hermes pulls the plugin (the call behind its agent-plugins update route), the
+# gateway restarts (the spawn behind /api/gateway/restart) and this dashboard
+# re-execs once no chat turn runs here, as /self/restart does. The job lives in
+# a file in the Hermes root, so the restarted dashboard can finish it: it
+# records how the update ended and notifies the profile that asked, through
+# that profile's relay pairing. A Hermes without those calls, or a dashboard
+# that can't restart itself, answers 501 and Conduit runs the steps itself.
+
+PLUGIN_NAME = "conduit_push"
+SELF_UPDATE_FILE = "conduit-self-update.json"
+SELF_UPDATE_GATEWAY_LIMIT_S = 180.0
+SELF_UPDATE_CHATS_RECHECK_S = 2.0
+# A turn marker left behind can't hold the update forever.
+SELF_UPDATE_CHATS_LIMIT_S = 7200.0
+# The restarted dashboard notifies once it has had a moment to come up.
+SELF_UPDATE_NOTIFY_DELAY_S = 5.0
+# A job that hasn't moved for this long is over, however it was left.
+SELF_UPDATE_STALE_S = 3600.0
+SELF_UPDATE_RUNNING = ("downloading", "restarting_gateway", "waiting_for_chats", "restarting_dashboard")
+# Reentrant: a start reads the status under it too.
+_self_update_lock = threading.RLock()
+_self_update_thread: Optional[threading.Thread] = None
+# The job this process started, for when its file can't be read back.
+_self_update_job: Optional[Dict[str, Any]] = None
+# Each start pulls and restarts the gateway: a few per hour is plenty.
+_self_update_limiter = _MintLimiter(3, 600.0, message="Too many plugin updates; try again in a few minutes")
+
+
+def _self_update_path() -> Path:
+    return _hermes_homes()[0] / SELF_UPDATE_FILE
+
+
+def _read_self_update(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        job = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return job if isinstance(job, dict) and isinstance(job.get("id"), str) else None
+
+
+def _write_self_update(path: Path, job: Dict[str, Any]) -> None:
+    job["updated_at"] = time.time()
+    handle, temp = tempfile.mkstemp(prefix=".conduit-self-update.", dir=str(path.parent))
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            json.dump(job, out)
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
+
+
+def _hermes_update_steps() -> Tuple[Callable[[], Dict[str, Any]], Callable[[], int]]:
+    """Hermes' own plugin pull and gateway restart, or 501 when this Hermes lacks them."""
+    try:
+        plugins_cmd = importlib.import_module("hermes_cli.plugins_cmd")
+        web_server = importlib.import_module("hermes_cli.web_server")
+    except ImportError as exc:
+        # Only a Hermes without these modules; a broken import inside Hermes is a real failure.
+        if exc.name not in ("hermes_cli", "hermes_cli.plugins_cmd", "hermes_cli.web_server"):
+            raise
+        raise TokenError(501, "This Hermes can't run the plugin update on its own")
+    dashboard_update_user_plugin = getattr(plugins_cmd, "dashboard_update_user_plugin", None)
+    _spawn_gateway_restart = getattr(web_server, "_spawn_gateway_restart", None)
+    if not callable(dashboard_update_user_plugin) or not callable(_spawn_gateway_restart):
+        raise TokenError(501, "This Hermes can't run the plugin update on its own")
+
+    def pull() -> Dict[str, Any]:
+        return dashboard_update_user_plugin(PLUGIN_NAME)
+
+    def restart_gateway() -> int:
+        proc, _reused = _spawn_gateway_restart(None, interrupt=True)
+        try:
+            return proc.wait(timeout=SELF_UPDATE_GATEWAY_LIMIT_S)
+        except subprocess.TimeoutExpired:
+            # Failed is failed: a restart finishing later mustn't contradict the job.
+            with contextlib.suppress(OSError):
+                proc.kill()
+            raise
+
+    return pull, restart_gateway
+
+
+def _self_update_failed(job: Dict[str, Any], detail: str, code: Optional[str] = None) -> None:
+    # failed_step says how far it got: Conduit runs the steps itself only
+    # when the pull itself failed.
+    job.update(failed_step=job.get("step"), step="failed", detail=detail, finished_at=time.time())
+    if code:
+        job["code"] = code
+
+
+def _run_self_update(job: Dict[str, Any], path: Path, pull: Callable[[], Dict[str, Any]],
+                     restart_gateway: Callable[[], int], schedule: Callable[[float, Callable[[], None]], Any],
+                     homes: Callable[[], List[Path]], notify: Callable[[Dict[str, Any]], None],
+                     sleep: Callable[[float], None] = time.sleep) -> None:
+    global _self_restart_scheduled
+    claimed_restart = False
+    try:
+        result = pull()
+        if not result.get("ok"):
+            # Not found, no owned checkout, a re-pin needing consent, a blocked
+            # scan: Hermes' own words, which Conduit acts on.
+            code = next((flag for flag in ("consent_required", "scan_blocked") if result.get(flag)), None)
+            _self_update_failed(job, str(result.get("error") or "Hermes didn't apply the update"), code)
+            return
+        job.update(step="restarting_gateway", version=_plugin_version())
+        if job["version"] is None:
+            _self_update_failed(job, "The update left a plugin.yaml without a readable version on the host")
+            return
+        _write_self_update(path, job)
+        try:
+            exit_code = restart_gateway()
+        except subprocess.TimeoutExpired:
+            exit_code = None
+        if exit_code != 0:
+            _self_update_failed(job, "The plugin is updated, but the gateway didn't restart. "
+                                     "Run hermes gateway status on the host.")
+            return
+        if LOADED_VERSION is not None and job["version"] == LOADED_VERSION:
+            # Nothing new on disk for this dashboard to load.
+            job.update(step="done", loaded_version=LOADED_VERSION, finished_at=time.time())
+            return
+        waited = 0.0
+        while running := _running_turns(os.getpid(), homes(), _own_start_time()):
+            if waited >= SELF_UPDATE_CHATS_LIMIT_S:
+                _self_update_failed(job, "Chats were still running after two hours. Restart the Hermes "
+                                         "dashboard on this host to finish the update", "restart_needed")
+                return
+            if job.get("running_chats") != running:
+                job.update(step="waiting_for_chats", running_chats=running)
+                _write_self_update(path, job)
+            sleep(SELF_UPDATE_CHATS_RECHECK_S)
+            waited += SELF_UPDATE_CHATS_RECHECK_S
+        with _self_restart_lock:
+            # Taken before the step is written, so a status read never sees
+            # the restart step without a restart on its way.
+            already = _self_restart_scheduled
+            _self_restart_scheduled = True
+        claimed_restart = not already
+        job.update(step="restarting_dashboard", running_chats=0)
+        _write_self_update(path, job)
+        if already:
+            return
+        # It checks again for a turn started meanwhile.
+        schedule(SELF_RESTART_DELAY_S, lambda: _restart_when_idle(schedule, homes))
+        claimed_restart = False
+        return
+    except Exception as exc:  # noqa: BLE001 — the job says how it ended, whatever ended it
+        if claimed_restart:
+            # Nothing was scheduled: a later restart must not read as already on its way.
+            with _self_restart_lock:
+                _self_restart_scheduled = False
+        logger.exception("Conduit plugin: the update on the host failed")
+        _self_update_failed(job, f"The update failed on the host ({type(exc).__name__})")
+    finally:
+        if job["step"] in ("done", "failed"):
+            with contextlib.suppress(OSError):
+                _write_self_update(path, job)
+            notify(job)
+
+
+def start_self_update(profile: Optional[str], schedule: Callable[[float, Callable[[], None]], Any], *,
+                      path: Optional[Path] = None,
+                      steps: Optional[Tuple[Callable[[], Dict[str, Any]], Callable[[], int]]] = None,
+                      homes: Optional[Callable[[], List[Path]]] = None,
+                      notify: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+    """Starts the update on the host, or returns the one still under way."""
+    global _self_update_thread, _self_update_job
+    refusal = _self_restart_refusal()
+    if refusal is not None:
+        raise TokenError(*refusal)
+    pull, restart_gateway = steps or _hermes_update_steps()
+    path = path or _self_update_path()
+    with _self_update_lock:
+        if _self_update_thread is not None and _self_update_thread.is_alive():
+            return _read_self_update(path) or dict(_self_update_job or {"id": "", "step": "downloading"})
+        # A job whose thread ended can still be under way: the dashboard
+        # restart it handed over hasn't happened yet.
+        current = self_update_status(path, notify=notify)
+        if current is not None and current.get("step") in SELF_UPDATE_RUNNING:
+            return current
+        mint = _self_update_limiter.acquire("")
+        job: Dict[str, Any] = {
+            "id": uuid.uuid4().hex, "step": "downloading", "from_version": LOADED_VERSION,
+            "boot_id": BOOT_ID, "pid": os.getpid(), "profile": profile or "", "started_at": time.time(),
+        }
+        try:
+            _write_self_update(path, job)
+            thread = threading.Thread(
+                target=_run_self_update, name="conduit-self-update", daemon=True,
+                args=(job, path, pull, restart_gateway, schedule, homes or _hermes_homes, notify or _notify_self_update))
+            thread.start()
+        except BaseException:
+            # Nothing started: the attempt doesn't count against the limit.
+            _self_update_limiter.release("", mint)
+            raise
+        _self_update_job, _self_update_thread = job, thread
+        return dict(job)
+
+
+def self_update_status(path: Optional[Path] = None, now: Optional[float] = None,
+                       notify: Optional[Callable[[Dict[str, Any]], None]] = None) -> Optional[Dict[str, Any]]:
+    """The latest job, with one this dashboard can no longer finish marked failed."""
+    path = path or _self_update_path()
+    with _self_update_lock:
+        return _self_update_status(path, now, notify or _notify_self_update)
+
+
+def _job_time(value: Any) -> float:
+    """A job file's timestamp; an unreadable one counts as long ago."""
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _self_update_status(path: Path, now: Optional[float],
+                        notify: Callable[[Dict[str, Any]], None]) -> Optional[Dict[str, Any]]:
+    job = _read_self_update(path)
+    if job is None or job.get("step") not in SELF_UPDATE_RUNNING:
+        return job
+    alive = _self_update_thread is not None and _self_update_thread.is_alive()
+    if alive and job.get("boot_id") == BOOT_ID:
+        # Its thread is still on it, however long the chats take.
+        return job
+    if job.get("boot_id") == BOOT_ID and job["step"] == "restarting_dashboard" and _self_restart_scheduled:
+        # The restart waits for the chats; it finishes the job when it lands.
+        return job
+    if job.get("boot_id") == BOOT_ID and job["step"] != "restarting_dashboard" and not alive:
+        _self_update_failed(job, "The update stopped on the host before it finished")
+    elif job.get("boot_id") == BOOT_ID and job["step"] == "restarting_dashboard" and not _self_restart_scheduled:
+        # The re-exec failed (and was logged): the new plugin waits for a restart.
+        _self_update_failed(job, "Restart the Hermes dashboard on this host to finish the update",
+                            "restart_needed")
+    elif (now or time.time()) - _job_time(job.get("updated_at")) > SELF_UPDATE_STALE_S:
+        _self_update_failed(job, "The update didn't finish on the host")
+    else:
+        return job
+    with contextlib.suppress(OSError):
+        _write_self_update(path, job)
+    # Conduit may be closed: the asking profile hears it ended.
+    timer = threading.Timer(0, notify, args=(dict(job),))
+    timer.daemon = True
+    timer.start()
+    return job
+
+
+def _another_live_process(pid: Any) -> bool:
+    """Whether `pid` is a running process other than this one. The dashboard's
+    re-exec keeps its pid; a dashboard restarted any other way has a new one."""
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def finish_self_update_after_restart(path: Optional[Path] = None,
+                                     notify: Optional[Callable[[Dict[str, Any]], None]] = None,
+                                     delay: float = SELF_UPDATE_NOTIFY_DELAY_S) -> Optional[Dict[str, Any]]:
+    """In a new dashboard process: ends a job the previous process left running."""
+    path = path or _self_update_path()
+    job = _read_self_update(path)
+    if job is None or job.get("step") not in SELF_UPDATE_RUNNING or job.get("boot_id") == BOOT_ID:
+        return None
+    if _another_live_process(job.get("pid")):
+        # Another process loading this file (a probe), while the dashboard runs the job.
+        return None
+    # Pulled (it has a version) and this process loaded it: done, whatever
+    # restarted the dashboard (an update's own re-exec or a /self/restart).
+    if job.get("version") is not None and LOADED_VERSION == job["version"]:
+        job.update(step="done", loaded_version=LOADED_VERSION, finished_at=time.time())
+    else:
+        _self_update_failed(job, "The dashboard restarted before the update finished")
+    _write_self_update(path, job)
+    timer = threading.Timer(delay, notify or _notify_self_update, args=(dict(job),))
+    timer.daemon = True
+    timer.start()
+    return job
+
+
+_plugin_package_lock = threading.Lock()
+
+
+def _plugin_client() -> Any:
+    """client.py, imported as part of a package of this plugin's own files.
+
+    This module is loaded by path, outside the plugin's package, and client.py
+    imports its siblings relatively; the package here holds only what it
+    imports, and never runs the plugin's __init__ (which registers hooks).
+    """
+    name = "conduit_push_dashboard_package"
+    with _plugin_package_lock:
+        if name not in sys.modules:
+            package = types.ModuleType(name)
+            package.__path__ = [os.path.dirname(os.path.dirname(os.path.abspath(__file__)))]
+            sys.modules[name] = package
+        return importlib.import_module(f"{name}.client")
+
+
+def _notify_self_update(job: Dict[str, Any]) -> None:
+    """Tells the profile that asked how the update ended, when it is paired."""
+    profile = job.get("profile") or None
+    if job.get("step") == "done":
+        title = "Conduit plugin updated"
+        body = f"Version {job.get('loaded_version') or job.get('version')} is running."
+    else:
+        title = "Conduit plugin update didn't finish"
+        body = str(job.get("detail") or "Open Conduit to see what happened.")
+    try:
+        with _profile_scope(profile):
+            client = _plugin_client()
+            if not client.load_state():
+                return
+            events = sys.modules[f"{client.__package__}.events"]
+            event = events.push_event("background_task.finished", identifier=events.event_id("plugin-update", job["id"]),
+                                      profile=profile or "default", title=title, body=body)
+            client.send_now(event)
+    except Exception as exc:  # noqa: BLE001 — a notification is a courtesy; the job file has the outcome
+        logger.warning("Conduit plugin: couldn't send the update notification (%s)", type(exc).__name__)
+
+
+@router.post("/self/update")
+async def post_self_update(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    loop = asyncio.get_running_loop()
+
+    def schedule(delay: float, fn: Callable[[], None]) -> None:
+        # From the job's thread: the restart runs on the dashboard's own loop.
+        loop.call_soon_threadsafe(loop.call_later, delay, fn)
+
+    try:
+        return {"ok": True, "job": await asyncio.to_thread(start_self_update, profile, schedule)}
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _unexpected("update", exc, feature="Update")
+
+
+@router.get("/self/update")
+async def get_self_update(response: Response) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"ok": True, "job": await asyncio.to_thread(self_update_status), "boot_id": BOOT_ID,
+                "loaded_version": LOADED_VERSION}
+    except Exception as exc:
+        raise _unexpected("update status", exc, feature="Update")
+
+
+with contextlib.suppress(Exception):
+    # A job the previous dashboard process handed over at its restart.
+    finish_self_update_after_restart()
