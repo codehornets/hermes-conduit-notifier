@@ -7342,6 +7342,29 @@ async def post_pulse_rate(request: Request, response: Response) -> Dict[str, Any
         store, body.get("card"), body.get("rating"), body.get("reason") or "")}, reads_only=True)
 
 
+@router.post("/pulse/done")
+async def post_pulse_done(request: Request, response: Response) -> Dict[str, Any]:
+    """{"card": n, "done": true|false}: marks a follow-up card done (its
+    promise closes, no rating) or takes the mark off: {"changed": bool}."""
+    response.headers["Cache-Control"] = "no-store"
+    body = await _read_json_body(request, PULSE_MAX_BODY_BYTES)
+    body = body if isinstance(body, dict) else {}
+    # "done" is required: a body without it changes nothing.
+    return await _pulse_route("done", lambda control, store, home: {"changed": control.done(
+        store, body.get("card"), body.get("done"))}, reads_only=True)
+
+
+@router.post("/pulse/acted")
+async def post_pulse_acted(request: Request, response: Response) -> Dict[str, Any]:
+    """{"card": n}: Do it on a follow-up card. Pulse reads that chat once it
+    has answered and marks the card done if it got done: {"booked": bool}."""
+    response.headers["Cache-Control"] = "no-store"
+    body = await _read_json_body(request, PULSE_MAX_BODY_BYTES)
+    body = body if isinstance(body, dict) else {}
+    return await _pulse_route("acted", lambda control, store, home: {"booked": control.acted(
+        store, body.get("card"))}, reads_only=True)
+
+
 @router.get("/pulse/learned")
 async def get_pulse_learned(response: Response) -> Dict[str, Any]:
     """What ratings taught Pulse, newest first, and each kind's loudness."""
@@ -14602,6 +14625,8 @@ ROUTE_CAPABILITIES = (
     "pulse_model",
     # PUT /pulse takes "nudge" and the daily token budgets.
     "pulse_nudge",
+    "pulse_done",
+    "pulse_acted",
     "present-v1",
     "health-sync",
     "voice-tools",

@@ -13,6 +13,15 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.64.0 (2026-10-23)
+
+### New and improved
+- Follow-up cards on the Pulse screen can be marked done. Pulse closes that
+  promise and stops checking on it, without counting it as a thumbs down, and
+  Undo puts it back. A card marked done also leaves the morning brief.
+- After Do it on a follow-up card, Pulse reads that chat once Hermes has
+  answered and marks the card done by itself when the chat shows it got done.
+
 ## 0.63.3 (2026-10-23)
 
 ### Fixes
