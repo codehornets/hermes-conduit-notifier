@@ -13,6 +13,14 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.64.2 (2026-10-23)
+
+### Fixes
+- When the last location has no distance to a saved place, the agent no
+  longer blames the "places only" setting. It says the phone left distances
+  out of that update, or the place was added after it, and can ask for a
+  fresh location.
+
 ## 0.64.1 (2026-10-23)
 
 ### Fixes
