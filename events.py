@@ -10,7 +10,7 @@ from typing import Any
 
 # Keep in sync with plugin.yaml. Reported on every event so the relay can
 # expose per-gateway compatibility state to the app (Settings > Notifications).
-PLUGIN_VERSION = "0.67.0"
+PLUGIN_VERSION = "0.68.0"
 PLUGIN_CAPABILITIES = [
     "approval-decisions",
     "clarify-loop",
@@ -87,6 +87,7 @@ def push_event(
     mode: str | None = None,
     locate: dict[str, Any] | None = None,
     maps: dict[str, Any] | None = None,
+    count: int | None = None,
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "event_id": identifier,
@@ -108,6 +109,9 @@ def push_event(
     # older apps and the relay.
     if isinstance(title_label, str) and _TITLE_LABEL.match(title_label):
         event["title_label"] = title_label
+    # How many things a Pulse push brings, for its title ("Pulse noticed 3 things").
+    if isinstance(count, int) and not isinstance(count, bool) and 0 < count <= 100 and kind == "response.ready":
+        event["count"] = count
     chat_title = _clean(session_title, 120) if isinstance(session_title, str) else ""
     if chat_title:
         event["session_title"] = chat_title
@@ -225,6 +229,10 @@ def redact_event(event: dict[str, Any]) -> dict[str, Any]:
     if isinstance(label, str) and _TITLE_LABEL.match(label):
         # Which title the phone writes: not content, so it stays.
         redacted["title_label"] = label
+    count = event.get("count")
+    if isinstance(count, int) and not isinstance(count, bool) and 0 < count <= 100:
+        # How many things a Pulse report noticed, for that title: a number, not content.
+        redacted["count"] = count
     decision = sanitize_decision(event.get("decision")) if event.get("decision") is not None else {}
     if decision.get("kind") == "approval":
         # Unknown labels never transit; fall back to the always-valid subset

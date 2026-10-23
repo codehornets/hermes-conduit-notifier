@@ -518,9 +518,27 @@ def test_push_event_names_its_title_and_sends_the_chat_title_on_its_own():
         "phone.auto.add_event")
 
 
+def test_a_pulse_push_says_how_many_things_it_brings():
+    event = push_event("response.ready", identifier="response:1", title_label="pulse.noticed", count=3)
+    assert event["title_label"] == "pulse.noticed" and event["count"] == 3
+    for count in (0, -1, 101, True, "3", None):
+        assert "count" not in push_event("response.ready", identifier="response:1", count=count)
+    assert "count" not in push_event("approval.needed", identifier="approval:1", count=3)
+    from e2e import INNER_FIELDS
+    assert "count" in INNER_FIELDS  # sealed with the rest of the content
+
+
 @pytest.mark.parametrize("label", ["", "approval", "Approval.Needed", "a.b.c.d", "phone.add event", 5])
 def test_push_event_drops_a_malformed_title_label(label):
     assert "title_label" not in push_event("approval.needed", identifier="approval:1", title_label=label)
+
+
+def test_redact_event_keeps_a_pulse_report_count():
+    event = push_event("response.ready", identifier="response:1", title="Pulse noticed 3 things",
+                       title_label="pulse.noticed", count=3)
+    redacted = redact_event(event)
+    assert redacted["title_label"] == "pulse.noticed" and redacted["count"] == 3
+    assert "count" not in redact_event({**event, "count": "3 secret things"})
 
 
 def test_redact_event_keeps_the_title_label_but_not_the_chat_title():
