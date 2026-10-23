@@ -191,6 +191,8 @@ CREATE TABLE IF NOT EXISTS cards (
     chat_id TEXT NOT NULL DEFAULT '',
     chat_title TEXT NOT NULL DEFAULT '',
     message_id INTEGER,
+    -- A report item's kind (pulse_report.KINDS) on a "noticed" card.
+    topic TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     seen_at REAL,
     briefed_at REAL,
@@ -255,8 +257,14 @@ def _check_marks(marks: str) -> None:
     if marks not in MARKS:  # named into SQL
         raise ValueError(f"unknown marks table {marks!r}")
 
+# A report's item on its own card (pulse_learning.add_noticed_cards).
+NOTICED = "noticed"
+# The report attempts split into such cards, newest last: their typed
+# ratings aren't read, so an item isn't counted twice.
+SPLIT_REPORTS = "split_reports"
+
 CARD_COLUMNS = ("kind", "item_id", "level", "title", "quote", "news", "why", "profile", "chat_id", "chat_title",
-                "message_id", "created_at")
+                "message_id", "topic", "created_at")
 LESSON_COLUMNS = ("kind", "what", "value", "profile", "chat_id", "card_id", "cause", "created_at")
 
 
@@ -282,6 +290,14 @@ class PulseStore:
         self.busy_timeout_s = busy_timeout_s
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # A store from before cards had a topic.
+            if "topic" not in {row[1] for row in conn.execute("PRAGMA table_info(cards)")}:
+                try:
+                    conn.execute("ALTER TABLE cards ADD COLUMN topic TEXT NOT NULL DEFAULT ''")
+                except sqlite3.OperationalError:
+                    # Another process opening the same store added it first.
+                    if "topic" not in {row[1] for row in conn.execute("PRAGMA table_info(cards)")}:
+                        raise
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=self.busy_timeout_s, isolation_level=None)
@@ -674,6 +690,13 @@ class PulseStore:
                 (status, closed_by, time.time(), item_id)).rowcount
         return bool(changed)
 
+    def current_item(self, item_id: int) -> Optional[int]:
+        """The open item standing for ``item_id`` now: itself, or what
+        replaced it; None once it's closed."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT profile FROM items WHERE id=?", (item_id,)).fetchone()
+            return _current(conn, item_id, row["profile"]) if row else None
+
     def item(self, item_id: int) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
@@ -748,6 +771,43 @@ class PulseStore:
             columns = ", ".join(row)
             return int(conn.execute(f"INSERT INTO cards({columns}) VALUES({', '.join('?' * len(row))})",
                                     tuple(row.values())).lastrowid)
+
+    def add_cards(self, rows: Sequence[dict[str, Any]], *, attempt: str = "", marks: Sequence[str] = (),
+                  keep: int = 50) -> list[int]:
+        """Adds these cards in one transaction, all or none. With ``attempt``,
+        it's appended to each list setting in ``marks`` (the last ``keep``)
+        in the same write, so the mark can't be lost apart from the cards;
+        and an attempt the first of them already holds adds nothing (another
+        process got there first)."""
+        for row in rows:
+            _check_columns(row, CARD_COLUMNS)
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                lists = {}
+                for key in marks if attempt else ():
+                    found = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+                    value = json.loads(found["value_json"]) if found else None
+                    lists[key] = [str(entry) for entry in value] if isinstance(value, list) else []
+                if marks and attempt and attempt in lists[marks[0]]:
+                    conn.execute("ROLLBACK")
+                    return []
+                ids = [int(conn.execute(f"INSERT INTO cards({', '.join(row)}) VALUES({', '.join('?' * len(row))})",
+                                        tuple(row.values())).lastrowid) for row in rows]
+                for key, value in lists.items():
+                    conn.execute("INSERT INTO settings(key, value_json) VALUES(?, ?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+                                 (key, json.dumps((value + [attempt])[-keep:])))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            return ids
+
+    def rated_cards(self, kind: str) -> list[dict]:
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT item_id, topic, rating, rated_at FROM cards WHERE kind=? AND rating!=''", (kind,))]
 
     def card(self, card_id: int) -> Optional[dict]:
         with self._connect() as conn:

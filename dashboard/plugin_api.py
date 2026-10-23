@@ -7249,7 +7249,7 @@ async def put_pulse(request: Request, response: Response) -> Dict[str, Any]:
 
 @router.post("/pulse/report")
 async def post_pulse_report(response: Response) -> Dict[str, Any]:
-    """Asks for a shadow report now."""
+    """Asks for a report now."""
     response.headers["Cache-Control"] = "no-store"
     # Refused while Pulse is off, so a host that never turned it on keeps no file.
     return await _pulse_route("report", lambda control, store, home: (control.request_report(store), {})[1],
@@ -7334,7 +7334,7 @@ async def post_pulse_seen(request: Request, response: Response) -> Dict[str, Any
 async def post_pulse_rate(request: Request, response: Response) -> Dict[str, Any]:
     """{"card": n, "rating": "up"|"down", "reason": optional, for a down:
     "not_relevant"|"already_knew"|"too_late"|"too_often"}: {"learned": [...]},
-    the lessons it made."""
+    the lessons it made. A report item's card ("noticed") takes no reason."""
     response.headers["Cache-Control"] = "no-store"
     body = await _read_json_body(request, PULSE_MAX_BODY_BYTES)
     body = body if isinstance(body, dict) else {}

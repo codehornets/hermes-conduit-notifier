@@ -25,7 +25,7 @@ closed stay closed, checks already brought forward stay sooner).
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import pulse_store as store
 
@@ -160,11 +160,62 @@ def drop_empty_reports(pulse_store: store.PulseStore) -> int:
                                    if empty_turn("report", card["news"])])
 
 
+# One item of a report, as its own card (the report's lines, split).
+NOTICED = store.NOTICED
+NOTICED_NEWS_LIMIT = 1200
+NOTICED_WHY = "From your Pulse report: something Hermes noticed in your chats, calendar or notes."
+# "1. [date] text #12", also bold or bulleted; the number, the kind, the rest.
+_REPORT_LINE = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?(\d{1,2})[.)](?:\*\*)?\s*\[([A-Za-z-]+)\]\s*(.+?)\s*$", re.MULTILINE)
+_LINE_REF = re.compile(r"\s*#(\d{1,9})\W*$")
+_ANY_REF = re.compile(r"#\d")
+
+
+def report_lines(reply: Optional[str]) -> list[tuple[str, str, Optional[int]]]:
+    """A report's items in order, as (kind, text, the remembered item its
+    "#n" names); a number used twice is its first line."""
+    lines, numbers = [], set()
+    for number, kind, text in _REPORT_LINE.findall(reply or ""):
+        if number in numbers:
+            continue
+        numbers.add(number)
+        # A "#n" counts only as the line's one: "PR #12 needs #4" links nothing.
+        ref = _LINE_REF.search(text) if len(_ANY_REF.findall(text)) == 1 else None
+        lines.append((kind.lower(), (text[:ref.start()] if ref else text).strip(), int(ref.group(1)) if ref else None))
+    return [line for line in lines if line[1]]
+
+
+def add_noticed_cards(pulse_store: store.PulseStore, *, turn: Any, lines: list[tuple[str, str, Optional[int]]],
+                      chat_id: str, chat_title: str, shown: set[int], kinds: tuple[str, ...],
+                      item_chat_title: Callable[[dict], str], now: float, attempt: str = "",
+                      marks: tuple[str, ...] = (), keep: int = 50) -> list[int]:
+    """A delivered report's items (``report_lines``) as cards, one each, all
+    at once, marked as ``add_cards`` marks them. An item drawn from a
+    remembered thing (its "#n", shown in the report; what replaced it since,
+    if anything) points at the chat that thing came from, so Do it and Done
+    work on it; the rest point at the report in the Pulse chat."""
+    rows = []
+    for kind, text, ref in lines:
+        current = pulse_store.current_item(ref) if ref is not None and ref in shown else None
+        item = pulse_store.item(current) if current is not None else None
+        row: dict[str, Any] = {
+            "kind": NOTICED, "level": "screen", "topic": kind if kind in kinds else "other",
+            "news": _clip(text, NOTICED_NEWS_LIMIT), "why": NOTICED_WHY, "created_at": now}
+        if item is not None:
+            row.update(item_id=item["id"], title=_clip(item["text"], 300), quote=_clip(item["evidence"], 300),
+                       profile=item["profile"], chat_id=item["chat_id"], message_id=item["message_id"],
+                       chat_title=_clip(item_chat_title(item), 120))
+        else:
+            row.update(item_id=None, title=_clip(text, 300), chat_id=turn.session_id or chat_id,
+                       message_id=turn.reply_id, chat_title=_clip(chat_title, 120))
+        rows.append(row)
+    return pulse_store.add_cards(rows, attempt=attempt, marks=marks, keep=keep)
+
+
 def card_entry(card: dict, done: Optional[dict] = None) -> dict[str, Any]:
     """``done``: its done mark, as ``done_marks`` gives it."""
     entry = {key: card[key] for key in ("id", "kind", "item_id", "level", "title", "quote", "news", "why", "profile",
-                                        "chat_id", "chat_title", "message_id", "created_at", "seen_at", "briefed_at",
-                                        "rating", "reason", "rated_at")}
+                                        "chat_id", "chat_title", "message_id", "topic", "created_at", "seen_at",
+                                        "briefed_at", "rating", "reason", "rated_at")}
     return {**entry, "done_at": done["done_at"] if done else None, "done_by": done["done_by"] if done else ""}
 
 
@@ -180,7 +231,7 @@ ACT_DONE_BY = "pulse: done in the chat after Do it"
 def followup_card(pulse_store: store.PulseStore, card_id: Any) -> dict:
     """The follow-up card ``card_id`` names, or Invalid("card")."""
     card = pulse_store.card(card_id) if isinstance(card_id, int) and not isinstance(card_id, bool) else None
-    if card is None or card["kind"] != "followup" or card["item_id"] is None:
+    if card is None or card["kind"] not in ("followup", NOTICED) or card["item_id"] is None:
         raise Invalid("card")
     return card
 
@@ -272,13 +323,20 @@ def rate(pulse_store: store.PulseStore, card_id: Any, rating: Any, reason: Any =
     reason = reason or ""
     if reason not in ("",) + REASONS or (reason and rating != "down"):
         raise Invalid("reason")
-    if card["kind"] not in DEFAULT_LEVELS:  # checked before the rating is kept
+    if card["kind"] not in DEFAULT_LEVELS and card["kind"] != NOTICED:  # checked before the rating is kept
         raise Invalid("card")
+    if reason and card["kind"] == NOTICED:  # no ladder or rule for a reason to move
+        raise Invalid("reason")
     while not pulse_store.rate_card(card, rating=rating, reason=reason, now=now):
         card = pulse_store.card(card["id"])  # rated meanwhile: count from what it says now
         if card is None:
             raise Invalid("card")
     if card["rating"] == rating and card["reason"] == reason:
+        return []
+    if card["kind"] == NOTICED:
+        # A report item has no ladder: the report weighs its kinds by these
+        # ratings and leaves out a remembered thing rated down
+        # (pulse_report.rating_counts, rated_not_useful).
         return []
     kind = card["kind"]
     delta = (1 if rating == "up" else -1) - {"up": 1, "down": -1}.get(card["rating"], 0)

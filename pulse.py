@@ -11,8 +11,8 @@ A Pulse turn is recognised by its tag in ``pre_llm_call``. On such a turn
 every tool is blocked in ``pre_tool_call`` (the probe needs none; later
 slices allow named reads only), and no push or Live Activity goes out for it.
 
-A few times a day it also sends the shadow report (pulse_report): what Hermes
-would have brought up since the last one, for the user to rate in the home chat.
+A few times a day it also sends the report (pulse_report): what Hermes would
+bring up since the last one, each item its own card on the Pulse screen.
 
 While Pulse is on, every tool call in the profile also gets a row in the
 outcome ledger (pulse_ledger), the record later slices check claims against,
@@ -188,20 +188,37 @@ def is_pulse_turn(session_id: str, turn_id: Any) -> bool:
         return (session_id, turn_id) in _turns
 
 
-def pushes(session_id: str, turn_id: Any) -> bool:
-    """Whether a Pulse turn's reply goes to the phone like any reply: a
-    follow-up or the morning brief does (it's news for the user); a probe
-    or a report doesn't."""
+def _turn_kind(session_id: str, turn_id: Any) -> str:
+    """The kind of attempt a Pulse turn is ("" when it isn't one, or its
+    store can't be read)."""
     if not is_pulse_turn(session_id, turn_id):
-        return False
+        return ""
     with _turns_lock:
         tag = _turns.get((session_id, turn_id))
     try:
         row = open_store().attempt_by_tag(tag) if tag else None
     except Exception:  # noqa: BLE001 — an unreadable store keeps the turn quiet, never breaks the hook
         logger.debug("conduit_push: Pulse couldn't read the turn's attempt", exc_info=True)
-        return False
-    return bool(row) and row["kind"] in (FOLLOWUP, BRIEF)
+        return ""
+    return row["kind"] if row else ""
+
+
+def pushes(session_id: str, turn_id: Any, response: Any = None) -> bool:
+    """Whether a Pulse turn's reply goes to the phone like any reply: a
+    follow-up or the morning brief does (it's news for the user), and so
+    does a report that brought something up (``response``, its items
+    becoming cards); a probe doesn't."""
+    kind = _turn_kind(session_id, turn_id)
+    if kind == REPORT:
+        return bool(learning.report_lines(response if isinstance(response, str) else ""))
+    return kind in (FOLLOWUP, BRIEF)
+
+
+def push_body(session_id: str, turn_id: Any, response: str) -> str:
+    """What a Pulse turn's push says: a report's items, one a line, without
+    the numbers, kinds and remembered-item refs that are for the cards."""
+    lines = learning.report_lines(response) if _turn_kind(session_id, turn_id) == REPORT else []
+    return "\n".join(text for _, text, _ in lines) if lines else response
 
 
 def pre_tool_call(session_id: str, turn_id: Any) -> Optional[dict[str, str]]:
@@ -266,7 +283,7 @@ def _hosts_chats() -> bool:
 
 def tick(now: Optional[float] = None) -> None:
     """One pass: reconcile what's in flight, read report ratings, then send
-    a probe or the shadow report if one is due."""
+    a probe or the report if one is due."""
     if _ctx is None or not turns_marked or not _hosts_chats():
         return
     home = get_hermes_home()
@@ -324,7 +341,8 @@ TURN_CARDS_DONE_KEEP = 50
 
 def _turn_cards(pulse_store: store.PulseStore, home: Path, changed: list[dict], now: float) -> None:
     """A report or brief that reached the Pulse chat goes on the Pulse screen
-    too, as Hermes wrote it, linked to its message in the chat. Those
+    too: a report as one card per item, a brief as Hermes wrote it, linked
+    to its message in the chat. Those
     delivered in the last few minutes are tried again, so a card a busy
     state.db kept out still lands (a card is never added twice)."""
     rows = {row["attempt_id"]: row for row in changed}
@@ -351,6 +369,18 @@ def _turn_cards(pulse_store: store.PulseStore, home: Path, changed: list[dict], 
                 # Nothing brought up: no card, and no looking it up again.
                 done = (done + [attempt])[-TURN_CARDS_DONE_KEEP:]
                 pulse_store.set(TURN_CARDS_DONE, done)
+                continue
+            lines = learning.report_lines(turn.reply) if turn is not None and row["kind"] == REPORT else []
+            if lines:
+                # Each item its own card; a reply in some other shape stays one
+                # card. The cards and the marks that they landed are one write,
+                # so a retry never adds them twice.
+                learning.add_noticed_cards(
+                    pulse_store, turn=turn, lines=lines, chat_id=row["session_key"], chat_title=title,
+                    shown=report.shown_items(turn.prompt), kinds=report.KINDS,
+                    item_chat_title=lambda item: followup.chat_title(home, item), now=now,
+                    attempt=str(attempt), marks=(TURN_CARDS_DONE, store.SPLIT_REPORTS), keep=TURN_CARDS_DONE_KEEP)
+                done = (done + [attempt])[-TURN_CARDS_DONE_KEEP:]
                 continue
             card = turn is not None and learning.add_turn_card(
                 pulse_store, kind=row["kind"], chat_id=row["session_key"], chat_title=title, turn=turn,
@@ -408,19 +438,19 @@ def _maybe_probe(pulse_store: store.PulseStore, home: Path, now: float) -> bool:
 
 
 def _maybe_report(pulse_store: store.PulseStore, home: Path, now: float) -> bool:
-    """Sends the shadow report if asked for or due; True when it went."""
+    """Sends the report if asked for or due; True when it went."""
     asked = pulse_store.take_request("report_requested")
     if not asked and not _report_due(pulse_store, home, now):
         return False
     if any(row["kind"] == REPORT for row in pulse_store.in_flight()):
         if asked:
-            logger.info("conduit_push: Pulse: a shadow report is already in flight; not sending another")
+            logger.info("conduit_push: Pulse: a report is already in flight; not sending another")
         return False
     chat, problem = home_chat(pulse_store, home)
     _log_problem(problem)
     if chat is None:
         if asked:
-            logger.info("conduit_push: Pulse: the requested shadow report wasn't sent; run `pulse report` again "
+            logger.info("conduit_push: Pulse: the requested report wasn't sent; run `pulse report` again "
                         "once the home chat is there")
         return False
     context, since = report.build(home, pulse_store, home_chat_id=chat.chat_id, now=now)
@@ -676,8 +706,11 @@ def _collect_ratings(pulse_store: store.PulseStore, home: Path, now: float) -> N
     if now - _last_ratings < RATINGS_EVERY_S:
         return
     _last_ratings = now
+    # A report split into cards is rated on them, not by typing.
+    split = pulse_store.get(store.SPLIT_REPORTS)
+    split = {str(attempt) for attempt in split} if isinstance(split, list) else set()
     for row in pulse_store.attempts_since(REPORT, now - RATINGS_DAYS * 86400):
-        if row["state"] != store.DELIVERED:
+        if row["state"] != store.DELIVERED or str(row["attempt_id"]) in split:
             continue
         try:
             items, ratings = report.ratings_after(home, chat_id=row["session_key"], tag=row["tag"],
