@@ -13,6 +13,16 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.63.2 (2026-10-23)
+
+### Security
+- A flood of wrong Local Live keys can no longer lock out your voice server's
+  real key. Without this, its key stopped working for up to a minute.
+
+### Fixes
+- Undoing a setting change Hermes made reaches Hermes even when the change was
+  made a while ago. Without this, Hermes could miss that you put it back.
+
 ## 0.63.1 (2026-10-23)
 
 ### New and improved

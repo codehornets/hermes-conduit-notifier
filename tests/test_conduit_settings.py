@@ -108,6 +108,59 @@ def test_an_undo_after_apply_is_kept_as_the_latest_result(store):
     assert result["status"] == "undone" and result["note"] == "user tapped Undo"
 
 
+def test_an_undo_whose_apply_left_the_ring_still_reaches_hermes(store, clock):
+    _sync(store)
+    [request] = store.request([{"key": "voice.live.tone", "value": "relaxed"}], "Calmer.")["requests"]
+    _sync(store, results=[{"id": request["id"], "status": "applied"}])
+    for n in range(store_module.MAX_RESULTS):
+        clock.now += store_module.HOUR_S / store_module.PER_HOUR
+        [other] = store.request([{"key": "voice.live.greeting", "value": f"hi {n}"}], "Greet.")["requests"]
+        _sync(store, results=[{"id": other["id"], "status": "applied"}])
+    assert request["id"] not in [item["id"] for item in store.view()["results"]]
+    _sync(store, results=[{"id": request["id"], "status": "undone", "note": "user tapped Undo"}])
+    result = store.view()["results"][-1]
+    assert result["id"] == request["id"] and result["status"] == "undone" and result["device"] == PHONE
+    assert result["note"] == "user tapped Undo"
+    assert result["key"] == "voice.live.tone" and result["value"] == "relaxed" and result["title"] == "Tone"
+    # The file it's saved to reads back with it.
+    reloaded = SettingsStore(store.path.parent, clock=store.clock)
+    assert reloaded.view()["results"][-1]["id"] == request["id"]
+
+
+def test_only_an_applied_request_is_undone_and_only_once(store, clock):
+    _sync(store)
+    [request] = store.request([{"key": "voice.live.tone", "value": "relaxed"}], "Calmer.")["requests"]
+    _sync(store, results=[{"id": request["id"], "status": "undone"}])
+    assert [item["id"] for item in store.view()["pending"]] == [request["id"]] and store.view()["results"] == []
+    _sync(store, results=[{"id": request["id"], "status": "dismissed"}])
+    _sync(store, results=[{"id": request["id"], "status": "undone"}])
+    assert [item["status"] for item in store.view()["results"]] == ["dismissed"]
+    [applied] = store.request([{"key": "voice.live.tone", "value": "professional"}], "Formal.")["requests"]
+    _sync(store, results=[{"id": applied["id"], "status": "applied"}])
+    _sync(store, results=[{"id": applied["id"], "status": "undone"}])
+    first = store.view()["results"][-1]
+    clock.now += 60
+    _sync(store, results=[{"id": applied["id"], "status": "undone"}])
+    assert store.view()["results"][-1] == first
+    # Not even once the undo has left the results ring.
+    clock.now += store_module.HOUR_S
+    for n in range(store_module.MAX_RESULTS):
+        clock.now += store_module.HOUR_S / store_module.PER_HOUR
+        [other] = store.request([{"key": "voice.live.greeting", "value": f"hi {n}"}], "Greet.")["requests"]
+        _sync(store, results=[{"id": other["id"], "status": "applied"}])
+    _sync(store, results=[{"id": applied["id"], "status": "undone"}])
+    assert applied["id"] not in [item["id"] for item in store.view()["results"]]
+
+
+def test_an_undo_for_a_request_never_applied_here_is_ignored(store):
+    _sync(store)
+    [request] = store.request([{"key": "voice.live.tone", "value": "relaxed"}], "Calmer.")["requests"]
+    _sync(store, installation=IPAD)
+    _sync(store, installation=IPAD, results=[{"id": request["id"], "status": "undone"},
+                                             {"id": "never-made-here1", "status": "undone"}])
+    assert store.view()["results"] == []
+
+
 def test_a_result_for_another_device_or_unknown_request_is_ignored(store):
     _sync(store)
     _sync(store, installation=IPAD)

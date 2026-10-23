@@ -2895,6 +2895,7 @@ def local_live_key(profile: Optional[str], rotate: bool = False) -> str:
         named = _local_live_profile_key(profile)
         for token in [t for t, (p, _) in _local_live_verified.items() if _local_live_profile_key(p) == named]:
             del _local_live_verified[token]
+        _local_live_known.pop(named, None)
         return key
 
 
@@ -2911,6 +2912,7 @@ LOCAL_LIVE_VERIFIED_TTL_S = 30.0
 # Per profile as many as the one shared budget allowed before, so junk keys
 # naming one profile cost no less than they did.
 LOCAL_LIVE_KEY_CHECK_LIMIT = 60
+LOCAL_LIVE_MAX_KEY_CHARS = 512
 LOCAL_LIVE_KEY_CHECK_TOTAL_LIMIT = 300
 # Its keys are bounded by the total budget below (a refused check gives its
 # slot back), so a flood of made-up profile names never fills it.
@@ -2918,6 +2920,12 @@ _local_live_key_check_limiter = _MintLimiter(LOCAL_LIVE_KEY_CHECK_LIMIT, 60.0, m
                                              max_keys=LOCAL_LIVE_KEY_CHECK_TOTAL_LIMIT + 1)
 _local_live_key_check_total_limiter = _MintLimiter(LOCAL_LIVE_KEY_CHECK_TOTAL_LIMIT, 60.0,
                                                    message="Too many Local Live key checks")
+# The key each profile last verified with, until its key file changes: that
+# key gets in without the check budget, so wrong keys naming the profile can't
+# spend the budget and lock its voice server out once the cache above expires.
+# Kept as a digest beside the key file's stat, so a rotation by another
+# dashboard process on this home (which replaces the file) retires it too.
+_local_live_known: Dict[str, Tuple[bytes, Tuple[int, int, int, int]]] = {}
 
 
 def local_live_profile_for_key(token: str) -> Optional[str]:
@@ -2931,6 +2939,14 @@ def local_live_profile_for_key(token: str) -> Optional[str]:
     if named is None:
         return None
     bucket = _local_live_profile_key(named)
+    with _local_live_key_lock:
+        generation = _local_live_key_generation
+    if _local_live_is_known(token, named):
+        with _local_live_key_lock:
+            # A rotation since the stat retired this key: it takes the budgeted check below.
+            if generation == _local_live_key_generation:
+                _local_live_remember_verified(token, named, now)
+                return named
     try:
         mint = _local_live_key_check_limiter.acquire(bucket)
     except TokenError:
@@ -2942,22 +2958,63 @@ def local_live_profile_for_key(token: str) -> Optional[str]:
         return None
     with _local_live_key_lock:
         generation = _local_live_key_generation
+    # Stat before and after the read: a file replaced in between can't be
+    # remembered against the key read from the one before it.
+    before = _local_live_key_stamp(named)
     profile = _local_live_check_key(token)
     if profile is not None:
         # A right key doesn't spend the budget wrong ones share.
         _local_live_key_check_limiter.release(bucket, mint)
         _local_live_key_check_total_limiter.release("", total)
+        after = _local_live_key_stamp(named) if before is not None else None
         with _local_live_key_lock:
             if generation == _local_live_key_generation:
-                for stale in [k for k, (_, expiry) in _local_live_verified.items() if expiry <= now]:
-                    del _local_live_verified[stale]
-                _local_live_verified[token] = (profile, now + LOCAL_LIVE_VERIFIED_TTL_S)
+                _local_live_remember_verified(token, profile, now)
+                if after is not None and after == before:
+                    _local_live_known[bucket] = (_local_live_digest(token), after)
     return profile
+
+
+def _local_live_remember_verified(token: str, profile: str, now: float) -> None:
+    """Caches a verified key, dropping expired ones (under the key lock)."""
+    for stale in [k for k, (_, expiry) in _local_live_verified.items() if expiry <= now]:
+        del _local_live_verified[stale]
+    _local_live_verified[token] = (profile, now + LOCAL_LIVE_VERIFIED_TTL_S)
+
+
+def _local_live_digest(token: str) -> bytes:
+    return hashlib.sha256(token.encode("utf-8")).digest()
+
+
+def _local_live_key_stamp(profile: str) -> Optional[Tuple[int, int, int, int]]:
+    """The profile's key file as it stands on disk (inode, mtime, ctime, size), else None."""
+    try:
+        with _profile_scope(profile or None):
+            stat = os.stat(_local_live_key_path())
+    except Exception:  # noqa: BLE001 — no stamp just means the key is checked again
+        return None
+    return (stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+
+
+def _local_live_is_known(token: str, profile: str) -> bool:
+    """Whether ``token`` is the key ``profile`` last verified with and its file is unchanged."""
+    bucket = _local_live_profile_key(profile)
+    with _local_live_key_lock:
+        known = _local_live_known.get(bucket)
+    if known is None or not hmac.compare_digest(known[0], _local_live_digest(token)):
+        return False
+    if _local_live_key_stamp(profile) == known[1]:
+        return True
+    with _local_live_key_lock:
+        if _local_live_known.get(bucket) == known:
+            del _local_live_known[bucket]
+    return False
 
 
 def _local_live_key_profile(token: str) -> Optional[str]:
     """The profile a well-formed key names, without reading anything; else None."""
-    if not isinstance(token, str):
+    # A real key is well under this; longer ones are refused before any work.
+    if not isinstance(token, str) or len(token) > LOCAL_LIVE_MAX_KEY_CHARS:
         return None
     parts = token.split(".")
     if len(parts) != 3 or parts[0] != LOCAL_LIVE_KEY_PREFIX or not parts[2]:

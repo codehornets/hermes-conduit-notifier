@@ -281,7 +281,8 @@ def test_two_processes_making_the_first_key_at_once_hand_out_the_same_one(tmp_pa
     assert keys == [stored, stored]
 
 
-@pytest.mark.parametrize("token", ["", "cll1", "cll1.-.", "cll2.-.abc", "cll1.!!!.abc", "Bearer x", "cll1.d29yaw.abc"])
+@pytest.mark.parametrize("token", ["", "cll1", "cll1.-.", "cll2.-.abc", "cll1.!!!.abc", "Bearer x", "cll1.d29yaw.abc",
+                                   "cll1.-." + "a" * 600])
 def test_malformed_or_unknown_keys_name_no_profile(hermes, token):
     _key(hermes, "work")
     assert api.local_live_profile_for_key(token) is None
@@ -617,6 +618,68 @@ def test_the_total_key_check_budget_backs_up_every_profile(monkeypatch):
         api.local_live_profile_for_key("cll1." + base64.urlsafe_b64encode(name).decode().rstrip("=") + ".wrong")
     assert len(checked) == 2
     assert api.local_live_profile_for_key(None) is None
+
+
+def test_wrong_keys_spending_a_profiles_budget_dont_lock_out_its_right_key(hermes, monkeypatch):
+    monkeypatch.setattr(api, "_local_live_verified", {})
+    monkeypatch.setattr(api, "_local_live_known", {})
+    monkeypatch.setattr(api, "_local_live_key_check_limiter", api._MintLimiter(2, 60.0, message="Too many"))
+    monkeypatch.setattr(api, "_local_live_key_check_total_limiter", api._MintLimiter(100, 60.0, message="Too many"))
+    key = _key(hermes, "work")
+    assert api.local_live_profile_for_key(key) == "work"
+    wrong = ".".join(key.split(".")[:2] + ["wrong"])
+    for _ in range(5):
+        assert api.local_live_profile_for_key(wrong) is None
+    # The 30 s cache has expired: the right key still gets in, the wrong one doesn't.
+    api._local_live_verified.clear()
+    assert api.local_live_profile_for_key(key) == "work"
+    api._local_live_verified.clear()
+    assert api.local_live_profile_for_key(wrong) is None
+
+
+def test_a_rotation_by_another_process_retires_the_remembered_key(hermes, monkeypatch):
+    monkeypatch.setattr(api, "_local_live_verified", {})
+    monkeypatch.setattr(api, "_local_live_known", {})
+    key = _key(hermes, "work")
+    assert api.local_live_profile_for_key(key) == "work"
+    # Another dashboard process replaces the file; this one's counter never moves.
+    with hermes_scope(hermes, "work"):
+        path = hermes.home() / api.LOCAL_LIVE_FILE
+    rotated = ".".join(key.split(".")[:2] + ["rotated"])
+    replacement = path.with_name("replacement")
+    replacement.write_text(json.dumps({"version": 1, "api_key": rotated}))
+    os.replace(replacement, path)
+    api._local_live_verified.clear()
+    assert api.local_live_profile_for_key(key) is None
+    assert api.local_live_profile_for_key(rotated) == "work"
+
+
+def test_a_rotation_racing_the_remembered_key_sends_it_the_long_way(monkeypatch):
+    monkeypatch.setattr(api, "_local_live_verified", {})
+    calls = []
+
+    def known_until_rotated(token, profile):
+        calls.append(token)
+        if len(calls) > 1:
+            return False
+        monkeypatch.setattr(api, "_local_live_key_generation", api._local_live_key_generation + 1)
+        return True
+
+    monkeypatch.setattr(api, "_local_live_is_known", known_until_rotated)
+    monkeypatch.setattr(api, "_local_live_check_key", lambda token: None)
+    assert api.local_live_profile_for_key("cll1.-.old") is None
+    assert api._local_live_verified == {}
+
+
+def test_a_rotation_here_retires_the_remembered_key(hermes, monkeypatch):
+    monkeypatch.setattr(api, "_local_live_verified", {})
+    monkeypatch.setattr(api, "_local_live_known", {})
+    key = _key(hermes, "work")
+    assert api.local_live_profile_for_key(key) == "work"
+    with hermes_scope(hermes, "work"):
+        api.local_live_key("work", rotate=True)
+    assert "work" not in api._local_live_known
+    assert api.local_live_profile_for_key(key) is None
 
 
 # --- Read-back speech servers ---------------------------------------------------

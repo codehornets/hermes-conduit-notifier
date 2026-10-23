@@ -67,6 +67,10 @@ MAX_DEVICE_NAME_CHARS = 60
 MAX_CHANGES = 10
 MAX_PENDING = 20
 MAX_RESULTS = 20
+# Applied requests remembered past the results ring, so a late Undo still
+# names the setting it put back.
+MAX_APPLIED = 160
+_APPLIED_FIELDS = ("id", "device", "key", "title", "value", "from", "session_id", "at")
 # Requests no phone picked up are dropped after a day; results are kept a
 # week so the next chat can still tell what happened.
 PENDING_TTL_S = 24 * 3600
@@ -393,23 +397,39 @@ def _take_result(state: dict[str, Any], installation: str, result: Any, now: flo
     request = next((item for item in state["pending"]
                     if item["id"] == request_id and item["installation_id"] == installation), None)
     if request is not None:
+        # Nothing waiting was applied, so there is nothing to undo.
+        if status == "undone":
+            return
         state["pending"].remove(request)
     elif status != "undone":
         return
     else:
-        # An Undo comes after the request was applied and left the queue.
-        earlier = next((item for item in state["results"] if item["id"] == request_id
-                        and item["device"] == installation), None)
+        # An Undo comes after the request was applied and left the queue. Its
+        # "applied" may have aged out of the results ring by then; the ledger
+        # of applied requests still knows it.
+        # Only an apply can be undone, and once only.
+        latest = next((item for item in reversed(state["results"]) if item["id"] == request_id
+                       and item["device"] == installation), None)
+        if latest is not None and latest["status"] != "applied":
+            return
+        earlier = latest or next((item for item in state["applied"] if item["id"] == request_id
+                                  and item["device"] == installation and now - item["at"] <= RESULT_TTL_S), None)
         if earlier is None:
             return
         request = {**earlier, "installation_id": installation}
-    state["results"] = [item for item in state["results"] if item["id"] != request_id]
+    state["results"] = [item for item in state["results"]
+                        if item["id"] != request_id or item["device"] != installation]
     state["results"].append({
         "id": request_id, "device": installation, "key": request["key"], "title": request.get("title", ""),
         "value": request["value"], "from": request.get("from"), "status": status,
         "note": _line(result.get("note"), MAX_NOTE_CHARS), "session_id": request.get("session_id", ""), "at": now,
     })
     state["results"] = state["results"][-MAX_RESULTS:]
+    state["applied"] = [item for item in state["applied"]
+                        if item["id"] != request_id or item["device"] != installation]
+    if status == "applied":
+        state["applied"].append({key: state["results"][-1][key] for key in _APPLIED_FIELDS})
+        state["applied"] = state["applied"][-MAX_APPLIED:]
 
 
 def _trim_devices(state: dict[str, Any]) -> None:
@@ -424,7 +444,8 @@ def _trim_devices(state: dict[str, Any]) -> None:
 def _normalized(raw: Any, now: float) -> dict[str, Any]:
     """A well-formed state from whatever is on disk, with expired entries
     dropped."""
-    state: dict[str, Any] = {"version": VERSION, "devices": {}, "pending": [], "results": [], "asked": {}}
+    state: dict[str, Any] = {"version": VERSION, "devices": {}, "pending": [], "results": [], "applied": [],
+                             "asked": {}}
     if not isinstance(raw, dict):
         return state
     asked = raw.get("asked")
@@ -458,6 +479,13 @@ def _normalized(raw: Any, now: float) -> dict[str, Any]:
                 and isinstance(result.get("at"), (int, float)) and now - result["at"] <= RESULT_TTL_S):
             state["results"].append(result)
     state["results"] = state["results"][-MAX_RESULTS:]
+    applied = raw.get("applied")
+    for item in applied if isinstance(applied, list) else []:
+        if (isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("device"), str)
+                and isinstance(item.get("key"), str) and "value" in item
+                and isinstance(item.get("at"), (int, float)) and now - item["at"] <= RESULT_TTL_S):
+            state["applied"].append({key: item.get(key) for key in _APPLIED_FIELDS})
+    state["applied"] = state["applied"][-MAX_APPLIED:]
     if isinstance(asked, dict):
         for installation, times in asked.items():
             if installation in state["devices"] and isinstance(times, list):
