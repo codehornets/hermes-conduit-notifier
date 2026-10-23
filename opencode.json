@@ -1,16 +1,16 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "mimo": {
+    "go-custom": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Xiaomi MiMo",
+      "name": "OpenCode Go (Custom)",
       "options": {
-        "baseURL": "https://token-plan-sgp.xiaomimimo.com/v1",
-        "apiKey": "{env:MIMO_API_KEY}"
+        "baseURL": "https://opencode.ai/zen/go/v1",
+        "apiKey": "{env:OPENCODE_GO_API_KEY}"
       },
       "models": {
-        "mimo-v2.6-flash": {
-          "name": "MiMo V2.6 Flash"
+        "deepseek-flash": {
+          "name": "DeepSeek V4.1 Flash"
         }
       }
     },

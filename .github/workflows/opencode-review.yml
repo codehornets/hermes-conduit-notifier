@@ -31,8 +31,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - reviewer: MiMo V2.6 Flash
-            model: mimo/mimo-v2.6-flash
+          - reviewer: DeepSeek V4.1 Flash
+            model: go-custom/deepseek-flash
           - reviewer: GLM-5.3-Flash
             model: zai-custom/glm-5.3-flash
     # No id-token: opencode uses the run's token (USE_GITHUB_TOKEN), not OIDC.
@@ -120,7 +120,7 @@ jobs:
         timeout-minutes: 40
         run: GITHUB_EVENT_NAME=pull_request GITHUB_ACTOR=${{ github.repository_owner }} opencode github run
         env:
-          MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
+          OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           # The run's own token: this repo only, the job's permissions above,
           # and it expires when the run ends.
