@@ -542,6 +542,65 @@ def test_distance_to_and_places_respect_private(home):
     assert {"name": "a private place", "private": True} in _call({"action": "places"})["places"]
 
 
+def test_no_distance_blames_the_fix_when_it_carried_none(home):
+    # The usual cause: a background fix without distances, not a setting the
+    # user never touched, which the note used to claim.
+    _shared(home, fix=fix(distances_m={}))
+    answer = _call({"action": "distance_to", "place": "Home"})
+    assert answer["error"] == "no_distance"
+    assert "carried no distances" in answer["note"] and "places only" not in answer["note"]
+
+
+def test_no_distance_at_places_only_keeps_that_explanation(home):
+    _shared(home, sharing=sharing(talking_precision="places", background_precision="places"), fix=fix())
+    answer = _call({"action": "distance_to", "place": "Home"})
+    assert answer["error"] == "no_distance"
+    assert answer["note"] == "Distances aren't shared at the 'places only' detail the user chose."
+
+
+def test_no_distance_names_a_place_added_after_the_fix(home):
+    _shared(home, fix=fix(distances_m={"p_work": 4321}))
+    answer = _call({"action": "distance_to", "place": "Home"})
+    assert answer["error"] == "no_distance"
+    assert "Home" in answer["note"] and "may have been added after" in answer["note"]
+
+
+def test_no_distance_at_a_private_place_does_not_blame_the_setting(home):
+    # The store stamps a fix taken at a private place as places only too.
+    _shared(home, fix=fix(place_id="p_clinic"))
+    answer = _call({"action": "distance_to", "place": "Home"})
+    assert answer["error"] == "no_distance"
+    assert "private" in answer["note"] and "the user chose" not in answer["note"]
+    # Even when one layer is places only, a fix at a private place says so.
+    _shared(home, sharing=sharing(background_precision="places"), fix=fix(place_id="p_clinic"))
+    assert "private" in _call({"action": "distance_to", "place": "Home"})["note"]
+
+
+def test_no_distance_offers_locate_only_with_background_sharing(home):
+    _shared(home, sharing=sharing(background=False), fix=fix(distances_m={}))
+    note = _call({"action": "distance_to", "place": "Home"})["note"]
+    assert "locate" not in note and "without a distance" in note
+    _shared(home, sharing=sharing(background_precision="places"), fix=fix(distances_m={}))
+    assert "locate" not in _call({"action": "distance_to", "place": "Home"})["note"]
+
+
+def test_a_places_only_fix_the_settings_no_longer_explain_blames_nothing():
+    # Stamped places only by a setting since changed: neither cause is sure.
+    view = {"sharing": sharing(), "places": {}}
+    note = tool._no_distance_note(view, {"precision": "places", "source": "message", "place_id": None}, {"name": "Home"})
+    assert "private" not in note and "the user chose" not in note
+    # Only the fix's own layer counts.
+    view = {"sharing": sharing(background_precision="places"), "places": {}}
+    note = tool._no_distance_note(view, {"precision": "places", "source": "message", "place_id": None}, {"name": "Home"})
+    assert "the user chose" not in note
+
+
+def test_a_spoken_no_distance_note_leaves_out_locate():
+    # Voice calls have no locate action.
+    answer = tool._spoken({"ok": False, "note": "The last fix carried no distances." + tool.LOCATE_HINT + " Otherwise."})
+    assert "locate" not in answer["note"]
+
+
 def test_a_paused_user_is_never_guessed(home):
     _shared(home, sharing=sharing(paused_until="2099-01-01T00:00:00+00:00"))
     assert _call({"action": "now"})["error"] == "paused"
