@@ -18,8 +18,8 @@ checks it). The format is fixed, because Conduit reads it:
 ### Fixes
 - When the last location has no distance to a saved place, the agent no
   longer blames the "places only" setting. It says the phone left distances
-  out of that update, or the place was added after it, and can ask for a
-  fresh location.
+  out of that update, the update was taken at a private place, or the place
+  was added after it, and offers a fresh location only when that can work.
 
 ## 0.64.1 (2026-10-23)
 

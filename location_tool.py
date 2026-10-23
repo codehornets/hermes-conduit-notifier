@@ -283,7 +283,7 @@ def _spoken(answer: dict[str, Any]) -> dict[str, Any]:
     answer.pop("coordinates", None)
     if isinstance(answer.get("note"), str):
         answer["note"] = answer["note"].replace(f"Conduit's {SETTINGS_LINK}", "Conduit's Location settings") \
-            .replace(" (leave the link out of anything spoken)", "")
+            .replace(" (leave the link out of anything spoken)", "").replace(LOCATE_HINT, "")
     return answer
 
 
@@ -359,20 +359,27 @@ def _distances(view: dict[str, Any], fix: dict[str, Any]) -> dict[str, str]:
     return shown
 
 
-def _no_distance_note(fix: dict[str, Any], place: dict[str, Any]) -> str:
+LOCATE_HINT = " Action locate asks the phone for a fresh fix."
+
+
+def _no_distance_note(view: dict[str, Any], fix: dict[str, Any], place: dict[str, Any]) -> str:
     """Why this fix has no distance to that place. "Places only" is one cause,
     not the usual one: a background fix often carries no distances at all
     (they arrive with a lookup or a fix sent while Conduit is open), and a
-    place added after the fix isn't in it either. Saying "places only" for
-    those sent the reader after a setting the user never touched."""
+    place added after the fix isn't in it either. Blaming "places only" for
+    those sent the reader chasing a setting the user never touched."""
+    sharing = view["sharing"]
     if fix["precision"] == "places":
-        return "Distances aren't shared at the 'places only' detail the user chose."
+        if "places" in (sharing.get("talking_precision"), sharing.get("background_precision")):
+            return "Distances aren't shared at the 'places only' detail the user chose."
+        # The store also stamps a fix taken at a private place as places only.
+        return "Distances aren't shared for the last fix, which was taken at a place the user keeps private."
+    hint = LOCATE_HINT if sharing.get("background") else ""
     if not (fix.get("distances_m") or {}):
         return ("The last fix carried no distances, which the phone leaves out of some fixes (a background "
-                "arrival or a move usually has none). Action locate asks the phone for a fresh fix, if the user "
-                "allows background sharing; otherwise say where they were without a distance.")
-    return (f"The last fix carried no distance to {place['name']}, which may have been added after it. Action "
-            "locate asks the phone for a fresh fix, if the user allows background sharing.")
+                f"arrival or a move usually has none).{hint} Otherwise say where they were without a distance.")
+    return (f"The last fix carried no distance to {place['name']}, which may have been added after it.{hint} "
+            "Otherwise say where they were without a distance.")
 
 
 def _distance_to(view: dict[str, Any], wanted: Any, now: float) -> dict[str, Any]:
@@ -389,7 +396,7 @@ def _distance_to(view: dict[str, Any], wanted: Any, now: float) -> dict[str, Any
         return {"ok": True, "place": place["name"], "distance": "there at the last fix", "as_of": _ago(now - fix["at"])}
     metres = (fix.get("distances_m") or {}).get(place["id"])
     if metres is None:
-        return {"ok": False, "error": "no_distance", "note": _no_distance_note(fix, place)}
+        return {"ok": False, "error": "no_distance", "note": _no_distance_note(view, fix, place)}
     return {"ok": True, "place": place["name"], "distance": _metres(metres), "straight_line": True,
             "as_of": f"{fix['at_local']} ({_ago(now - fix['at'])})"}
 

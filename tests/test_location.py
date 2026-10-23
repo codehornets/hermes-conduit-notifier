@@ -565,6 +565,26 @@ def test_no_distance_names_a_place_added_after_the_fix(home):
     assert "Home" in answer["note"] and "may have been added after" in answer["note"]
 
 
+def test_no_distance_at_a_private_place_does_not_blame_the_setting(home):
+    # The store stamps a fix taken at a private place as places only too.
+    _shared(home, fix=fix(place_id="p_clinic"))
+    answer = _call({"action": "distance_to", "place": "Home"})
+    assert answer["error"] == "no_distance"
+    assert "private" in answer["note"] and "the user chose" not in answer["note"]
+
+
+def test_no_distance_offers_locate_only_with_background_sharing(home):
+    _shared(home, sharing=sharing(background=False), fix=fix(distances_m={}))
+    note = _call({"action": "distance_to", "place": "Home"})["note"]
+    assert "locate" not in note and "without a distance" in note
+
+
+def test_a_spoken_no_distance_note_leaves_out_locate():
+    # Voice calls have no locate action.
+    answer = tool._spoken({"ok": False, "note": "The last fix carried no distances." + tool.LOCATE_HINT + " Otherwise."})
+    assert "locate" not in answer["note"]
+
+
 def test_a_paused_user_is_never_guessed(home):
     _shared(home, sharing=sharing(paused_until="2099-01-01T00:00:00+00:00"))
     assert _call({"action": "now"})["error"] == "paused"
