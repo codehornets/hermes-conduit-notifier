@@ -64,6 +64,7 @@ class Phone:
         host_public = inbox.unb64u(answer["host_public_key"])
         shared = self.private.exchange(X25519PublicKey.from_public_bytes(host_public))
         self.key = inbox.derive_key(shared, self.device_id, self.public, host_public)
+        self.answer_key = inbox.derive_key(shared, self.device_id, self.public, host_public, inbox.INFO_ANSWER)
         self.kid = answer["kid"]
         assert self.kid == inbox.key_id(self.public, host_public)
 
@@ -108,6 +109,13 @@ def test_the_vector_matches_what_the_phone_computes():
     aad = inbox.ingest_aad(vector["kid"], vector["device_id"], vector["batch_id"])
     assert aad.decode() == vector["aad"]
     assert inbox.open_sealed(key, vector["nonce"], vector["ct"], aad).decode() == vector["plaintext"]
+    answer_key = inbox.derive_key(inbox.agree(host_private, device_public), vector["device_id"], device_public,
+                                  host_public, inbox.INFO_ANSWER)
+    assert answer_key.hex() == vector["answer_key"]
+    list_aad = inbox.list_aad(vector["kid"], vector["device_id"], vector["request_id"])
+    assert list_aad.decode() == vector["list_aad"]
+    assert inbox.open_sealed(answer_key, vector["nonce"], vector["answer_ct"], list_aad).decode() == \
+        vector["answer_plaintext"]
 
 
 def test_an_event_lands_sealed_and_reads_back(store, phone):
@@ -278,3 +286,66 @@ def test_a_lost_key_answers_with_its_code(monkeypatch, tmp_path):
     client.post(f"{BASE}/inbox/wipe", json={"all": True})
     refused = client.post(f"{BASE}/inbox/ingest", json=phone.seal(_batch()))
     assert refused.status_code == 409 and refused.json()["code"] == "unknown_key"
+
+
+def _opened(phone, answer, request_id):
+    return json.loads(inbox.open_sealed(phone.answer_key, answer["nonce"], answer["ct"],
+                                        inbox.list_aad(phone.kid, phone.device_id, request_id)))
+
+
+def test_the_settings_page_reads_its_own_events_sealed_a_page_at_a_time(store, phone):
+    events = [_event(f"evt-{n}", at=f"2026-10-14T0{n}:00:00-04:00") for n in range(1, 6)]
+    store.ingest(phone.seal(_batch(*events)))
+    other = Phone("phone-installation-2")
+    other.accept(store.register_key(other.key_request()))
+    store.ingest(other.seal(_batch(_event("theirs"), batch_id="batch-0002")))
+    sealed = store.list_sealed({"device_id": DEVICE, "kid": phone.kid, "request_id": "request-0001", "limit": 3})
+    assert "IGA" not in json.dumps(sealed)
+    first = _opened(phone, sealed, "request-0001")
+    assert [event["id"] for event in first["events"]] == ["evt-5", "evt-4", "evt-3"]
+    assert first["events"][0]["at"] == "2026-10-14T05:00:00-04:00" and first["next"]
+    second = _opened(phone, store.list_sealed({"device_id": DEVICE, "kid": phone.kid, "request_id": "request-0002",
+                                               "limit": 3, "before": first["next"]}), "request-0002")
+    assert [event["id"] for event in second["events"]] == ["evt-2", "evt-1"] and second["next"] is None
+    with pytest.raises(inbox.InboxError):  # an answer opens only for the request it answers
+        _opened(phone, sealed, "request-0002")
+
+
+def test_the_settings_page_deletes_only_what_it_names_from_its_own(store, phone):
+    store.ingest(phone.seal(_batch(_event("evt-1"), _event("evt-2"))))
+    other = Phone("phone-installation-2")
+    other.accept(store.register_key(other.key_request()))
+    store.ingest(other.seal(_batch(_event("evt-1"), batch_id="batch-0002")))
+    assert store.delete_events({"device_id": DEVICE, "kid": phone.kid, "ids": ["evt-1", "nope"]}) == {"deleted": 1}
+    left = {(event["id"]) for event in _opened(phone, store.list_sealed(
+        {"device_id": DEVICE, "kid": phone.kid, "request_id": "request-0001"}), "request-0001")["events"]}
+    assert left == {"evt-2"}
+    assert len(store.events()[0]) == 2  # the other phone's evt-1 stays
+    with pytest.raises(inbox.InboxError) as refused:
+        store.delete_events({"device_id": DEVICE, "kid": "0" * 32, "ids": ["evt-2"]})
+    assert refused.value.code == "unknown_key"
+
+
+@pytest.mark.parametrize("body", [
+    {"device_id": DEVICE, "kid": "0" * 32},
+    {"device_id": DEVICE, "kid": "0" * 32, "request_id": "request-0001", "limit": 0},
+    {"device_id": DEVICE, "kid": "0" * 32, "request_id": "request-0001", "before": ["x", "evt-1"]},
+])
+def test_malformed_list_requests_are_refused(store, phone, body):
+    with pytest.raises(inbox.InboxError) as refused:
+        store.list_sealed(body)
+    assert refused.value.code == "malformed"
+
+
+def test_the_list_and_delete_routes(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    phone = Phone()
+    phone.accept(client.post(f"{BASE}/inbox/key", json=phone.key_request()).json())
+    event = _event(at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    client.post(f"{BASE}/inbox/ingest", json=phone.seal(_batch(event)))
+    listed = client.post(f"{BASE}/inbox/list", json={"device_id": DEVICE, "kid": phone.kid,
+                                                     "request_id": "request-0001"})
+    assert listed.status_code == 200 and listed.headers["cache-control"] == "no-store"
+    assert [found["id"] for found in _opened(phone, listed.json(), "request-0001")["events"]] == ["evt-1"]
+    deleted = client.post(f"{BASE}/inbox/delete", json={"device_id": DEVICE, "kid": phone.kid, "ids": ["evt-1"]})
+    assert deleted.status_code == 200 and deleted.json()["deleted"] == 1

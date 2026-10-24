@@ -1927,6 +1927,12 @@ Wallet payment, an NFC tag, a sound the phone heard) on this host, for the
 agent to look up later with `conduit_inbox` ("what did the bank send me
 today?"). Logging starts no chat, sends no push and works with Pulse off.
 
+With Pulse on, its report reads what was logged since the last one, and the
+user's watches (things they asked to be told about, which Pulse memory keeps)
+are checked against new events as they arrive: a run starts at most every
+15 minutes, and later arrivals ride the next one. A watch still open after a
+month asks if it's still wanted.
+
 - **Straight to this host, sealed end to end.** The phone posts to
   `POST /api/plugins/conduit_push/inbox/ingest` over your dashboard
   connection, after agreeing a key once with `POST /inbox/key`. It uses the
@@ -1942,9 +1948,12 @@ today?"). Logging starts no chat, sends no push and works with Pulse off.
 - **Data, not instructions.** What the inbox holds is other people's words.
   The tool tells the agent to treat it as data and not to forward it unless
   the user asks. Subagents can't read it.
-- **Status and deleting.** `GET /inbox/status?device_id=…` returns counts
-  only. `POST /inbox/wipe` with `{"device_id": "…"}` or `{"all": true}`
-  deletes events.
+- **Status, reading back and deleting.** `GET /inbox/status?device_id=…`
+  returns counts only. Conduit's Settings page reads a phone's own events
+  with `POST /inbox/list`, sealed for that phone alone under a second key
+  from the same agreement, and deletes the ones the user picks with
+  `POST /inbox/delete`. `POST /inbox/wipe` with `{"device_id": "…"}` or
+  `{"all": true}` deletes everything a phone sent, or everything.
 
 The app checks for the `shortcut-inbox` capability; on an older plugin the
 action keeps events on the phone until the plugin is updated.

@@ -59,6 +59,7 @@ SCHEMA_VERSION = 1
 
 SALT = b"conduit-inbox-v1"
 INFO_INGEST = b"conduit-inbox-v1 ingest device-to-host"
+INFO_ANSWER = b"conduit-inbox-v1 answer host-to-device"
 AAD_TAG = "conduit-inbox/1"
 KID_TAG = b"conduit-inbox-kid\n"
 NONCE_BYTES = 12
@@ -78,12 +79,17 @@ MAX_TITLE_CHARS = 200
 MAX_TEXT_CHARS = 4000
 MAX_AMOUNT_CHARS = 40
 MAX_DEVICE_NAME_CHARS = 60
+# Conduit's Settings page reads a device's own events back a page at a time
+# (list) and deletes the ones the user picks (delete).
+MAX_LIST = 100
+MAX_DELETE = 100
 EARLIEST = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 _DEVICE_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}\Z")
 _EVENT_ID = re.compile(r"^[A-Za-z0-9:_-]{1,80}\Z")
 _BATCH_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}\Z")
 _KID = re.compile(r"^[0-9a-f]{32}\Z")
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}\Z")
 _B64URL = re.compile(r"^[A-Za-z0-9_-]*\Z")
 _TZ = re.compile(r"^[A-Za-z0-9_+\-/]{1,64}\Z")
 
@@ -207,6 +213,10 @@ def new_host_keypair() -> tuple[bytes, bytes]:
         private.private_bytes(raw, serialization.PrivateFormat.Raw, serialization.NoEncryption()),
         private.public_key().public_bytes(raw, serialization.PublicFormat.Raw),
     )
+
+
+def list_aad(kid: str, device_id: str, request_id: str) -> bytes:
+    return "\n".join([AAD_TAG, "list", f"kid={kid}", f"dev={device_id}", f"req={request_id}"]).encode("utf-8")
 
 
 def ingest_aad(kid: str, device_id: str, batch_id: str) -> bytes:
@@ -386,14 +396,14 @@ class InboxStore:
             generation = _meta(db, "generation")
         return {"kid": kid, "host_public_key": b64u(host_public), "generation": generation}
 
-    def _device_key(self, db: sqlite3.Connection, device_id: str, kid: str) -> bytes:
+    def _device_key(self, db: sqlite3.Connection, device_id: str, kid: str, purpose: bytes = INFO_INGEST) -> bytes:
         row = db.execute("SELECT device_public, host_private, host_public, kid FROM devices WHERE id=?",
                          (device_id,)).fetchone()
         if row is None or row[3] != kid:
             raise InboxError("unknown_key", "This device's inbox key isn't on this profile; set it up again",
                              status=409)
         device_public, host_private, host_public = bytes(row[0]), bytes(row[1]), bytes(row[2])
-        return derive_key(agree(host_private, device_public), device_id, device_public, host_public)
+        return derive_key(agree(host_private, device_public), device_id, device_public, host_public, purpose)
 
     # Ingest --------------------------------------------------------------------
 
@@ -423,6 +433,75 @@ class InboxStore:
             result = _apply(db, device_id, batch, now)
             generation = _meta(db, "generation")
         return {**result, "generation": generation}
+
+    # Conduit's Settings page --------------------------------------------------------
+
+    def list_sealed(self, body: Any, nonce: bytes | None = None) -> dict[str, Any]:
+        """A device's own events, newest first, a page at a time, sealed for
+        that device alone (the answer key): the words never cross the
+        dashboard connection in the clear. ``before`` is the last page's
+        ``next``."""
+        device_id, kid, request_id = self._settings_call(body)
+        limit = body.get("limit", 50)
+        if type(limit) is not int or not 1 <= limit <= MAX_LIST:
+            raise InboxError("malformed", f"limit must be 1-{MAX_LIST}")
+        before = body.get("before")
+        if before is not None and (not isinstance(before, list) or len(before) != 2 or type(before[0]) is not int
+                                   or not isinstance(before[1], str) or not _EVENT_ID.match(before[1])):
+            raise InboxError("malformed", "before must be the last page's next")
+        with self._write() as db:
+            key = self._device_key(db, device_id, kid, INFO_ANSWER)
+            clauses, params = ["e.device = ?", "e.at_utc >= ? - d.keep_days * 86400"], [device_id, int(self.clock())]
+            if before is not None:
+                clauses.append("(e.at_utc < ? OR (e.at_utc = ? AND e.id < ?))")
+                params.extend([before[0], before[0], before[1]])
+            rows = db.execute(
+                "SELECT e.id, e.kind, e.at_utc, e.at_local, e.source, e.title, e.text, e.amount"
+                " FROM events e JOIN devices d ON d.id = e.device"
+                f" WHERE {' AND '.join(clauses)} ORDER BY e.at_utc DESC, e.id DESC LIMIT ?",
+                (*params, limit + 1)).fetchall()
+        events = []
+        for event_id, kind, _, at_local, source, title, text, amount in rows[:limit]:
+            item = {"id": event_id, "kind": kind, "at": at_local, "source": source, "title": title, "text": text,
+                    "amount": amount}
+            events.append({name: value for name, value in item.items() if value is not None})
+        last = rows[limit - 1] if len(rows) > limit else None
+        answer = {"request_id": request_id, "events": events, "next": [last[2], last[0]] if last else None}
+        sealed_nonce, ct = seal(key, json.dumps(answer, separators=(",", ":")).encode("utf-8"),
+                                list_aad(kid, device_id, request_id), nonce)
+        return {"nonce": sealed_nonce, "ct": ct}
+
+    def delete_events(self, body: Any) -> dict[str, Any]:
+        """Deletes the events a device names from its own; the rest stay.
+        Ids aren't secret, so the request isn't sealed, but it names the
+        device's key like the rest."""
+        device_id, kid, _ = self._settings_call(body, needs_request=False)
+        ids = body.get("ids")
+        if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_DELETE or \
+                not all(isinstance(event_id, str) and _EVENT_ID.match(event_id) for event_id in ids):
+            raise InboxError("malformed", f"ids must list 1-{MAX_DELETE} event ids")
+        with self._write() as db:
+            self._device_key(db, device_id, kid)
+            deleted = db.execute(f"DELETE FROM events WHERE device=? AND id IN ({','.join('?' * len(ids))})",
+                                 (device_id, *ids)).rowcount
+        return {"deleted": deleted}
+
+    def _settings_call(self, body: Any, needs_request: bool = True) -> tuple[str, str, str]:
+        if not isinstance(body, dict):
+            raise InboxError("malformed", "Expected a JSON object")
+        device_id, kid, request_id = body.get("device_id"), body.get("kid"), body.get("request_id")
+        if not isinstance(device_id, str) or not _DEVICE_ID.match(device_id):
+            raise InboxError("malformed", "device_id is malformed")
+        if not isinstance(kid, str) or not _KID.match(kid):
+            raise InboxError("malformed", "kid is malformed")
+        if needs_request and (not isinstance(request_id, str) or not _REQUEST_ID.match(request_id)):
+            raise InboxError("malformed", "request_id is malformed")
+        if not crypto_available():
+            raise InboxError("no_crypto", "The inbox needs the cryptography package on this host", status=501)
+        if not self.path.exists():
+            raise InboxError("unknown_key", "This device's inbox key isn't on this profile; set it up again",
+                             status=409)
+        return device_id, kid, request_id or ""
 
     # Status and wipe ---------------------------------------------------------------
 

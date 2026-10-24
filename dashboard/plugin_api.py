@@ -8107,7 +8107,11 @@ async def post_location_ingest(request: Request, response: Response,
 # (/inbox/ingest) after agreeing a key once (/inbox/key), straight over the
 # dashboard connection, never through the push relay. No chat turn and no
 # push: the conduit_inbox tool reads them (inbox_store.py,
-# conduit-inbox.sqlite3). Status reports counts only and wipe deletes.
+# conduit-inbox.sqlite3), and Pulse, when it's on, reads them in its report
+# and checks the user's watches when new ones arrive. Status reports counts
+# only. Conduit's Settings page reads a device's own events back sealed for
+# it (/inbox/list), deletes the ones the user picks (/inbox/delete), and
+# wipe deletes a device's or everything.
 
 INBOX_KEY_LIMIT = 10
 INBOX_KEY_WINDOW_S = 60.0
@@ -8126,6 +8130,14 @@ _inbox_ingest_limiter = _MintLimiter(INBOX_INGEST_LIMIT, INBOX_INGEST_WINDOW_S,
                                      message="Too many inbox events; try again shortly")
 _inbox_wipe_limiter = _MintLimiter(INBOX_WIPE_LIMIT, INBOX_WIPE_WINDOW_S,
                                    message="Too many inbox delete requests; try again shortly")
+INBOX_LIST_LIMIT = 60
+INBOX_LIST_WINDOW_S = 60.0
+_inbox_list_limiter = _MintLimiter(INBOX_LIST_LIMIT, INBOX_LIST_WINDOW_S,
+                                   message="Too many inbox requests; try again shortly")
+INBOX_DELETE_LIMIT = 30
+INBOX_DELETE_WINDOW_S = 60.0
+_inbox_delete_limiter = _MintLimiter(INBOX_DELETE_LIMIT, INBOX_DELETE_WINDOW_S,
+                                     message="Too many inbox delete requests; try again shortly")
 _inbox_store_module: Any = None
 
 
@@ -8182,7 +8194,46 @@ async def post_inbox_ingest(request: Request, response: Response, profile: Optio
     response.headers["Cache-Control"] = "no-store"
     await _scoped_acquire(_inbox_ingest_limiter, profile)
     body = await _read_json_body(request, INBOX_MAX_INGEST_BODY_BYTES)
-    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.ingest(body)), "upload")
+    return await _inbox_route(response, profile, lambda: _inbox_ingest(body), "upload")
+
+
+def _inbox_ingest(body: Any) -> Dict[str, Any]:
+    result = _inbox_call(lambda store: store.ingest(body))
+    if result.get("stored"):
+        _inbox_tell_pulse()
+    return result
+
+
+def _inbox_tell_pulse() -> None:
+    """New events in: Pulse checks the user's open watches against them
+    (pulse_followup.inbox_arrived). Only where Pulse runs, on this home;
+    the events are stored whatever happens here."""
+    try:
+        pulse = _plugin_package_module("pulse")
+        home = _calls_home()
+        if not (Path(home) / pulse.store.DB_NAME).exists():
+            return  # Pulse never turned on: leave no file behind
+        if pulse.followup.inbox_arrived(pulse.open_store(home), time.time()):
+            pulse.wake()
+    except Exception:  # noqa: BLE001 — logging an event never fails on Pulse
+        logger.warning("conduit_push: inbox couldn't tell Pulse about new events", exc_info=True)
+
+
+@router.post("/inbox/list")
+async def post_inbox_list(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_list_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.list_sealed(body)), "list")
+
+
+@router.post("/inbox/delete")
+async def post_inbox_delete(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_delete_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES * 2)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.delete_events(body)),
+                              "delete")
 
 
 @router.post("/inbox/wipe")
