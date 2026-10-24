@@ -13,6 +13,15 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.71.0 (2026-10-24)
+
+### New and improved
+- Shortcuts automations can log to Hermes. End an automation (a notification
+  from an app you pick, a message, an email, a Wallet payment, an NFC tag, a
+  sound the phone hears) with Conduit's Log to Hermes action, and Hermes can
+  look it up later ("what did my bank send today?") without a reply or a
+  push each time. Sign-in codes are never kept, and events go after 14 days.
+
 ## 0.69.1 (2026-10-24)
 
 ### Fixes

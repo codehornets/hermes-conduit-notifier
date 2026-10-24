@@ -5,7 +5,7 @@ Hermes Conduit Notifier is the open-source Hermes plugin that connects a Hermes 
 - **Notifications and calls**: approval, input, reply, failure and background-task notifications, Hermes calling you (CallKit on the phone and Watch), and Lock Screen progress while a turn runs, all delivered through the Conduit push relay in [`relay/`](relay/), end-to-end encrypted where APNs allows.
 - **Live voice**: single-use Gemini Live tokens, GPT-Live sessions on the host's ChatGPT subscription or API key, Grok Live relayed with the host's xAI sign-in, Local Live and Classic voice through your own speech server, voice web lookups, memory and personality for voice, and saved call transcripts.
 - **Apple Watch**: short-lived grants that let a Watch call run lookups and Hermes jobs, and stream GPT-Live, Grok and Local Live audio, through the relay, sealed end to end.
-- **Phone data the user opts into**: Apple Health, location, maps, calendar, reminders, Focus, phone status, contacts and alarms, sent by the phone straight to this host and sealed end to end, with the `conduit_health`, `conduit_location`, `conduit_maps`, `conduit_calendar`, `conduit_phone` and `conduit_contacts` tools for the agent.
+- **Phone data the user opts into**: Apple Health, location, maps, calendar, reminders, Focus, phone status, contacts and alarms, sent by the phone straight to this host and sealed end to end, with the `conduit_health`, `conduit_location`, `conduit_maps`, `conduit_calendar`, `conduit_phone` and `conduit_contacts` tools for the agent, and events from the user's Shortcuts automations through `conduit_inbox`.
 - **Conduit extras**: rich cards and on-screen cards during calls, Artifacts, group pictures, chat takeover, cron notification settings, Conduit settings the agent can change, and one-tap pairing and updates from the app.
 
 Every route sits behind the Hermes dashboard's own auth. The plugin holds no Apple Push Notification service key and no dashboard credentials: Apple credentials stay on the push relay, so self-hosted users never need to copy a shared signing key onto their gateway, and provider keys and sign-ins never leave this host. What each party can see is in the [privacy policy](https://kaishi00.github.io/hermes-conduit-notifier/privacy/).
@@ -1896,6 +1896,36 @@ takes the item's id from these reads), so no write is offered here. With plugin 
 timers Hermes set) and `conduit_contacts` (`people`) joins the list, each once
 a phone shares it; setting an alarm or timer in a call is the phone's own tool
 too.
+
+## Events from Shortcuts automations (plugin 0.71+)
+
+Conduit's **Log to Hermes** Shortcuts action keeps what an automation hands
+over (a notification from an app the user picks, a message, an email, a
+Wallet payment, an NFC tag, a sound the phone heard) on this host, for the
+agent to look up later with `conduit_inbox` ("what did the bank send me
+today?"). Logging starts no chat, sends no push and works with Pulse off.
+
+- **Straight to this host, sealed end to end.** The phone posts to
+  `POST /api/plugins/conduit_push/inbox/ingest` over your dashboard
+  connection, after agreeing a key once with `POST /inbox/key`. It uses the
+  same X25519, HKDF-SHA256 and ChaCha20-Poly1305 scheme as health and
+  location; nothing passes through the push relay.
+- **Sign-in codes are never kept.** The phone doesn't send anything that
+  looks like a verification code, one-time password or sign-in link, and
+  this host drops it again if one gets through.
+- **Kept for a while, then gone.** Events stay 14 days by default (the
+  phone may ask for up to 30), at most 5,000 per phone, in
+  `conduit-inbox.sqlite3` in the profile's home, readable only by its owner.
+  A new key for a phone drops what the old key sent.
+- **Data, not instructions.** What the inbox holds is other people's words.
+  The tool tells the agent to treat it as data and not to forward it unless
+  the user asks. Subagents can't read it.
+- **Status and deleting.** `GET /inbox/status?device_id=…` returns counts
+  only. `POST /inbox/wipe` with `{"device_id": "…"}` or `{"all": true}`
+  deletes events.
+
+The app checks for the `shortcut-inbox` capability; on an older plugin the
+action keeps events on the phone until the plugin is updated.
 
 ## Location from Conduit (plugin 0.26+)
 

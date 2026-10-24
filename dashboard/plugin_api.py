@@ -7974,6 +7974,110 @@ async def post_location_ingest(request: Request, response: Response,
     return await _location_route(response, profile, lambda: _location_ingest(body), "upload")
 
 
+# --- Shortcuts inbox ---------------------------------------------------------
+#
+# The user's iPhone Shortcuts automations (a notification from an app they
+# pick, a message, an email, a Wallet payment, an NFC tag, a sound) end in
+# Conduit's Log to Hermes action, which posts each run here as a sealed event
+# (/inbox/ingest) after agreeing a key once (/inbox/key), straight over the
+# dashboard connection, never through the push relay. No chat turn and no
+# push: the conduit_inbox tool reads them (inbox_store.py,
+# conduit-inbox.sqlite3). Status reports counts only and wipe deletes.
+
+INBOX_KEY_LIMIT = 10
+INBOX_KEY_WINDOW_S = 60.0
+INBOX_WIPE_LIMIT = 5
+INBOX_WIPE_WINDOW_S = 60.0
+# A burst of notifications can each run an automation.
+INBOX_INGEST_LIMIT = 120
+INBOX_INGEST_WINDOW_S = 60.0
+INBOX_MAX_KEY_BODY_BYTES = 4 * 1024
+# At most 50 events of about 4 KB of text each, sealed and base64url.
+INBOX_MAX_INGEST_BODY_BYTES = 512 * 1024
+
+_inbox_key_limiter = _MintLimiter(INBOX_KEY_LIMIT, INBOX_KEY_WINDOW_S,
+                                  message="Too many inbox key requests; try again shortly")
+_inbox_ingest_limiter = _MintLimiter(INBOX_INGEST_LIMIT, INBOX_INGEST_WINDOW_S,
+                                     message="Too many inbox events; try again shortly")
+_inbox_wipe_limiter = _MintLimiter(INBOX_WIPE_LIMIT, INBOX_WIPE_WINDOW_S,
+                                   message="Too many inbox delete requests; try again shortly")
+_inbox_store_module: Any = None
+
+
+def _inbox_store() -> Any:
+    """inbox_store.py beside this folder, loaded once."""
+    global _inbox_store_module
+    if _inbox_store_module is None:
+        _inbox_store_module = _plugin_package_module("inbox_store")
+    return _inbox_store_module
+
+
+def _inbox_call(fn: Callable[[Any], Dict[str, Any]]) -> Dict[str, Any]:
+    module = _inbox_store()
+    try:
+        return fn(module.InboxStore(_calls_home()))
+    except module.InboxError as exc:
+        raise TokenError(exc.status, str(exc), exc.code)
+    except sqlite3.DatabaseError:
+        logger.warning("conduit_push: inbox store unreadable", exc_info=True)
+        raise TokenError(503, "The inbox on this host can't be read")
+
+
+async def _inbox_route(response: Response, profile: Optional[str], fn: Callable[[], Dict[str, Any]],
+                       name: str) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"ok": True, **(await _run_scoped(profile, fn))}
+    except TokenError as exc:
+        return _store_refusal(exc)
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected(name, exc, feature="Shortcuts inbox")
+
+
+@router.get("/inbox/status")
+async def get_inbox_status(response: Response, profile: Optional[str] = None,
+                           device_id: Optional[str] = None) -> Dict[str, Any]:
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: {
+        **store.status(device_id), "crypto": _inbox_store().crypto_available()}), "status")
+
+
+@router.post("/inbox/key")
+async def post_inbox_key(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_key_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.register_key(body)), "key")
+
+
+@router.post("/inbox/ingest")
+async def post_inbox_ingest(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_ingest_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_INGEST_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.ingest(body)), "upload")
+
+
+@router.post("/inbox/wipe")
+async def post_inbox_wipe(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_wipe_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object", headers={"Cache-Control": "no-store"})
+    # Everything only when asked for by name; a device id alone deletes that device's events.
+    if body.get("all") is True and body.get("device_id") is not None:
+        raise HTTPException(status_code=400, detail="Name a device_id or all: true, not both",
+                            headers={"Cache-Control": "no-store"})
+    device_id = None if body.get("all") is True else body.get("device_id")
+    if device_id is None and body.get("all") is not True:
+        raise HTTPException(status_code=400, detail="Name a device_id, or all: true",
+                            headers={"Cache-Control": "no-store"})
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.wipe(device_id)), "delete")
+
+
 # A maps lookup the agent asked the phone for (conduit_maps): the phone,
 # woken by a location push, fetches the lookup sealed for it alone and posts
 # its Apple Maps answer sealed back. Neither passes through the relay.
@@ -14677,6 +14781,8 @@ ROUTE_CAPABILITIES = (
     # sharing.other_profiles: the host's other profiles paired with the
     # same iPhone read the location (location_profiles).
     "location-profiles",
+    # /inbox: events the user's Shortcuts automations log (Log to Hermes).
+    "shortcut-inbox",
     "pairing",
     "self-restart",
     # POST /self/update runs the whole update on the host and notifies.
