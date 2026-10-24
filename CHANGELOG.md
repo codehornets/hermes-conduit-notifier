@@ -20,7 +20,7 @@ checks it). The format is fixed, because Conduit reads it:
   from an app you pick, a message, an email, a Wallet payment, an NFC tag, a
   sound the phone hears) with Conduit's Log to Hermes action, and Hermes can
   look it up later ("what did my bank send today?") without a reply or a
-  push each time. Sign-in codes are never kept, and events go after 14 days.
+  push each time. Sign-in codes are never kept, and events go after 30 days.
 - With Pulse on, its reports read what your automations logged, and when
   you ask Hermes to tell you when something happens ("let me know when the
   bank confirms the transfer"), Pulse checks as soon as a new event comes in.

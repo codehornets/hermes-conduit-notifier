@@ -69,7 +69,8 @@ KEY_BYTES = 32
 # one of these; anything else (CarPlay, an alarm, a Focus) is "other".
 KINDS = ("notification", "message", "email", "transaction", "nfc", "sound", "other")
 
-KEEP_DAYS = 14
+# The maintainer's window: 30 days to start, then deleted (review of #350).
+KEEP_DAYS = 30
 MAX_KEEP_DAYS = 30
 MAX_DEVICES = 4
 MAX_EVENTS_PER_BATCH = 50

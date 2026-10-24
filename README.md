@@ -1931,7 +1931,9 @@ With Pulse on, its report reads what was logged since the last one, and the
 user's watches (things they asked to be told about, which Pulse memory keeps)
 are checked against new events as they arrive: a run starts at most every
 15 minutes, and later arrivals ride the next one. A watch still open after a
-month asks if it's still wanted.
+month asks if it's still wanted. A report item or a watch's message may
+quote an event, but Pulse memory never keeps other people's messages or
+facts about who sent them unless the user asks.
 
 - **Straight to this host, sealed end to end.** The phone posts to
   `POST /api/plugins/conduit_push/inbox/ingest` over your dashboard
@@ -1941,8 +1943,8 @@ month asks if it's still wanted.
 - **Sign-in codes are never kept.** The phone doesn't send anything that
   looks like a verification code, one-time password or sign-in link, and
   this host drops it again if one gets through.
-- **Kept for a while, then gone.** Events stay 14 days by default (the
-  phone may ask for up to 30), at most 5,000 per phone, in
+- **Kept for a while, then gone.** Events stay 30 days (the phone may ask
+  for fewer), at most 5,000 per phone, in
   `conduit-inbox.sqlite3` in the profile's home, readable only by its owner.
   A new key for a phone drops what the old key sent.
 - **Data, not instructions.** What the inbox holds is other people's words.
