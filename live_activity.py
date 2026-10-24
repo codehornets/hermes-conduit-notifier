@@ -92,6 +92,7 @@ _TOOL_CATEGORIES = {
     "todo": "planning",
     "cronjob": "schedule",
     "send_message": "messages",
+    "message_agent": "messages",
     "skill_view": "skills",
     "skills_list": "skills",
     "skill_manage": "skills",

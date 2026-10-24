@@ -70,6 +70,7 @@ def test_tool_names_become_coarse_categories():
     assert live.tool_category("browser_click") == "browser"
     assert live.tool_category("mcp_github_create_issue") == "connector"
     assert live.tool_category("web_search") == "web"
+    assert live.tool_category("message_agent") == "messages"
     assert live.tool_category("my_secret_project_tool") == "tool"
     assert live.tool_category(None) == "tool"
 
