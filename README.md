@@ -541,13 +541,15 @@ fairness boundary.
 
 ## Gemini Live tokens
 
-### Qwen direct voice
+### Qwen Live: independently selectable direct voice
 
-The modified app's **Gemini / Qwen Live** mode can use Qwen instead of Google.
-Set these in the Hermes profile's `.env` and restart the gateway:
+Qwen Live is a separate provider alongside Gemini Live in the phone, Watch
+and CarPlay pickers. Both can be configured at once; switching in Conduit
+requires no environment-variable change or gateway restart.
+
+Set these in the profile's `.env`:
 
 ```dotenv
-CONDUIT_DIRECT_LIVE_PROVIDER=qwen
 DASHSCOPE_API_KEY=your-bailian-key
 CONDUIT_QWEN_LIVE_WORKSPACE=your-workspace-id
 CONDUIT_QWEN_LIVE_REGION=cn-beijing
@@ -555,24 +557,27 @@ CONDUIT_QWEN_LIVE_MODEL=qwen3.8-omni-flash-realtime
 CONDUIT_QWEN_LIVE_VOICE=Tina
 ```
 
-The key/workspace must match the region; Singapore is `ap-southeast-1`.
-`GET /api/plugins/conduit_push/direct-live/status` checks configuration.
-`POST /api/plugins/conduit_push/direct-live/token` returns a 120-second
-temporary key, model, voice and provider WebSocket address. Both routes use
-normal dashboard authentication and profile scoping; token responses are
-not cached. The permanent key stays on the host. Failed minting never falls
-back to the permanent key or Google. The default provider remains Gemini.
-The legacy `/gemini-live/*` routes continue to serve Google.
+Singapore uses `ap-southeast-1`; the key/workspace must match the region.
+The host voice is a default; Conduit's Qwen settings can override it without
+changing Gemini's voice. Gemini keeps its existing key and endpoints.
 
-iPhone and Watch connect directly to Alibaba for audio. Watch tool requests
-and reconnect credentials can use the encrypted relay grant, but audio does
-not pass through the relay or this host. Qwen native search is disabled in
-favor of Hermes function tools. The existing Gemini voice picker only affects
-Google; use the host voice setting for Qwen.
+`GET /api/plugins/conduit_push/qwen-live/status` checks Qwen configuration.
+`POST /api/plugins/conduit_push/qwen-live/token` returns a short-lived key,
+model, voice and provider address. These routes use profile-scoped dashboard
+authentication and no-store responses. A mint failure never falls back to
+Google or returns the permanent key. There is no host-wide provider selector.
 
-This source integration has mocked tests, not account/device verification.
-Validate temporary-key compatibility at the workspace endpoint and token
-expiry on established calls, then build and test the Apple app on macOS.
+Phone and Watch audio connect directly to Alibaba Cloud. Encrypted Watch
+grants may carry tools and reconnect credentials, not audio. The grant tools
+`live_token` and `qwen_live_token` are authorized independently and cannot
+mint each other's credentials. Qwen calls use the `qwen-live` history and
+phone-data permission identity; Gemini keeps `gemini-live`.
+
+The app asks for separate Alibaba Cloud consent. Tools, audio controllers,
+CarPlay and incoming calls share infrastructure while selecting independent
+provider clients. Qwen uses Hermes web search instead of incompatible native
+search plus tools. Live credentials and Apple-device behavior still require
+maintainer testing as described in the companion app PR.
 
 ### Google Gemini credentials
 

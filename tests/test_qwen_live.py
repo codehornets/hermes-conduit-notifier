@@ -65,26 +65,19 @@ def test_provider_failure_does_not_echo_body_or_secret():
     assert "sk-secret" not in str(failure.value)
 
 
-def test_provider_selection_is_explicit():
-    assert api.direct_live_provider(lambda _: None) == "gemini"
-    assert api.direct_live_provider(env(CONDUIT_DIRECT_LIVE_PROVIDER="qwen")) == "qwen"
-    with pytest.raises(api.TokenError):
-        api.direct_live_provider(env(CONDUIT_DIRECT_LIVE_PROVIDER="typo"))
-
-
 def test_routes_are_profile_scoped_and_not_cached(monkeypatch):
     scopes = []
     async def scoped(profile, fn, executor=None):
         scopes.append(profile)
         return fn()
     monkeypatch.setattr(api, "_run_scoped", scoped)
-    monkeypatch.setattr(api, "direct_live_status", lambda: {"available": True, "provider": "qwen"})
-    monkeypatch.setattr(api, "mint_direct_live_token", lambda **_: {"token": "st-test"})
+    monkeypatch.setattr(api, "qwen_live_status", lambda: {"available": True, "provider": "qwen"})
+    monkeypatch.setattr(api, "mint_qwen_live_token", lambda **_: {"token": "st-test"})
     app = FastAPI()
     app.include_router(api.router, prefix="/api/plugins/conduit_push")
     with TestClient(app) as client:
         for method, path in [(client.get, "status"), (client.post, "token")]:
-            response = method(f"/api/plugins/conduit_push/direct-live/{path}?profile=work")
+            response = method(f"/api/plugins/conduit_push/qwen-live/{path}?profile=work")
             assert response.status_code == 200
             assert response.headers["cache-control"] == "no-store"
     assert scopes == ["work", "work"]
@@ -99,3 +92,34 @@ def test_rate_limit_is_applied_before_network(monkeypatch):
     with pytest.raises(api.TokenError) as exc:
         api.mint_qwen_live_token(env(), post=lambda _: pytest.fail("network called"), limiter_key="work")
     assert exc.value.status == 429
+
+
+def test_gemini_and_qwen_routes_are_independent(monkeypatch):
+    async def scoped(profile, fn, executor=None):
+        assert profile == "work"
+        return fn()
+    monkeypatch.setattr(api, "_run_scoped", scoped)
+    monkeypatch.setattr(api, "gemini_live_status", lambda: {"available": True, "model": "gemini-test"})
+    monkeypatch.setattr(api, "qwen_live_status", lambda: {"available": True, "model": "qwen-test"})
+    app = FastAPI()
+    app.include_router(api.router)
+    with TestClient(app) as client:
+        assert client.get("/gemini-live/status?profile=work").json()["model"] == "gemini-test"
+        assert client.get("/qwen-live/status?profile=work").json()["model"] == "qwen-test"
+        assert client.get("/direct-live/status").status_code == 404
+
+
+def test_watch_token_tools_cannot_switch_provider(monkeypatch):
+    from types import SimpleNamespace
+    import threading
+    monkeypatch.setattr(api, "_scoped_call", lambda profile, fn: fn())
+    monkeypatch.setattr(api, "mint_gemini_live_token", lambda **kwargs: {"token": "google-only"})
+    monkeypatch.setattr(api, "mint_qwen_live_token", lambda **kwargs: {"token": "st-qwen-only"})
+    def grant(tool):
+        return SimpleNamespace(tools=(tool,), live_tokens=0, lock=threading.Lock(), profile="work", limiter_key="work")
+    gemini = grant(api.WATCH_LIVE_TOKEN)
+    qwen = grant(api.WATCH_QWEN_LIVE_TOKEN)
+    assert api.run_watch_live_token(gemini)["token"] == "google-only"
+    assert api.run_watch_live_token(qwen, provider="qwen")["token"] == "st-qwen-only"
+    assert api.run_watch_live_token(gemini, provider="qwen")["status"] == 403
+    assert api.run_watch_live_token(qwen, provider="gemini")["status"] == 403

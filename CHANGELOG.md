@@ -16,7 +16,7 @@ checks it). The format is fixed, because Conduit reads it:
 ## 0.70.0 (2026-10-24)
 
 ### New and improved
-- Qwen Live can power the shared direct voice mode on iPhone and Apple Watch.
+- Qwen Live is a separate voice provider on iPhone and Apple Watch.
   The host supplies temporary credentials; call audio connects directly to
   Alibaba Cloud, without going through the Conduit relay or the Hermes host.
 

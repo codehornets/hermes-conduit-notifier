@@ -242,13 +242,6 @@ QWEN_DEFAULT_MODEL = "qwen3.8-omni-flash-realtime"
 _qwen_mint_limiter = None  # initialized with the other limiters below
 
 
-def direct_live_provider(get_env=None) -> str:
-    value = str((get_env or _env_value)("CONDUIT_DIRECT_LIVE_PROVIDER") or "gemini").strip().lower()
-    if value not in ("gemini", "qwen"):
-        raise TokenError(503, "CONDUIT_DIRECT_LIVE_PROVIDER must be gemini or qwen")
-    return value
-
-
 def qwen_live_settings(get_env=None) -> Dict[str, str]:
     get_env = get_env or _env_value
     region = str(get_env("CONDUIT_QWEN_LIVE_REGION") or "cn-beijing").strip()
@@ -306,14 +299,6 @@ def mint_qwen_live_token(get_env=None, post=None, limiter_key=None) -> Dict[str,
     # Never substitute the permanent key when minting is unsupported or fails.
     return {"provider": "qwen", "token": token, "expires_at": _timestamp(datetime.fromtimestamp(expiry, timezone.utc)),
             "model": settings["model"], "websocket_url": settings["websocket_url"], "voice": settings["voice"]}
-
-
-def direct_live_status() -> Dict[str, Any]:
-    return qwen_live_status() if direct_live_provider() == "qwen" else {"provider": "gemini", **gemini_live_status()}
-
-
-def mint_direct_live_token(**kwargs) -> Dict[str, Any]:
-    return mint_qwen_live_token(**kwargs) if direct_live_provider() == "qwen" else mint_gemini_live_token(**kwargs)
 
 
 def _hermes_web_search(query: str, limit: int) -> str:
@@ -658,21 +643,21 @@ async def create_gemini_live_token(response: Response, profile: Optional[str] = 
     return {"ok": True, **result}
 
 
-@router.get("/direct-live/status")
-async def get_direct_live_status(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+@router.get("/qwen-live/status")
+async def get_qwen_live_status(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     try:
-        return {"ok": True, **await _run_scoped(profile, direct_live_status)}
+        return {"ok": True, **await _run_scoped(profile, qwen_live_status)}
     except TokenError as exc:
         raise HTTPException(exc.status, str(exc), headers={"Cache-Control": "no-store"})
 
 
-@router.post("/direct-live/token")
-async def create_direct_live_token(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+@router.post("/qwen-live/token")
+async def create_qwen_live_token(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     try:
-        return {"ok": True, **await _run_scoped(profile, lambda: mint_direct_live_token(limiter_key=_limiter_key(profile)))}
+        return {"ok": True, **await _run_scoped(profile, lambda: mint_qwen_live_token(limiter_key=_limiter_key(profile)))}
     except TokenError as exc:
         raise HTTPException(exc.status, str(exc), headers={"Cache-Control": "no-store"})
 
@@ -5030,7 +5015,7 @@ VOICE_SESSION_SOURCE = "desktop"
 VOICE_END_REASON = "conduit_voice"
 VOICE_TAG_KINDS = frozenset({"call", "classic", "job"})
 # Local Live calls (the user's own speech server) save like the others.
-VOICE_ENGINES = frozenset({"gemini-live", "gpt-live", "grok-live", "local-live", "classic"})
+VOICE_ENGINES = frozenset({"gemini-live", "gpt-live", "grok-live", "qwen-live", "local-live", "classic"})
 VOICE_TAGS_KEY = "conduit.voice.tags"
 VOICE_CALLS_KEY = "conduit.voice.calls:{session_id}"
 VOICE_CREATED_KEY = "conduit.voice.created"
@@ -8287,6 +8272,7 @@ async def post_phone_wipe(request: Request, response: Response, profile: Optiona
 WATCH_CHAT_TOOLS = ("find_chat", "read_chat")
 WATCH_TOOLS = ("web_search", "recall_memory") + WATCH_CHAT_TOOLS
 WATCH_LIVE_TOKEN = "live_token"
+WATCH_QWEN_LIVE_TOKEN = "qwen_live_token"
 # Tokens one grant may mint: a few fresh sessions per call, never a stream.
 # A renewal, which only the iPhone can ask for, counts its own.
 WATCH_LIVE_TOKENS_PER_GRANT = 6
@@ -8576,8 +8562,8 @@ def run_watch_tool(grant: _WatchGrant, request: Dict[str, Any]) -> Dict[str, Any
         return {"ok": False, "status": 403, "detail": "This tool isn't available to the Watch"}
     if tool in WATCH_JOB_TOOLS or tool in WATCH_JOB_CALLS or tool == WATCH_JOB_FOLLOW_UP:
         return run_watch_job_call(grant, tool, args)
-    if tool == WATCH_LIVE_TOKEN:
-        return run_watch_live_token(grant)
+    if tool in (WATCH_LIVE_TOKEN, WATCH_QWEN_LIVE_TOKEN):
+        return run_watch_live_token(grant, provider="qwen" if tool == WATCH_QWEN_LIVE_TOKEN else "gemini")
     if tool == "find_chat":
         with grant.lock:
             run: Dict[str, Any] = {"dispatched_after": grant.chat_searches}
@@ -9072,13 +9058,14 @@ def _run_watch_chat_tool(grant: _WatchGrant, feature: str, timeout: float,
 
 
 def run_watch_live_token(grant: _WatchGrant,
-                         mint: Optional[Callable[..., Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """A fresh single-use Gemini Live token for the grant's call, as
+                         mint: Optional[Callable[..., Dict[str, Any]]] = None, *, provider: str = "gemini") -> Dict[str, Any]:
+    """A fresh provider-specific Live token for the grant's call, as
     /gemini-live/token answers. A mint that fails, or whose answer never
     reaches the relay, doesn't count against the grant's tokens; the token
     itself is never logged."""
-    mint = mint or mint_direct_live_token
-    if WATCH_LIVE_TOKEN not in grant.tools:
+    mint = mint or (mint_qwen_live_token if provider == "qwen" else mint_gemini_live_token)
+    required = WATCH_QWEN_LIVE_TOKEN if provider == "qwen" else WATCH_LIVE_TOKEN
+    if required not in grant.tools:
         return {"ok": False, "status": 403, "detail": "This tool isn't available to the Watch"}
     with grant.lock:
         if grant.live_tokens >= WATCH_LIVE_TOKENS_PER_GRANT:
@@ -9287,7 +9274,7 @@ def open_watch_grant(body: Any, *, profile: Optional[str], ticket_home: Optional
     if not isinstance(requested, list) or not requested or not all(isinstance(t, str) for t in requested):
         raise TokenError(400, "tools must be a non-empty list")
     # interrupt_job comes with jobs; named, it's taken rather than refused.
-    grantable = WATCH_TOOLS + WATCH_JOB_TOOLS + (WATCH_JOB_FOLLOW_UP, WATCH_LIVE_TOKEN)
+    grantable = WATCH_TOOLS + WATCH_JOB_TOOLS + (WATCH_JOB_FOLLOW_UP, WATCH_LIVE_TOKEN, WATCH_QWEN_LIVE_TOKEN)
     if any(tool not in grantable for tool in requested):
         raise TokenError(400, f"The Watch can only be granted {', '.join(grantable)}")
     max_jobs = _watch_max_jobs(body.get("max_jobs"))
@@ -9321,9 +9308,13 @@ def open_watch_grant(body: Any, *, profile: Optional[str], ticket_home: Optional
         # stop them: a grant that only lists jobs doesn't get them unasked.
         if WATCH_JOB_FOLLOW_UP in requested or any(tool in WATCH_JOB_WRITE_TOOLS for tool in requested):
             tools += (WATCH_JOB_FOLLOW_UP,)
+    if WATCH_QWEN_LIVE_TOKEN in requested and qwen_live_status()["available"]:
+        tools += (WATCH_QWEN_LIVE_TOKEN,)
     if WATCH_LIVE_TOKEN in requested and live_key() is not None:
         tools += (WATCH_LIVE_TOKEN,)
     if not tools:
+        if WATCH_QWEN_LIVE_TOKEN in requested:
+            raise TokenError(503, "Qwen Live is not configured on this Hermes profile")
         if WATCH_LIVE_TOKEN in requested and not any(tool in WATCH_JOB_TOOLS for tool in requested):
             raise TokenError(503, "GEMINI_API_KEY is not set on this Hermes host")
         if all(tool in WATCH_CHAT_TOOLS for tool in requested):
@@ -14728,7 +14719,6 @@ async def get_artifacts(response: Response, profile: Optional[str] = None, befor
 
 ROUTE_CAPABILITIES = (
     "gemini-live",
-    "direct-live",
     "qwen-live",
     "web-search",
     "memory",
