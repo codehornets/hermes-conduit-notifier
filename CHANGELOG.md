@@ -13,7 +13,7 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
-## 0.71.0 (2026-10-24)
+## 0.73.0 (2026-10-24)
 
 ### New and improved
 - Shortcuts automations can log to Hermes. End an automation (a notification

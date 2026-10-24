@@ -1914,7 +1914,7 @@ timers Hermes set) and `conduit_contacts` (`people`) joins the list, each once
 a phone shares it; setting an alarm or timer in a call is the phone's own tool
 too.
 
-## Events from Shortcuts automations (plugin 0.71+)
+## Events from Shortcuts automations (plugin 0.73+)
 
 Conduit's **Log to Hermes** Shortcuts action keeps what an automation hands
 over (a notification from an app the user picks, a message, an email, a
