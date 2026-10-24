@@ -13,6 +13,15 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.71.0 (2026-10-24)
+
+### New and improved
+- Encryption keys for notifications now rotate. Conduit hands this host a
+  new key every 30 days, or sooner when you ask (`hermes conduit-push e2e
+  rotate`). The old key still opens your answers for 7 days, so nothing in
+  flight is lost; `rotate --now` drops it at once for a key that may have
+  leaked.
+
 ## 0.70.3 (2026-10-24)
 
 ### Fixes
