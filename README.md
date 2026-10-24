@@ -541,6 +541,41 @@ fairness boundary.
 
 ## Gemini Live tokens
 
+### Qwen direct voice
+
+The modified app's **Gemini / Qwen Live** mode can use Qwen instead of Google.
+Set these in the Hermes profile's `.env` and restart the gateway:
+
+```dotenv
+CONDUIT_DIRECT_LIVE_PROVIDER=qwen
+DASHSCOPE_API_KEY=your-bailian-key
+CONDUIT_QWEN_LIVE_WORKSPACE=your-workspace-id
+CONDUIT_QWEN_LIVE_REGION=cn-beijing
+CONDUIT_QWEN_LIVE_MODEL=qwen3.8-omni-flash-realtime
+CONDUIT_QWEN_LIVE_VOICE=Tina
+```
+
+The key/workspace must match the region; Singapore is `ap-southeast-1`.
+`GET /api/plugins/conduit_push/direct-live/status` checks configuration.
+`POST /api/plugins/conduit_push/direct-live/token` returns a 120-second
+temporary key, model, voice and provider WebSocket address. Both routes use
+normal dashboard authentication and profile scoping; token responses are
+not cached. The permanent key stays on the host. Failed minting never falls
+back to the permanent key or Google. The default provider remains Gemini.
+The legacy `/gemini-live/*` routes continue to serve Google.
+
+iPhone and Watch connect directly to Alibaba for audio. Watch tool requests
+and reconnect credentials can use the encrypted relay grant, but audio does
+not pass through the relay or this host. Qwen native search is disabled in
+favor of Hermes function tools. The existing Gemini voice picker only affects
+Google; use the host voice setting for Qwen.
+
+This source integration has mocked tests, not account/device verification.
+Validate temporary-key compatibility at the workspace endpoint and token
+expiry on established calls, then build and test the Apple app on macOS.
+
+### Google Gemini credentials
+
 Conduit's Gemini Live voice mode talks to Google directly from the phone, but
 the Gemini API key stays on your Hermes host. The plugin adds two routes to the
 Hermes dashboard, behind the dashboard's normal auth:

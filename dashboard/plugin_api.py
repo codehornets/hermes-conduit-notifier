@@ -236,6 +236,86 @@ def gemini_live_status(get_env: Optional[Callable[[str], Optional[str]]] = None)
     return {"available": True, "model": model}
 
 
+# Direct Live shares Conduit's phone/Watch call shell. Only credentials pass
+# through this host; audio connects directly to Google or Alibaba Cloud.
+QWEN_DEFAULT_MODEL = "qwen3.8-omni-flash-realtime"
+_qwen_mint_limiter = None  # initialized with the other limiters below
+
+
+def direct_live_provider(get_env=None) -> str:
+    value = str((get_env or _env_value)("CONDUIT_DIRECT_LIVE_PROVIDER") or "gemini").strip().lower()
+    if value not in ("gemini", "qwen"):
+        raise TokenError(503, "CONDUIT_DIRECT_LIVE_PROVIDER must be gemini or qwen")
+    return value
+
+
+def qwen_live_settings(get_env=None) -> Dict[str, str]:
+    get_env = get_env or _env_value
+    region = str(get_env("CONDUIT_QWEN_LIVE_REGION") or "cn-beijing").strip()
+    domains = {"cn-beijing": "dashscope.aliyuncs.com", "ap-southeast-1": "dashscope-intl.aliyuncs.com"}
+    if region not in domains:
+        raise TokenError(503, "Qwen Live region must be cn-beijing or ap-southeast-1")
+    workspace = str(get_env("CONDUIT_QWEN_LIVE_WORKSPACE") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", workspace):
+        raise TokenError(503, "Set CONDUIT_QWEN_LIVE_WORKSPACE to the Alibaba Cloud workspace ID")
+    model = str(get_env("CONDUIT_QWEN_LIVE_MODEL") or QWEN_DEFAULT_MODEL).strip()
+    if not re.fullmatch(r"qwen[A-Za-z0-9._-]*realtime[A-Za-z0-9._-]*", model):
+        raise TokenError(503, "Set a Qwen Realtime model in CONDUIT_QWEN_LIVE_MODEL")
+    return {"model": model, "token_url": f"https://{domains[region]}/api/v1/tokens?expire_in_seconds=120",
+            "websocket_url": f"wss://{workspace}.{region}.maas.aliyuncs.com/api-ws/v1/realtime?"
+                             + urllib.parse.urlencode({"model": model}),
+            "voice": str(get_env("CONDUIT_QWEN_LIVE_VOICE") or "Tina").strip()}
+
+
+def qwen_live_status(get_env=None) -> Dict[str, Any]:
+    get_env = get_env or _env_value
+    try:
+        settings = qwen_live_settings(get_env)
+    except TokenError as exc:
+        return {"provider": "qwen", "available": False, "reason": str(exc), "model": QWEN_DEFAULT_MODEL}
+    return {"provider": "qwen", "available": bool(str(get_env("DASHSCOPE_API_KEY") or "").strip()),
+            "reason": None if str(get_env("DASHSCOPE_API_KEY") or "").strip() else "Set DASHSCOPE_API_KEY on the Hermes host",
+            "model": settings["model"]}
+
+
+def mint_qwen_live_token(get_env=None, post=None, limiter_key=None) -> Dict[str, Any]:
+    get_env = get_env or _env_value
+    settings = qwen_live_settings(get_env)
+    key = str(get_env("DASHSCOPE_API_KEY") or "").strip()
+    if not key:
+        raise TokenError(503, "Set DASHSCOPE_API_KEY on the Hermes host")
+    if limiter_key is not None:
+        _qwen_mint_limiter.acquire(limiter_key)
+    request = urllib.request.Request(settings["token_url"], data=b"", method="POST",
+                                     headers={"Authorization": f"Bearer {key}"})
+    try:
+        if post is not None:
+            result = post(request)
+        else:
+            with _opener.open(request, timeout=REQUEST_TIMEOUT_S) as response:
+                result = json.loads(response.read(64 * 1024))
+    except urllib.error.HTTPError as exc:
+        raise TokenError(502, f"Alibaba Cloud rejected the temporary token request (HTTP {exc.code})") from None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        raise TokenError(502, "Could not obtain a Qwen Live temporary token") from None
+    token = result.get("token") if isinstance(result, dict) else None
+    expiry = result.get("expires_at") if isinstance(result, dict) else None
+    if not isinstance(token, str) or not token.startswith("st-") or not isinstance(expiry, (int, float)) \
+            or not math.isfinite(expiry) or not time.time() < expiry <= time.time() + 1800:
+        raise TokenError(502, "Alibaba Cloud returned an invalid temporary token")
+    # Never substitute the permanent key when minting is unsupported or fails.
+    return {"provider": "qwen", "token": token, "expires_at": _timestamp(datetime.fromtimestamp(expiry, timezone.utc)),
+            "model": settings["model"], "websocket_url": settings["websocket_url"], "voice": settings["voice"]}
+
+
+def direct_live_status() -> Dict[str, Any]:
+    return qwen_live_status() if direct_live_provider() == "qwen" else {"provider": "gemini", **gemini_live_status()}
+
+
+def mint_direct_live_token(**kwargs) -> Dict[str, Any]:
+    return mint_qwen_live_token(**kwargs) if direct_live_provider() == "qwen" else mint_gemini_live_token(**kwargs)
+
+
 def _hermes_web_search(query: str, limit: int) -> str:
     from tools.web_tools import web_search_tool
 
@@ -437,6 +517,7 @@ class _MintLimiter:
 
 
 _mint_limiter = _MintLimiter(MINT_LIMIT, MINT_WINDOW_S)
+_qwen_mint_limiter = _MintLimiter(MINT_LIMIT, MINT_WINDOW_S)
 _search_limiter = _MintLimiter(SEARCH_LIMIT, SEARCH_WINDOW_S, message="Too many web searches; try again shortly")
 
 
@@ -575,6 +656,25 @@ async def create_gemini_live_token(response: Response, profile: Optional[str] = 
     except Exception as exc:
         raise _unexpected("token", exc)
     return {"ok": True, **result}
+
+
+@router.get("/direct-live/status")
+async def get_direct_live_status(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"ok": True, **await _run_scoped(profile, direct_live_status)}
+    except TokenError as exc:
+        raise HTTPException(exc.status, str(exc), headers={"Cache-Control": "no-store"})
+
+
+@router.post("/direct-live/token")
+async def create_direct_live_token(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    try:
+        return {"ok": True, **await _run_scoped(profile, lambda: mint_direct_live_token(limiter_key=_limiter_key(profile)))}
+    except TokenError as exc:
+        raise HTTPException(exc.status, str(exc), headers={"Cache-Control": "no-store"})
 
 
 @router.get("/web-search/status")
@@ -8977,7 +9077,7 @@ def run_watch_live_token(grant: _WatchGrant,
     /gemini-live/token answers. A mint that fails, or whose answer never
     reaches the relay, doesn't count against the grant's tokens; the token
     itself is never logged."""
-    mint = mint or mint_gemini_live_token
+    mint = mint or mint_direct_live_token
     if WATCH_LIVE_TOKEN not in grant.tools:
         return {"ok": False, "status": 403, "detail": "This tool isn't available to the Watch"}
     with grant.lock:
@@ -14628,6 +14728,8 @@ async def get_artifacts(response: Response, profile: Optional[str] = None, befor
 
 ROUTE_CAPABILITIES = (
     "gemini-live",
+    "direct-live",
+    "qwen-live",
     "web-search",
     "memory",
     "personality",
