@@ -22,6 +22,39 @@ checks it). The format is fixed, because Conduit reads it:
   look it up later ("what did my bank send today?") without a reply or a
   push each time. Sign-in codes are never kept, and events go after 14 days.
 
+## 0.70.3 (2026-10-24)
+
+### Fixes
+- A Pulse reminder held back for a free slot no longer goes out the next
+  day for something you did while it waited: it's checked again first.
+- The morning brief leaves out news that got done or went out of date
+  while it waited for the brief. Undo on the card puts it back.
+- Pulse checks see the calendar and open reminders on your phone, so
+  something you already planned there isn't nagged about.
+- The report also looks at later chats for things you asked Pulse to watch
+  and things you wanted to start, and for items from your other profiles.
+- After Do it, Pulse also notices when you got it done in another chat.
+
+## 0.70.2 (2026-10-24)
+
+### Fixes
+- Pulse no longer asks about something you finished later in another chat or
+  a cron run, or that a newer release moved past: a follow-up and the report
+  now read later chats on the same subject, follow a long chat into its
+  continuation, and see what Hermes is still running in the background.
+- A week-old follow-up checks once more before asking whether you still want
+  it, so a finished one closes instead.
+- On Windows, the dashboard's check for an update still in progress could
+  end the process it looked at. It now only asks Windows whether it runs.
+
+## 0.70.1 (2026-10-24)
+
+### Fixes
+- Answering an approval by voice on the Apple Watch could say "approved"
+  when nothing ran, because the request had just been answered elsewhere or
+  timed out. The call now says so instead, and says "approved" only once
+  Hermes has taken the answer.
+
 ## 0.70.0 (2026-10-24)
 
 ### New and improved
