@@ -12,7 +12,10 @@ every tool is blocked in ``pre_tool_call`` (the probe needs none; later
 slices allow named reads only), and no push or Live Activity goes out for it.
 
 A few times a day it also sends the report (pulse_report): what Hermes would
-bring up since the last one, each item its own card on the Pulse screen.
+bring up since the last one, each item its own card on the Pulse screen. A
+model call lists the report's candidates first, on a thread of its own, and
+code picks what goes in (pulse_candidates); without model access, or when the
+list fails, the report turn picks its items itself, as it always did.
 
 While Pulse is on, every tool call in the profile also gets a row in the
 outcome ledger (pulse_ledger), the record later slices check claims against,
@@ -30,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import socket
 import sqlite3
 import threading
@@ -43,6 +47,7 @@ from hermes_constants import get_hermes_home
 
 from . import pulse_delivery as delivery
 from . import pulse_brief as brief
+from . import pulse_candidates as candidates
 from . import pulse_followup as followup
 from . import pulse_hermes as hermes
 from . import pulse_host as host
@@ -70,6 +75,13 @@ HELD_DAYS = 30
 REPORT_RETRY_S = 1800.0
 REPORT_TRIES = 3
 REPORT_WINDOW_S = 8 * 3600.0
+# The report's candidate list (pulse_candidates): {"id", "state", "started_at",
+# ...}. Its model call runs on a thread of its own ("working"); the tick then
+# sends its picks ("ready"), or the report as it used to be when the list
+# failed ("failed") or was left working by a process that stopped.
+REPORT_RUN = "report_run"
+RUN_WORKING, RUN_READY, RUN_FAILED, RUN_SENT, RUN_DROPPED = "working", "ready", "failed", "sent", "dropped"
+RUN_STALE_S = 2 * memory.CALL_TIMEOUT_S + 60
 # Ratings are read back from the home chat this often, for reports this old.
 RATINGS_EVERY_S = 300.0
 RATINGS_DAYS = 3
@@ -103,6 +115,7 @@ _last_problem = ""
 _last_ratings = 0.0
 _owner = f"{socket.gethostname()}:{os.getpid()}"
 _memory_thread: Optional[threading.Thread] = None
+_report_thread: Optional[threading.Thread] = None
 # Whether Hermes took the plugin's auxiliary task, so memory calls can name it.
 _memory_task = False
 
@@ -188,29 +201,48 @@ def is_pulse_turn(session_id: str, turn_id: Any) -> bool:
         return (session_id, turn_id) in _turns
 
 
-def _turn_kind(session_id: str, turn_id: Any) -> str:
-    """The kind of attempt a Pulse turn is ("" when it isn't one, or its
-    store can't be read)."""
+def _turn_attempt(session_id: str, turn_id: Any) -> Optional[dict]:
+    """The attempt a Pulse turn is (None when it isn't one, or its store
+    can't be read)."""
     if not is_pulse_turn(session_id, turn_id):
-        return ""
+        return None
     with _turns_lock:
         tag = _turns.get((session_id, turn_id))
     try:
-        row = open_store().attempt_by_tag(tag) if tag else None
+        return open_store().attempt_by_tag(tag) if tag else None
     except Exception:  # noqa: BLE001 — an unreadable store keeps the turn quiet, never breaks the hook
         logger.debug("conduit_push: Pulse couldn't read the turn's attempt", exc_info=True)
-        return ""
-    return row["kind"] if row else ""
+        return None
+
+
+def _run_picks(pulse_store: store.PulseStore, attempt: dict) -> Optional[list[dict]]:
+    """The picks of the candidate list a report attempt says, in order; None
+    for a report the turn picked itself (no list behind it)."""
+    rows = pulse_store.run_candidates(str(attempt["item_id"])) if attempt["item_id"] else []
+    return candidates.picks(rows) if rows else None
+
+
+def _report_lines(attempt: dict, response: Any) -> list[tuple[str, str, Optional[int]]]:
+    """A report turn's items: its candidate list's picks, else its reply's lines."""
+    try:
+        picked = _run_picks(open_store(), attempt)
+    except Exception:  # noqa: BLE001 — the reply still says them
+        logger.debug("conduit_push: Pulse couldn't read the report's picks", exc_info=True)
+        picked = None
+    if picked is not None:
+        return candidates.lines(picked)
+    return learning.report_lines(response if isinstance(response, str) else "")
 
 
 def pushes(session_id: str, turn_id: Any, response: Any = None) -> bool:
     """Whether a Pulse turn's reply goes to the phone like any reply: a
     follow-up or the morning brief does (it's news for the user), and so
-    does a report that brought something up (``response``, its items
-    becoming cards); a probe doesn't."""
-    kind = _turn_kind(session_id, turn_id)
+    does a report that brought something up (its picks, or ``response``'s
+    items, becoming cards); a probe doesn't."""
+    attempt = _turn_attempt(session_id, turn_id)
+    kind = attempt["kind"] if attempt else ""
     if kind == REPORT:
-        return bool(learning.report_lines(response if isinstance(response, str) else ""))
+        return bool(_report_lines(attempt, response))
     return kind in (FOLLOWUP, BRIEF)
 
 
@@ -224,9 +256,10 @@ def push_copy(session_id: str, turn_id: Any, response: Any) -> dict[str, Any]:
     what it is, not by Pulse's hidden chat. A report's body is its items,
     one after another, without the numbers, kinds and remembered-item refs
     that are for the cards, and ``count`` says how many there are (two or more)."""
-    kind = _turn_kind(session_id, turn_id)
+    attempt = _turn_attempt(session_id, turn_id)
+    kind = attempt["kind"] if attempt else ""
     response = response if isinstance(response, str) else ""
-    lines = learning.report_lines(response) if kind == REPORT else []
+    lines = _report_lines(attempt, response) if kind == REPORT else []
     if lines:
         copy = {"title_label": "pulse.noticed", "title": "Pulse noticed something",
                 "body": " · ".join(" ".join(text.split()) for _, text, _ in lines)}
@@ -334,6 +367,7 @@ def tick(now: Optional[float] = None) -> None:
     brief.settle(pulse_store, now)
     learning.drop_empty_reports(pulse_store)
     pulse_store.prune_cards(CARDS_KEEP, held_before=now - HELD_DAYS * 86400.0)
+    pulse_store.prune_candidates(now - candidates.JOURNAL_DAYS * 86400.0)
     _maybe_memory(pulse_store, home, now)
     # One new turn per tick: a probe first, then a follow-up, the brief, then the report.
     if not _maybe_probe(pulse_store, home, now) and not _maybe_followup(pulse_store, home, now) \
@@ -380,6 +414,19 @@ def _turn_cards(pulse_store: store.PulseStore, home: Path, changed: list[dict], 
         try:
             turn = hermes.find_turn(home, chat_id=row["session_key"], tag=row["tag"],
                                     since=row["created_at"] - delivery.SINCE_SLACK_S)
+            picked = _run_picks(pulse_store, row) if turn is not None and row["kind"] == REPORT else None
+            if picked is not None:
+                # Made from the candidate list: its picks are its cards, whatever the reply says.
+                if picked:
+                    learning.add_noticed_cards(
+                        pulse_store, turn=turn, lines=candidates.lines(picked), chat_id=row["session_key"],
+                        chat_title=title, shown={pick["item_id"] for pick in picked if pick["item_id"] is not None},
+                        kinds=report.KINDS, item_chat_title=lambda item: followup.chat_title(home, item), now=now,
+                        attempt=str(attempt), marks=(TURN_CARDS_DONE, store.SPLIT_REPORTS),
+                        keep=TURN_CARDS_DONE_KEEP, links=[pick["id"] for pick in picked])
+                else:
+                    _mark_turn_card(pulse_store, attempt)
+                continue
             # A brief comes with a push; a report doesn't.
             if turn is not None and learning.empty_turn(row["kind"], turn.reply):
                 # Nothing brought up: no card, and no looking it up again.
@@ -432,9 +479,9 @@ def _sender(pulse_store: store.PulseStore) -> Callable[[str, str], host.Sent]:
     return lambda chat_id, body: host.send(chat_id, body, profile=profile, model=model)
 
 
-def _send(pulse_store: store.PulseStore, *, kind: str, chat_id: str, text: Any) -> None:
-    delivery.submit(pulse_store, _sender(pulse_store), kind=kind,
-                    chat_id=chat_id, text=text)
+def _send(pulse_store: store.PulseStore, *, kind: str, chat_id: str, text: Any) -> dict:
+    return delivery.submit(pulse_store, _sender(pulse_store), kind=kind,
+                           chat_id=chat_id, text=text)
 
 
 def _maybe_probe(pulse_store: store.PulseStore, home: Path, now: float) -> bool:
@@ -458,9 +505,26 @@ def _maybe_probe(pulse_store: store.PulseStore, home: Path, now: float) -> bool:
 
 
 def _maybe_report(pulse_store: store.PulseStore, home: Path, now: float) -> bool:
-    """Sends the report if asked for or due; True when it went."""
+    """Sends the report if asked for or due; True when it went. With model
+    access its candidate list comes first, on a thread of its own, and a
+    later tick sends what the list picked (``_send_report``)."""
     asked = pulse_store.take_request("report_requested")
-    if not asked and not _report_due(pulse_store, home, now):
+    stored = pulse_store.get(REPORT_RUN)
+    run = stored if isinstance(stored, dict) and isinstance(stored.get("id"), str) and stored["id"] else {}
+    started = run.get("started_at")
+    started = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
+    if run.get("state") == RUN_WORKING and now - started < RUN_STALE_S:
+        if asked:
+            logger.info("conduit_push: Pulse: a report is already on its way; not sending another")
+        return False
+    pending = run.get("state") in (RUN_WORKING, RUN_READY, RUN_FAILED)
+    if pending and now - started > REPORT_WINDOW_S:
+        # Too late to send, like a report long past its time.
+        dropped = {**run, "state": RUN_DROPPED}
+        if pulse_store.swap(REPORT_RUN, stored, dropped):
+            stored = dropped  # so a run asked for now starts from it
+        pending = False
+    if not pending and not asked and not _report_due(pulse_store, home, now):
         return False
     if any(row["kind"] == REPORT for row in pulse_store.in_flight()):
         if asked:
@@ -473,10 +537,98 @@ def _maybe_report(pulse_store: store.PulseStore, home: Path, now: float) -> bool
             logger.info("conduit_push: Pulse: the requested report wasn't sent; run `pulse report` again "
                         "once the home chat is there")
         return False
-    context, since = report.build(home, pulse_store, home_chat_id=chat.chat_id, now=now)
-    _send(pulse_store, kind=REPORT, chat_id=chat.chat_id, text=lambda tag: report.report_text(tag, context, since,
-                                                                                         learning.nudge(pulse_store)))
+    if pending:
+        return _send_report(pulse_store, home, run, chat.chat_id, now)
+    if getattr(_ctx, "llm", None) is not None:
+        return _start_report_run(pulse_store, home, chat.chat_id, now, stored)
+    _send_turn_report(pulse_store, home, chat.chat_id, now)
     return True
+
+
+def _start_report_run(pulse_store: store.PulseStore, home: Path, chat_id: str, now: float, stored: Any) -> bool:
+    """Starts the report's candidate list on a thread of its own, so a slow
+    model call never holds up the loop; True when it started."""
+    global _report_thread
+    run = {"id": secrets.token_hex(8), "state": RUN_WORKING, "started_at": now, "owner": _owner}
+    if not pulse_store.swap(REPORT_RUN, stored, run):
+        return False  # another process started one
+    _report_thread = threading.Thread(target=_report_run, args=(home, chat_id, run), name="conduit-pulse-report",
+                                      daemon=True)
+    _report_thread.start()
+    return True
+
+
+def _report_run(home: Path, chat_id: str, run: dict) -> None:
+    """Makes the report's candidate list and journals it (pulse_candidates);
+    the tick then sends the report. A list that fails leaves the report to
+    go out as it used to."""
+    pulse_store = None
+    try:
+        pulse_store = open_store(home)
+        now = float(run["started_at"])
+        zone = report_zone(pulse_store, home, now)
+        gathered = report.gather(home, pulse_store, home_chat_id=chat_id, now=now, room=candidates.CONTEXT_BUDGET,
+                                 extra=candidates.recent_section(pulse_store, zone, now), keyed=True)
+        rows, tokens = candidates.ask(lambda instructions, text: _memory_llm(
+            instructions, text, purpose="pulse report", max_tokens=candidates.REPLY_TOKENS), gathered,
+            nudge=learning.nudge(pulse_store))
+        candidates.decide(pulse_store, rows, now=now)
+        ready = {**run, "state": RUN_READY, "since": gathered.since, "tokens": tokens}
+        if not pulse_store.finish_run(REPORT_RUN, run, rows, ready, now=now):
+            logger.info("conduit_push: Pulse: the report's candidate list took too long; the report went without it")
+    except BaseException as error:  # noqa: BLE001 — the report goes out as it used to
+        logger.warning("conduit_push: Pulse couldn't list the report's candidates; it goes out as before",
+                       exc_info=True)
+        try:
+            if pulse_store is not None:
+                pulse_store.swap(REPORT_RUN, run, {**run, "state": RUN_FAILED, "error": type(error).__name__})
+        except Exception:  # noqa: BLE001 — left working, it goes out as before once stale
+            logger.debug("conduit_push: Pulse couldn't mark the report's candidate list failed", exc_info=True)
+        if not isinstance(error, Exception):
+            raise  # an interpreter exit or the like: marked, and on its way
+    finally:
+        _wake.set()  # the next tick sends it now, not a whole TICK_S later
+
+
+def _send_report(pulse_store: store.PulseStore, home: Path, run: dict, chat_id: str, now: float) -> bool:
+    """Sends the report a candidate list was started for: its picks once the
+    list is ready, else the report as it used to be (the list failed, or a
+    process that stopped left it working). Marked sent first, so it goes
+    once."""
+    sent = {**run, "state": RUN_SENT}
+    if run["state"] != RUN_READY:
+        sent["error"] = run.get("error") or "left working"  # what `pulse candidates` says
+    if not pulse_store.swap(REPORT_RUN, run, sent):
+        return False  # another process got to it
+    try:
+        if run["state"] != RUN_READY:
+            attempt = _send_turn_report(pulse_store, home, chat_id, now)
+        else:
+            picked = candidates.picks(pulse_store.run_candidates(run["id"]))
+            since = str(run.get("since") or "")
+            # The attempt's item id is the run's, so its turn finds its picks (_run_picks).
+            attempt = delivery.submit(pulse_store, _sender(pulse_store), kind=REPORT, chat_id=chat_id,
+                                      text=lambda tag: candidates.report_text(tag, picked, since),
+                                      item_id=run["id"])
+    except BaseException:
+        # Nothing recorded (the store refused the attempt): back as it was, so
+        # a later tick sends it. Should this write fail too, the run stays sent
+        # and the next scheduled report makes a new list.
+        pulse_store.swap(REPORT_RUN, sent, run)
+        raise
+    if attempt.get("state") in (store.REFUSED, store.NOT_ADMITTED):
+        # Hermes didn't take it: `pulse candidates` says so, and the report is
+        # tried again as any report is (_report_due), from a new list.
+        pulse_store.swap(REPORT_RUN, sent, {**sent, "refused": attempt.get("detail") or attempt["state"]})
+    return True
+
+
+def _send_turn_report(pulse_store: store.PulseStore, home: Path, chat_id: str, now: float) -> dict:
+    """The report as it was before candidate lists: one turn that reads the
+    day and picks its items itself; its attempt."""
+    context, since = report.build(home, pulse_store, home_chat_id=chat_id, now=now)
+    return _send(pulse_store, kind=REPORT, chat_id=chat_id, text=lambda tag: report.report_text(tag, context, since,
+                                                                                    learning.nudge(pulse_store)))
 
 
 def _maybe_followup(pulse_store: store.PulseStore, home: Path, now: float) -> bool:
@@ -657,7 +809,8 @@ def _leads(pulse_store: store.PulseStore) -> bool:
             and bool(pulse_store.get("memory")))
 
 
-def _memory_llm(instructions: str, text: str, purpose: str = "pulse memory") -> tuple[Any, int]:
+def _memory_llm(instructions: str, text: str, purpose: str = "pulse memory",
+                max_tokens: int = memory.MAX_TOKENS) -> tuple[Any, int]:
     llm = getattr(_ctx, "llm", None)
     if llm is None:
         raise RuntimeError("this Hermes gives plugins no model access")
@@ -665,7 +818,7 @@ def _memory_llm(instructions: str, text: str, purpose: str = "pulse memory") -> 
         result = llm.complete_structured(
             instructions=instructions, input=[{"type": "text", "text": text}], json_mode=True,
             task=memory.TASK if _memory_task else None, purpose=purpose, timeout=memory.CALL_TIMEOUT_S,
-            max_tokens=memory.MAX_TOKENS)
+            max_tokens=max_tokens)
     usage = getattr(result, "usage", None)
     return getattr(result, "parsed", None), int(getattr(usage, "total_tokens", 0) or 0)
 
@@ -732,9 +885,11 @@ def _collect_ratings(pulse_store: store.PulseStore, home: Path, now: float) -> N
     for row in pulse_store.attempts_since(REPORT, now - RATINGS_DAYS * 86400):
         if row["state"] != store.DELIVERED or str(row["attempt_id"]) in split:
             continue
+        picked = _run_picks(pulse_store, row)
+        shown = None if picked is None else {pick["item_id"] for pick in picked if pick["item_id"] is not None}
         try:
             items, ratings = report.ratings_after(home, chat_id=row["session_key"], tag=row["tag"],
-                                                  since=row["created_at"] - delivery.SINCE_SLACK_S)
+                                                  since=row["created_at"] - delivery.SINCE_SLACK_S, shown=shown)
         except hermes.HermesUnreadable:
             continue
         if items:

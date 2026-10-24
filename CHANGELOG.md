@@ -13,6 +13,13 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.69.0 (2026-10-24)
+
+### New and improved
+- Pulse's report now lists everything it could bring up before it picks, and
+  keeps that list for 30 days: what it picked, and why it left the rest out
+  (`hermes conduit-push pulse candidates`). Reports read the same as before.
+
 ## 0.68.0 (2026-10-23)
 
 ### New and improved

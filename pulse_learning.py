@@ -25,7 +25,7 @@ closed stay closed, checks already brought forward stay sooner).
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from . import pulse_store as store
 
@@ -188,7 +188,7 @@ def report_lines(reply: Optional[str]) -> list[tuple[str, str, Optional[int]]]:
 def add_noticed_cards(pulse_store: store.PulseStore, *, turn: Any, lines: list[tuple[str, str, Optional[int]]],
                       chat_id: str, chat_title: str, shown: set[int], kinds: tuple[str, ...],
                       item_chat_title: Callable[[dict], str], now: float, attempt: str = "",
-                      marks: tuple[str, ...] = (), keep: int = 50) -> list[int]:
+                      marks: tuple[str, ...] = (), keep: int = 50, links: Sequence[int] = ()) -> list[int]:
     """A delivered report's items (``report_lines``) as cards, one each, all
     at once, marked as ``add_cards`` marks them. An item drawn from a
     remembered thing (its "#n", shown in the report; what replaced it since,
@@ -209,7 +209,7 @@ def add_noticed_cards(pulse_store: store.PulseStore, *, turn: Any, lines: list[t
             row.update(item_id=None, title=_clip(text, 300), chat_id=turn.session_id or chat_id,
                        message_id=turn.reply_id, chat_title=_clip(chat_title, 120))
         rows.append(row)
-    return pulse_store.add_cards(rows, attempt=attempt, marks=marks, keep=keep)
+    return pulse_store.add_cards(rows, attempt=attempt, marks=marks, keep=keep, links=links)
 
 
 def card_entry(card: dict, done: Optional[dict] = None) -> dict[str, Any]:

@@ -38,9 +38,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     )
     redact.add_argument("mode", choices=["on", "off"])
     pulse = commands.add_parser("pulse", help="Pulse, the proactivity experiment: on, off, status, probe, report, home, outcomes, memory, followups, "
-                                                 "cards, rate, done, learned, nudge, budget")
+                                                 "cards, rate, done, learned, nudge, budget, candidates")
     pulse.add_argument("pulse_action", choices=["on", "off", "status", "probe", "report", "home", "outcomes", "memory",
-                                                "followups", "cards", "rate", "done", "learned", "nudge", "budget"])
+                                                "followups", "cards", "rate", "done", "learned", "nudge", "budget",
+                                                "candidates"])
     pulse.add_argument("value", nargs="?", default="",
                        help="for home: the id of the chat to use, or 'auto' to find it by title; "
                             "for outcomes: how many to show, or a chat id; "
@@ -52,7 +53,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
                             "for rate and done: the card number; "
                             "for learned: 'undo' and a lesson number, or a kind and a loudness to set; "
                             "for nudge: gentle, balanced or eager; "
-                            "for budget: memory or followups")
+                            "for budget: memory or followups; "
+                            "for candidates: how many reports to show")
     pulse.add_argument("extra", nargs="?", default="",
                        help="for memory forget: the item number; for memory backfill: how many days back "
                             "(it shows what that costs), 'start', 'stop' or 'cancel'; "
@@ -215,7 +217,7 @@ def _pulse(args: argparse.Namespace) -> int:
     home = get_hermes_home()
     action = args.pulse_action
     # Follow-ups are on by default, so even `followups on|off` needs no file yet.
-    listing = action in ("followups", "cards", "rate", "done", "learned") \
+    listing = action in ("followups", "cards", "rate", "done", "learned", "candidates") \
         or (action == "memory" and (args.value or "").strip() not in ("on", "off")) \
         or (action == "nudge" and not (args.value or "").strip()) \
         or (action == "budget" and not str(getattr(args, "extra", "") or "").strip())
@@ -264,6 +266,8 @@ def _pulse(args: argparse.Namespace) -> int:
                                str(getattr(args, "extra", "") or "").strip())
     if action == "nudge":
         return _pulse_nudge(pulse_store, (args.value or "").strip())
+    if action == "candidates":
+        return _pulse_candidates(pulse_store, home, (args.value or "").strip())
     if action == "budget":
         return _pulse_budget(pulse_store, (args.value or "").strip(), str(getattr(args, "extra", "") or "").strip())
     if action == "memory":
@@ -609,6 +613,44 @@ def _pulse_learning(pulse_store: Any, action: str, value: str, extra: str) -> in
         print("Nothing learned from ratings yet.")
     for lesson in lessons:
         print(_printable(f"#{lesson['id']} {lesson['text']}"))
+    return 0
+
+
+CANDIDATE_RUNS = 50
+RUN_STATES = {"working": "being made", "ready": "ready to send", "failed": "failed", "sent": "sent",
+              "dropped": "too late to send"}
+
+
+def _pulse_candidates(pulse_store: Any, home: Any, value: str) -> int:
+    """What the latest reports' candidate lists put in front of Pulse, and
+    what became of each (pulse_candidates)."""
+    from . import pulse, pulse_candidates
+    if value and (not value.isdecimal() or len(value) > 3):
+        print("Usage: hermes conduit-push pulse candidates [how many reports]")
+        return 2
+    run = pulse_store.get(pulse.REPORT_RUN)
+    if isinstance(run, dict) and run.get("state") in RUN_STATES:
+        tokens, error = run.get("tokens"), run.get("error")
+        state = RUN_STATES[run["state"]]
+        if isinstance(run.get("refused"), str) and run["refused"]:
+            state = f"sent, but Hermes didn't take it ({run['refused']}); the report is tried again as usual"
+        elif isinstance(error, str) and error and run["state"] != "dropped":
+            state = f"failed ({error}), so the report {'went' if run['state'] == 'sent' else 'goes'} out as before"
+        used = f", {tokens} tokens" if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens else ""
+        print(_printable(f"Latest list: {state}{used}"))
+    runs = pulse_store.candidate_runs(max(1, min(int(value or 1), CANDIDATE_RUNS)))
+    if not runs:
+        print("No candidate lists yet. A report makes one when this Hermes gives plugins model access; "
+              f"they're kept {pulse_candidates.JOURNAL_DAYS} days.")
+        return 0
+    zone = pulse.report_zone(pulse_store, home)
+    for run_id in runs:
+        rows = pulse_store.run_candidates(run_id)
+        when = datetime.fromtimestamp(rows[0]["created_at"], zone).strftime("%a %d %b %H:%M")
+        picked = sum(row["decision"] == pulse_candidates.SURFACED for row in rows)
+        print(f"Report of {when}: {picked} picked of {len(rows)}")
+        for row in rows:
+            print("  " + _printable(pulse_candidates.describe(row)))
     return 0
 
 
