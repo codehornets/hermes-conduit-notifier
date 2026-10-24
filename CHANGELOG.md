@@ -13,6 +13,16 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.70.0 (2026-10-24)
+
+### New and improved
+- A call from Hermes about a question or an approval can be answered on the
+  Apple Watch, even with your iPhone out of reach: the Watch reads out the
+  choices (and which one Hermes recommends) or the command, and your spoken
+  answer goes to Hermes. Needs approval, question and failure calls on.
+- With the Watch on Local Live, a call from Hermes rings it too, and what
+  you say answers what Hermes asked.
+
 ## 0.69.2 (2026-10-24)
 
 ### Security
