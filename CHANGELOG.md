@@ -13,6 +13,15 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.71.2 (2026-10-24)
+
+### Fixes
+- A notification no longer shows a file's path on the host
+  (MEDIA:/opt/data/cache/…): replies, questions, approvals, calls, updates
+  and phone changes show a paperclip and the file's name, or its type when
+  the name is only a code. So do the answer card under a question or an
+  approval, and the call screen.
+
 ## 0.71.1 (2026-10-24)
 
 ### Fixes
