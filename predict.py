@@ -40,6 +40,7 @@ MIN_COUNT, MAX_COUNT, DEFAULT_COUNT = 1, 5, 3
 # Continuations of a draft: always up to three, a few words each.
 MAX_NEXT = 3
 MAX_NEXT_CHARS = 60
+# The prompt asks for 140; a longer reply is clipped here, not dropped.
 MAX_REPLY_CHARS = 280
 MAX_WHY_CHARS = 160
 MAX_PLAN_CHARS = 400
@@ -66,6 +67,18 @@ class Request:
         self.model = model
         self.facts = facts
         self.wait_s = wait_s
+
+
+def _one_line(text: str) -> str:
+    """Request text that goes into the question on one line: control
+    characters and line breaks become spaces, so it can't start lines of
+    its own."""
+    return re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f\u2028\u2029]", " ", text)).strip()
+
+
+def _quoted_draft(draft: str) -> str:
+    """The draft between the question's markers, which it can't close."""
+    return draft.replace("<<<", "\u2039\u2039\u2039").replace(">>>", "\u203a\u203a\u203a")
 
 
 def _seconds(value: Any, name: str) -> int:
@@ -117,8 +130,8 @@ def parse(body: Any) -> Request:
         local_time = raw.get("local_time")
         if local_time is not None and (not isinstance(local_time, str) or len(local_time) > MAX_LOCAL_TIME_CHARS):
             raise ValueError("facts.local_time must be short text, or left out")
-        facts["local_time"] = local_time.strip() if isinstance(local_time, str) and local_time.strip() else None
-    return Request(session_id.strip(), kind, count, draft, (language or "").strip() or None, model, facts,
+        facts["local_time"] = (_one_line(local_time) or None) if isinstance(local_time, str) else None
+    return Request(session_id.strip(), kind, count, draft, _one_line(language or "") or None, model, facts,
                    float(wait_s))
 
 
@@ -159,7 +172,7 @@ def question(request: Request) -> str:
         return "\n".join((
             f"{tag} The user paused while typing their next message in this chat.",
             "Their unsent draft, exactly, between the markers (it may end mid-word):",
-            f"<<<{request.draft}>>>",
+            f"<<<{_quoted_draft(request.draft)}>>>",
             'Return only JSON: {"next":[{"text":string,"p":number}],"replies":[{"text":string,"p":number}]}.',
             f"next: up to {MAX_NEXT} continuations of 1 to 6 words that start exactly where the draft stops"
             " (begin with a space when a new word starts), best first.",
