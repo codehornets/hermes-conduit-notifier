@@ -13,7 +13,7 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
-## 0.73.0 (2026-10-24)
+## 0.72.0 (2026-10-25)
 
 ### New and improved
 - Shortcuts automations can log to Hermes. End an automation (a notification
@@ -26,6 +26,15 @@ checks it). The format is fixed, because Conduit reads it:
   bank confirms the transfer"), Pulse checks as soon as a new event comes in.
 - Conduit's Settings can show what was logged from your iPhone and delete
   any of it.
+
+## 0.71.2 (2026-10-24)
+
+### Fixes
+- A notification no longer shows a file's path on the host
+  (MEDIA:/opt/data/cache/…): replies, questions, approvals, calls, updates
+  and phone changes show a paperclip and the file's name, or its type when
+  the name is only a code. So do the answer card under a question or an
+  approval, and the call screen.
 
 ## 0.71.1 (2026-10-24)
 
