@@ -79,6 +79,7 @@ MAX_SOURCE_CHARS = 120
 MAX_TITLE_CHARS = 200
 MAX_TEXT_CHARS = 4000
 MAX_AMOUNT_CHARS = 40
+MAX_TRIGGER_CHARS = 40
 MAX_DEVICE_NAME_CHARS = 60
 # Conduit's Settings page reads a device's own events back a page at a time
 # (list) and deletes the ones the user picks (delete).
@@ -390,7 +391,7 @@ class InboxStore:
                 " keep_days) VALUES(?,?,?,?,?,?,?,NULL,?)"
                 " ON CONFLICT(id) DO UPDATE SET name=excluded.name, device_public=excluded.device_public,"
                 " host_private=excluded.host_private, host_public=excluded.host_public, kid=excluded.kid,"
-                " created_at=excluded.created_at,"
+                " created_at=devices.created_at,"
                 " last_seen=CASE WHEN devices.device_public=excluded.device_public THEN devices.last_seen END",
                 (device_id, name, device_public, host_private, host_public, kid, now, KEEP_DAYS),
             )
@@ -450,7 +451,10 @@ class InboxStore:
         if before is not None and (not isinstance(before, list) or len(before) != 2 or type(before[0]) is not int
                                    or not isinstance(before[1], str) or not _EVENT_ID.match(before[1])):
             raise InboxError("malformed", "before must be the last page's next")
-        with self._write() as db:
+        # A read: Settings pages never wait on, or hold, the writers' lock.
+        with self._read() as db:
+            if db is None:  # there (_settings_call checked), but not readable yet: no key is lost
+                raise InboxError("unavailable", "The inbox can't be read right now; try again", status=503)
             key = self._device_key(db, device_id, kid, INFO_ANSWER)
             clauses, params = ["e.device = ?", "e.at_utc >= ? - d.keep_days * 86400"], [device_id, int(self.clock())]
             if before is not None:
@@ -516,8 +520,11 @@ class InboxStore:
                 row = db.execute("SELECT kid, last_seen, keep_days FROM devices WHERE id=?",
                                  (device_id,)).fetchone()
                 if row is not None:
+                    # Only what the tool and Settings can still show: within the days kept.
+                    cutoff = int(self.clock()) - int(row[2] or KEEP_DAYS) * 86400
                     counts = {kind: count for kind, count in db.execute(
-                        "SELECT kind, COUNT(*) FROM events WHERE device=? GROUP BY kind", (device_id,))}
+                        "SELECT kind, COUNT(*) FROM events WHERE device=? AND at_utc>=? GROUP BY kind",
+                        (device_id, cutoff))}
                     answer["device"] = {"kid": row[0], "last_event": iso_utc(row[1]) if row[1] else None,
                                         "keep_days": row[2], "events": counts}
             return answer
@@ -700,10 +707,12 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
         title = _text(event.get("title"), f"events[{index}].title", MAX_TITLE_CHARS)
         text = _text(event.get("text"), f"events[{index}].text", MAX_TEXT_CHARS, lines=True)
         amount = _text(event.get("amount"), f"events[{index}].amount", MAX_AMOUNT_CHARS)
-        trigger = _text(event.get("trigger"), f"events[{index}].trigger", 40)
+        trigger = _text(event.get("trigger"), f"events[{index}].trigger", MAX_TRIGGER_CHARS)
         if not any((source, title, text, amount, trigger)):
             raise InboxError("malformed", f"events[{index}] carries nothing")
-        if looks_like_code(title, text):
+        # Every field: a code or sign-in link in the source or amount stays
+        # out too (Conduit's ShortcutEventFilter reads the same ones).
+        if looks_like_code(source, title, text, amount):
             codes += 1
             continue
         cursor = db.execute(

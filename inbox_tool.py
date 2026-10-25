@@ -13,6 +13,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from hermes_constants import get_hermes_home
 
@@ -135,11 +136,14 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
         raise InboxError("malformed", f"limit is 1 to {MAX_LIMIT}")
     current = now()
-    since = _when(args.get("since"), "since", current, end=False)
-    until = _when(args.get("until"), "until", current, end=True)
     source = args.get("source") if isinstance(args.get("source"), str) and args.get("source").strip() else None
     device = args.get("device") if isinstance(args.get("device"), str) and args.get("device").strip() else None
-    if not store.overview()["devices"]:
+    devices = store.overview()["devices"]
+    # A bare date is the phone's day, not the host's.
+    zone = _phone_zone(devices, device)
+    since = _when(args.get("since"), "since", current, end=False, zone=zone)
+    until = _when(args.get("until"), "until", current, end=True, zone=zone)
+    if not devices:
         return _nothing_logged()
     found, more = store.events(kinds=kinds, since=since, until=until, query=query or None, source=source,
                                device=device, limit=limit)
@@ -154,9 +158,20 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
     return answer
 
 
-def _when(value: Any, field: str, now: datetime, *, end: bool) -> float | None:
-    """An ISO time with offset, a date (its start, or its end for ``until``)
-    or "<n>h" back from now, as epoch seconds."""
+def _phone_zone(devices: list[dict[str, Any]], device: str | None) -> Any:
+    """The time zone of the phone asked about, or of the one heard from
+    last; None (the host's own) when it isn't known."""
+    for item in ([d for d in devices if d.get("id") == device] if device else []) + devices:
+        try:
+            return ZoneInfo(item["time_zone"]) if item.get("time_zone") else None
+        except (KeyError, ValueError):
+            return None
+    return None
+
+
+def _when(value: Any, field: str, now: datetime, *, end: bool, zone: Any = None) -> float | None:
+    """An ISO time with offset, a date in ``zone`` (its start, or its end
+    for ``until``) or "<n>h" back from now, as epoch seconds."""
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     if not isinstance(value, str):
@@ -170,8 +185,7 @@ def _when(value: Any, field: str, now: datetime, *, end: bool) -> float | None:
     try:
         if len(text) == 10:
             day = datetime.fromisoformat(text)
-            local = now.astimezone().tzinfo
-            start = day.replace(tzinfo=local)
+            start = day.replace(tzinfo=zone or now.astimezone().tzinfo)
             return (start + timedelta(days=1) - timedelta(seconds=1)).timestamp() if end else start.timestamp()
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:

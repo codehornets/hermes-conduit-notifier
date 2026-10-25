@@ -148,6 +148,17 @@ def test_sign_in_codes_never_land(store, phone):
     assert [event["id"] for event in store.events()[0]] == ["evt-alert"]
 
 
+def test_a_code_in_any_field_never_lands(store, phone):
+    # Conduit's ShortcutEventFilter reads the same fields: From, Title, Details and Amount.
+    result = store.ingest(phone.seal(_batch(
+        _event("evt-source", kind="other", source="Your verification code is 482913", text="Hello"),
+        _event("evt-amount", kind="transaction", title="Bank", amount="Tap to sign in: https://b.example/magic"),
+        _event("evt-coffee", kind="transaction", source="Café Olimpico", amount="4,50 $"),
+    )))
+    assert result["stored"] == 1 and result["codes_dropped"] == 2
+    assert [event["id"] for event in store.events()[0]] == ["evt-coffee"]
+
+
 @pytest.mark.parametrize("text,code", [
     ("Your verification code is 482913", True),
     ("Votre code de vérification est 123456", True),
@@ -177,6 +188,27 @@ def test_a_new_device_key_drops_what_the_old_one_sent(store, phone):
     fresh = Phone()
     fresh.accept(store.register_key(fresh.key_request()))
     assert store.events() == ([], False)
+
+
+def test_a_new_key_keeps_when_the_device_first_paired(tmp_path):
+    clock = {"now": NOW}
+    store = inbox.InboxStore(tmp_path, clock=lambda: clock["now"])
+    store.register_key(Phone().key_request())
+    clock["now"] = NOW + 86400
+    store.register_key(Phone().key_request())
+    with store._read() as db:
+        assert db.execute("SELECT created_at FROM devices").fetchone()[0] == NOW
+
+
+def test_status_counts_only_what_is_still_kept(tmp_path):
+    clock = {"now": NOW}
+    store = inbox.InboxStore(tmp_path, clock=lambda: clock["now"])
+    phone = Phone()
+    phone.accept(store.register_key(phone.key_request()))
+    store.ingest(phone.seal(_batch(keep_days=2)))
+    assert store.status(DEVICE)["device"]["events"] == {"notification": 1}
+    clock["now"] = NOW + 3 * 86400  # past its days, not pruned yet
+    assert store.status(DEVICE)["device"]["events"] == {}
 
 
 def test_old_events_go_after_the_days_the_phone_asked(tmp_path):
@@ -241,6 +273,22 @@ def test_the_tool_reads_and_marks_events_as_data(store, phone):
     search = json.loads(tool.handle({"action": "search", "query": "IGA"}, store=store, now=now))
     assert [e["id"] for e in search["events"]] == ["evt-1"]
     assert json.loads(tool.handle({"action": "search"}, store=store, now=now))["error"] == "invalid"
+
+
+def test_the_tool_reads_a_bare_date_as_the_phones_day(tmp_path):
+    store = inbox.InboxStore(tmp_path, clock=lambda: NOW)
+    phone = Phone()
+    phone.accept(store.register_key(phone.key_request()))
+    # 8:00 on the 14th in Auckland is still the 13th in UTC and on this host.
+    store.ingest(phone.seal(_batch(_event("evt-morning", at="2026-10-14T08:00:00+13:00"),
+                                   device={"name": "Michel's iPhone", "time_zone": "Pacific/Auckland"})))
+    now = lambda: datetime.fromtimestamp(NOW, timezone.utc)  # noqa: E731
+    day = json.loads(tool.handle({"action": "recent", "since": "2026-10-14", "until": "2026-10-14"},
+                                 store=store, now=now))
+    assert [e["id"] for e in day["events"]] == ["evt-morning"]
+    before = json.loads(tool.handle({"action": "recent", "since": "2026-10-13", "until": "2026-10-13"},
+                                    store=store, now=now))
+    assert before["count"] == 0
 
 
 def test_the_tool_stays_with_the_main_conversation(store, phone):
@@ -349,3 +397,30 @@ def test_the_list_and_delete_routes(monkeypatch, tmp_path):
     assert [found["id"] for found in _opened(phone, listed.json(), "request-0001")["events"]] == ["evt-1"]
     deleted = client.post(f"{BASE}/inbox/delete", json={"device_id": DEVICE, "kid": phone.kid, "ids": ["evt-1"]})
     assert deleted.status_code == 200 and deleted.json()["deleted"] == 1
+
+
+def test_the_delete_route_takes_the_largest_delete_the_store_does(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    phone = Phone()
+    phone.accept(client.post(f"{BASE}/inbox/key", json=phone.key_request()).json())
+    ids = [f"{n:03d}" + "x" * 77 for n in range(inbox.MAX_DELETE)]
+    deleted = client.post(f"{BASE}/inbox/delete", json={"device_id": DEVICE, "kid": phone.kid, "ids": ids})
+    assert deleted.status_code == 200 and deleted.json()["deleted"] == 0
+
+
+def test_new_events_wake_the_pulse_loop_that_runs_here(monkeypatch):
+    import threading
+    woken = []
+    stop = threading.Event()
+    running = threading.Thread(target=stop.wait, daemon=True)
+    running.start()
+    try:
+        live = types.SimpleNamespace(_thread=running, wake=lambda: woken.append("live"))
+        idle = types.SimpleNamespace(_thread=None, wake=lambda: woken.append("idle"))
+        monkeypatch.setitem(sys.modules, "hermes_plugins.conduit_push.pulse", live)
+        monkeypatch.setitem(sys.modules, "conduit_push_dashboard_pkg.pulse", idle)
+        # Other suites may leave a real loop running in this process too.
+        assert api._wake_running_pulse() >= 1
+        assert woken == ["live"]  # the running loop, not an import whose thread never started
+    finally:
+        stop.set()

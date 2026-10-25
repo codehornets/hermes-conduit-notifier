@@ -8215,6 +8215,9 @@ INBOX_INGEST_WINDOW_S = 60.0
 INBOX_MAX_KEY_BODY_BYTES = 4 * 1024
 # At most 50 events of about 4 KB of text each, sealed and base64url.
 INBOX_MAX_INGEST_BODY_BYTES = 512 * 1024
+# inbox_store.MAX_DELETE ids of up to 80 characters, each quoted with a
+# comma, plus the device id, kid and JSON around them.
+INBOX_MAX_DELETE_BODY_BYTES = 100 * (80 + 3) + 1024
 
 _inbox_key_limiter = _MintLimiter(INBOX_KEY_LIMIT, INBOX_KEY_WINDOW_S,
                                   message="Too many inbox key requests; try again shortly")
@@ -8301,14 +8304,32 @@ def _inbox_tell_pulse() -> None:
     (pulse_followup.inbox_arrived). Only where Pulse runs, on this home;
     the events are stored whatever happens here."""
     try:
-        pulse = _plugin_package_module("pulse")
-        home = _calls_home()
-        if not (Path(home) / pulse.store.DB_NAME).exists():
+        pulse_store = _plugin_package_module("pulse_store")
+        followup = _plugin_package_module("pulse_followup")
+        home = Path(_calls_home())
+        if not (home / pulse_store.DB_NAME).exists():
             return  # Pulse never turned on: leave no file behind
-        if pulse.followup.inbox_arrived(pulse.open_store(home), time.time()):
-            pulse.wake()
+        if followup.inbox_arrived(pulse_store.open_store(home), time.time()):
+            _wake_running_pulse()
     except Exception:  # noqa: BLE001 — logging an event never fails on Pulse
         logger.warning("conduit_push: inbox couldn't tell Pulse about new events", exc_info=True)
+
+
+def _wake_running_pulse() -> int:
+    """Wakes the Pulse loop running in this process: the copy Hermes loaded
+    with the plugin (pulse.register started its thread), not an import of
+    the dashboard's own, whose wake event no loop waits on. A loop in
+    another process finds the marker inbox_arrived left on its next tick
+    (pulse.TICK_S). How many loops it woke."""
+    woken = 0
+    for name, module in list(sys.modules.items()):
+        if module is None or name.rsplit(".", 1)[-1] != "pulse":
+            continue
+        thread, wake = getattr(module, "_thread", None), getattr(module, "wake", None)
+        if callable(wake) and isinstance(thread, threading.Thread) and thread.is_alive():
+            wake()
+            woken += 1
+    return woken
 
 
 @router.post("/inbox/list")
@@ -8323,7 +8344,7 @@ async def post_inbox_list(request: Request, response: Response, profile: Optiona
 async def post_inbox_delete(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     await _scoped_acquire(_inbox_delete_limiter, profile)
-    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES * 2)
+    body = await _read_json_body(request, INBOX_MAX_DELETE_BODY_BYTES)
     return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.delete_events(body)),
                               "delete")
 
