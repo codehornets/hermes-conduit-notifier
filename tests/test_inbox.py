@@ -70,7 +70,7 @@ class Phone:
 
     def seal(self, batch):
         batch_id = batch["batch_id"]
-        nonce, ct = inbox.seal(self.key, json.dumps(batch).encode(), inbox.ingest_aad(self.kid, self.device_id, batch_id))
+        nonce, ct = inbox.seal(self.key, json.dumps(batch, ensure_ascii=False).encode(), inbox.ingest_aad(self.kid, self.device_id, batch_id))
         return {"v": 1, "device_id": self.device_id, "kid": self.kid, "batch_id": batch_id, "nonce": nonce, "ct": ct}
 
 
@@ -403,7 +403,7 @@ def test_the_delete_route_takes_the_largest_delete_the_store_does(monkeypatch, t
     client = _client(monkeypatch, tmp_path)
     phone = Phone()
     phone.accept(client.post(f"{BASE}/inbox/key", json=phone.key_request()).json())
-    ids = [f"{n:03d}" + "x" * 77 for n in range(inbox.MAX_DELETE)]
+    ids = [f"{n:03d}" + "x" * (inbox.MAX_EVENT_ID_CHARS - 3) for n in range(inbox.MAX_DELETE)]
     deleted = client.post(f"{BASE}/inbox/delete", json={"device_id": DEVICE, "kid": phone.kid, "ids": ids})
     assert deleted.status_code == 200 and deleted.json()["deleted"] == 0
 
@@ -424,3 +424,25 @@ def test_new_events_wake_the_pulse_loop_that_runs_here(monkeypatch):
         assert woken == ["live"]  # the running loop, not an import whose thread never started
     finally:
         stop.set()
+
+
+def test_the_route_caps_follow_the_store_limits():
+    # The routes can't import inbox_store when they load; this keeps their
+    # caps in step with it.
+    fields = (inbox.MAX_SOURCE_CHARS + inbox.MAX_TITLE_CHARS + inbox.MAX_TEXT_CHARS + inbox.MAX_AMOUNT_CHARS
+              + inbox.MAX_TRIGGER_CHARS)
+    assert api.INBOX_MAX_INGEST_BODY_BYTES == \
+        (inbox.MAX_EVENTS_PER_BATCH * (4 * fields + 512)) * 4 // 3 + 4096
+    assert api.INBOX_MAX_DELETE_BODY_BYTES == inbox.MAX_DELETE * (inbox.MAX_EVENT_ID_CHARS + 3) + 1024
+
+
+def test_a_full_batch_of_long_fields_fits_the_ingest_route(monkeypatch, tmp_path):
+    client = _client(monkeypatch, tmp_path)
+    phone = Phone()
+    phone.accept(client.post(f"{BASE}/inbox/key", json=phone.key_request()).json())
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    events = [_event(f"evt-{n}", at=at, source="é" * inbox.MAX_SOURCE_CHARS, title="ü" * inbox.MAX_TITLE_CHARS,
+                     text="👍" * inbox.MAX_TEXT_CHARS, amount="€" * inbox.MAX_AMOUNT_CHARS)
+              for n in range(inbox.MAX_EVENTS_PER_BATCH)]
+    landed = client.post(f"{BASE}/inbox/ingest", json=phone.seal(_batch(*events)))
+    assert landed.status_code == 200 and landed.json()["stored"] == inbox.MAX_EVENTS_PER_BATCH

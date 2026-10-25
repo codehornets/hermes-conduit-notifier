@@ -8213,10 +8213,14 @@ INBOX_WIPE_WINDOW_S = 60.0
 INBOX_INGEST_LIMIT = 120
 INBOX_INGEST_WINDOW_S = 60.0
 INBOX_MAX_KEY_BODY_BYTES = 4 * 1024
-# At most 50 events of about 4 KB of text each, sealed and base64url.
-INBOX_MAX_INGEST_BODY_BYTES = 512 * 1024
-# inbox_store.MAX_DELETE ids of up to 80 characters, each quoted with a
-# comma, plus the device id, kid and JSON around them.
+# The largest batch the store keeps whole: inbox_store.MAX_EVENTS_PER_BATCH
+# events whose fields are at their MAX_*_CHARS (source 120, title 200, text
+# 4000, amount 40, trigger 40; Conduit cuts to these), at up to 4 UTF-8
+# bytes a character plus id and JSON, sealed and base64url. Kept in step
+# with inbox_store by tests/test_inbox.py.
+INBOX_MAX_INGEST_BODY_BYTES = (50 * (4 * (120 + 200 + 4000 + 40 + 40) + 512)) * 4 // 3 + 4096
+# inbox_store.MAX_DELETE ids of MAX_EVENT_ID_CHARS, each quoted with a
+# comma, plus the device id, kid and JSON around them (the same test).
 INBOX_MAX_DELETE_BODY_BYTES = 100 * (80 + 3) + 1024
 
 _inbox_key_limiter = _MintLimiter(INBOX_KEY_LIMIT, INBOX_KEY_WINDOW_S,

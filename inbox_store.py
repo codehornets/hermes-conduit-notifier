@@ -80,6 +80,7 @@ MAX_TITLE_CHARS = 200
 MAX_TEXT_CHARS = 4000
 MAX_AMOUNT_CHARS = 40
 MAX_TRIGGER_CHARS = 40
+MAX_EVENT_ID_CHARS = 80
 MAX_DEVICE_NAME_CHARS = 60
 # Conduit's Settings page reads a device's own events back a page at a time
 # (list) and deletes the ones the user picks (delete).
@@ -88,7 +89,7 @@ MAX_DELETE = 100
 EARLIEST = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 _DEVICE_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}\Z")
-_EVENT_ID = re.compile(r"^[A-Za-z0-9:_-]{1,80}\Z")
+_EVENT_ID = re.compile(rf"^[A-Za-z0-9:_-]{{1,{MAX_EVENT_ID_CHARS}}}\Z")
 _BATCH_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}\Z")
 _KID = re.compile(r"^[0-9a-f]{32}\Z")
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}\Z")
@@ -525,7 +526,7 @@ class InboxStore:
                     counts = {kind: count for kind, count in db.execute(
                         "SELECT kind, COUNT(*) FROM events WHERE device=? AND at_utc>=? GROUP BY kind",
                         (device_id, cutoff))}
-                    answer["device"] = {"kid": row[0], "last_event": iso_utc(row[1]) if row[1] else None,
+                    answer["device"] = {"kid": row[0], "last_seen": iso_utc(row[1]) if row[1] else None,
                                         "keep_days": row[2], "events": counts}
             return answer
 
@@ -586,7 +587,7 @@ class InboxStore:
                 span = db.execute("SELECT MIN(at_utc), MAX(at_utc) FROM events WHERE device=? AND at_utc>=?",
                                   (device_id, cutoff)).fetchone()
                 devices.append({
-                    "id": device_id, "name": name, "time_zone": tz, "last_event": iso_utc(last_seen),
+                    "id": device_id, "name": name, "time_zone": tz, "last_seen": iso_utc(last_seen),
                     "keep_days": keep_days, "kinds": kinds, "top_sources": sources,
                     "oldest": iso_utc(span[0]) if span[0] else None, "newest": iso_utc(span[1]) if span[1] else None,
                 })
@@ -692,7 +693,6 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
     if isinstance(keep, bool) or not isinstance(keep, int) or not 1 <= keep <= MAX_KEEP_DAYS:
         raise InboxError("malformed", f"keep_days must be 1 to {MAX_KEEP_DAYS}")
     stored = duplicates = codes = 0
-    newest = None
     for index, event in enumerate(events):
         if not isinstance(event, dict):
             raise InboxError("malformed", f"events[{index}] must be an object")
@@ -722,7 +722,6 @@ def _apply(db: sqlite3.Connection, device_id: str, batch: dict[str, Any], now: i
              text, amount, trigger))
         if cursor.rowcount:
             stored += 1
-            newest = max(newest or 0, int(at.timestamp()))
         else:
             duplicates += 1
     db.execute("UPDATE devices SET last_seen=?, keep_days=?, name=COALESCE(?, name), tz=COALESCE(?, tz) WHERE id=?",
