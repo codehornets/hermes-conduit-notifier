@@ -8217,7 +8217,9 @@ INBOX_MAX_KEY_BODY_BYTES = 4 * 1024
 # events whose fields are at their MAX_*_CHARS (source 120, title 200, text
 # 4000, amount 40, trigger 40; Conduit cuts to these), at up to 4 UTF-8
 # bytes a character plus id and JSON, sealed and base64url. Kept in step
-# with inbox_store by tests/test_inbox.py.
+# with inbox_store by tests/test_inbox.py. The store still cuts a longer
+# field rather than refuse it, but a batch of such fields from a client
+# that doesn't cut may be refused here (413) instead.
 INBOX_MAX_INGEST_BODY_BYTES = (50 * (4 * (120 + 200 + 4000 + 40 + 40) + 512)) * 4 // 3 + 4096
 # inbox_store.MAX_DELETE ids of MAX_EVENT_ID_CHARS, each quoted with a
 # comma, plus the device id, kid and JSON around them (the same test).

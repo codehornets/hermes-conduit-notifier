@@ -446,3 +446,24 @@ def test_a_full_batch_of_long_fields_fits_the_ingest_route(monkeypatch, tmp_path
               for n in range(inbox.MAX_EVENTS_PER_BATCH)]
     landed = client.post(f"{BASE}/inbox/ingest", json=phone.seal(_batch(*events)))
     assert landed.status_code == 200 and landed.json()["stored"] == inbox.MAX_EVENTS_PER_BATCH
+
+
+def test_search_folds_case_beyond_ascii(store, phone):
+    store.ingest(phone.seal(_batch(_event("evt-1", source="CAFÉ OLIMPICO", title="REÇU", text="Merci"))))
+    assert [e["id"] for e in store.events(source="café")[0]] == ["evt-1"]
+    assert [e["id"] for e in store.events(query="reçu")[0]] == ["evt-1"]
+
+
+def test_the_tool_reads_a_bare_date_in_the_named_phones_zone(tmp_path):
+    store = inbox.InboxStore(tmp_path, clock=lambda: NOW)
+    auckland, toronto = Phone("phone-installation-1"), Phone("phone-installation-2")
+    auckland.accept(store.register_key(auckland.key_request()))
+    toronto.accept(store.register_key({**toronto.key_request(), "device_name": "Work iPhone"}))
+    store.ingest(auckland.seal(_batch(_event("evt-morning", at="2026-10-14T08:00:00+13:00"),
+                                      device={"name": "Michel's iPhone", "time_zone": "Pacific/Auckland"})))
+    store.ingest(toronto.seal(_batch(_event("evt-work", at="2026-10-14T09:00:00-04:00"), batch_id="batch-0002",
+                                     device={"name": "Work iPhone", "time_zone": "America/Toronto"})))
+    now = lambda: datetime.fromtimestamp(NOW, timezone.utc)  # noqa: E731
+    day = json.loads(tool.handle({"action": "recent", "since": "2026-10-14", "until": "2026-10-14",
+                                  "device": "michel's iphone"}, store=store, now=now))
+    assert [e["id"] for e in day["events"]] == ["evt-morning"]

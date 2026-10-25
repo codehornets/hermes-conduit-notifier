@@ -602,6 +602,9 @@ class InboxStore:
         with self._read() as db:
             if db is None:
                 return [], False
+            # SQLite's LOWER folds only ASCII: fold both sides in Python, so
+            # "café" finds "CAFÉ".
+            db.create_function("fold", 1, _fold, deterministic=True)
             clauses = ["e.at_utc >= ? - d.keep_days * 86400"]
             params: list[Any] = [now]
             if kinds:
@@ -614,14 +617,14 @@ class InboxStore:
                 clauses.append("e.at_utc <= ?")
                 params.append(int(until))
             if device:
-                clauses.append("(d.id = ? OR LOWER(d.name) = LOWER(?))")
+                clauses.append("(d.id = ? OR fold(d.name) = fold(?))")
                 params.extend([device, device])
             if source:
-                clauses.append("LOWER(COALESCE(e.source, '')) LIKE ? ESCAPE '\\'")
-                params.append(f"%{_like(source.lower())}%")
+                clauses.append("fold(COALESCE(e.source, '')) LIKE ? ESCAPE '\\'")
+                params.append(f"%{_like(_fold(source))}%")
             if query:
-                for word in query.lower().split()[:6]:
-                    clauses.append("LOWER(COALESCE(e.source, '') || ' ' || COALESCE(e.title, '') || ' ' ||"
+                for word in _fold(query).split()[:6]:
+                    clauses.append("fold(COALESCE(e.source, '') || ' ' || COALESCE(e.title, '') || ' ' ||"
                                    " COALESCE(e.text, '')) LIKE ? ESCAPE '\\'")
                     params.append(f"%{_like(word)}%")
             rows = db.execute(
@@ -635,6 +638,10 @@ class InboxStore:
                     "text": text, "amount": amount, "trigger": trigger, "device": device_name}
             found.append({key: value for key, value in item.items() if value is not None})
         return found, len(rows) > limit
+
+
+def _fold(text: Any) -> Any:
+    return text.casefold() if isinstance(text, str) else text
 
 
 def _like(text: str) -> str:

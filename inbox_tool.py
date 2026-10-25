@@ -161,11 +161,16 @@ def _handle(args: dict[str, Any], session_id: Any, is_child: Callable[[Any], boo
 def _phone_zone(devices: list[dict[str, Any]], device: str | None) -> Any:
     """The time zone of the phone asked about, or of the one heard from
     last; None (the host's own) when it isn't known."""
-    for item in ([d for d in devices if d.get("id") == device] if device else []) + devices:
+    named = [d for d in devices if device and (d.get("id") == device
+                                                  or str(d.get("name") or "").casefold() == device.casefold())]
+    # The phone named (by id or name, as events() matches it), else the
+    # newest; the first whose zone is known.
+    for item in named or devices:
         try:
-            return ZoneInfo(item["time_zone"]) if item.get("time_zone") else None
+            if item.get("time_zone"):
+                return ZoneInfo(item["time_zone"])
         except (KeyError, ValueError):
-            return None
+            continue
     return None
 
 
