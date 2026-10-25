@@ -83,7 +83,7 @@ Return a JSON object {{"remembered": [...], "found": [...]}}.
 
 - "bring_up": true when it belongs in this report. {bar} At most {limit} in all.
 - "value": how useful hearing it now would be, from 1 (not at all) to 5 (they'd want it now).
-- "skip": when it should stay out, why, in one word: "done" (already done, in any chat or cron run, or later work moved past it), "covered" (their calendar, reminders, Hermes's scheduled jobs or something running in the background cover it), "raised" (Pulse brought it up lately and nothing about it changed), "rated" (the user rated it "no" before) or "minor"; otherwise "".
+- "skip": when it should stay out, why, in one word: "done" (already done, in any chat or cron run, marked (done) in what Pulse brought up lately, or later work moved past it), "covered" (their calendar, reminders, Hermes's scheduled jobs or something running in the background cover it), "raised" (Pulse brought it up lately and nothing about it changed), "rated" (the user rated it "no" before) or "minor"; otherwise "".
 - "actionable": whether the user could do something about it.
 - "line": what to tell the user, one line written to them that makes sense on its own, then (why now, and where it came from). Every found entry needs one, and so does every remembered item you'd bring up.
 - "kind" (found only): one of {kinds}.
@@ -318,6 +318,13 @@ def report_text(tag: str, picked: Sequence[dict], since: str) -> str:
 def lines(picked: Sequence[dict]) -> list[tuple[str, str, Optional[int]]]:
     """The picks as pulse_learning.add_noticed_cards takes a report's lines."""
     return [(pick["kind"], pick["text"], pick["item_id"]) for pick in picked]
+
+
+def found_in(picked: Sequence[dict]) -> list[tuple[str, str]]:
+    """The chat each pick came from, as (profile, chat id), ("", "") when it
+    came from none (the calendar, reminders, notes, jobs, tools or the
+    inbox): pulse_learning.add_noticed_cards's ``found_in``."""
+    return [(pick["profile"], pick["chat_id"]) for pick in picked]
 
 
 def describe(row: dict) -> str:
