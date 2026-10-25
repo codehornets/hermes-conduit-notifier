@@ -13,6 +13,14 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
+## 0.72.0 (2026-10-25)
+
+### New and improved
+- The Hermes dashboard's Sessions page shows a Conduit card: whether the
+  app is reaching this host (connected, or when it was last seen), and
+  whether its notifications get through the relay, with the reason when
+  they don't.
+
 ## 0.71.2 (2026-10-24)
 
 ### Fixes
