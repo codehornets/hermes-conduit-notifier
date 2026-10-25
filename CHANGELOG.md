@@ -13,7 +13,7 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
-## 0.72.0 (2026-10-25)
+## 0.73.0 (2026-10-25)
 
 ### New and improved
 - Shortcuts automations can log to Hermes. End an automation (a notification
@@ -26,6 +26,15 @@ checks it). The format is fixed, because Conduit reads it:
   bank confirms the transfer"), Pulse checks as soon as a new event comes in.
 - Conduit's Settings can show what was logged from your iPhone and delete
   any of it.
+
+## 0.72.0 (2026-10-24)
+
+### Security
+- Encryption keys for notifications now rotate every 7 days through a key
+  exchange inside the encrypted channel, so new keys never travel over the
+  dashboard connection. On iOS 26 the exchange is quantum-safe (ML-KEM-768
+  with X25519): a recording of today's traffic can't open later
+  notifications, even with a future quantum computer.
 
 ## 0.71.2 (2026-10-24)
 
