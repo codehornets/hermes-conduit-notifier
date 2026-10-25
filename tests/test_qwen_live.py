@@ -123,3 +123,68 @@ def test_watch_token_tools_cannot_switch_provider(monkeypatch):
     assert api.run_watch_live_token(qwen, provider="qwen")["token"] == "st-qwen-only"
     assert api.run_watch_live_token(gemini, provider="qwen")["status"] == 403
     assert api.run_watch_live_token(qwen, provider="gemini")["status"] == 403
+
+
+@pytest.mark.parametrize("voice", ["", "  "])
+def test_blank_voice_uses_the_default(voice):
+    assert api.qwen_live_settings(env(CONDUIT_QWEN_LIVE_VOICE=voice))["voice"] == "Tina"
+
+
+@pytest.mark.parametrize("voice", ["Tina&x=1", "a" * 65, "<script>", "Ti na"])
+def test_unbounded_voice_is_refused(voice):
+    status = api.qwen_live_status(env(CONDUIT_QWEN_LIVE_VOICE=voice))
+    assert status["available"] is False
+    assert "CONDUIT_QWEN_LIVE_VOICE" in status["reason"]
+
+
+def test_missing_key_uses_the_gemini_reason_code():
+    status = api.qwen_live_status({"CONDUIT_QWEN_LIVE_WORKSPACE": "workspace1"}.get)
+    assert status == {"provider": "qwen", "available": False, "reason": "no_api_key",
+                      "model": "qwen3.8-omni-flash-realtime"}
+
+
+def test_routes_name_unexpected_failures_and_stay_uncached(monkeypatch):
+    async def scoped(profile, fn, executor=None):
+        return fn()
+    monkeypatch.setattr(api, "_run_scoped", scoped)
+    def broken(**_):
+        raise RuntimeError("host detail")
+    monkeypatch.setattr(api, "qwen_live_status", lambda: broken())
+    monkeypatch.setattr(api, "mint_qwen_live_token", broken)
+    app = FastAPI()
+    app.include_router(api.router)
+    with TestClient(app) as client:
+        for method, path, route in [(client.get, "status", "status"), (client.post, "token", "token")]:
+            response = method(f"/qwen-live/{path}")
+            assert response.status_code == 500
+            assert response.headers["cache-control"] == "no-store"
+            assert response.json()["detail"] == f"Qwen Live {route} failed on the host (RuntimeError)"
+            assert "host detail" not in response.text
+
+
+def test_route_keeps_no_store_on_a_profile_refusal(monkeypatch):
+    async def scoped(profile, fn, executor=None):
+        raise api.HTTPException(status_code=404, detail="Unknown profile")
+    monkeypatch.setattr(api, "_run_scoped", scoped)
+    app = FastAPI()
+    app.include_router(api.router)
+    with TestClient(app) as client:
+        for method, path in [(client.get, "status"), (client.post, "token")]:
+            response = method(f"/qwen-live/{path}?profile=nope")
+            assert response.status_code == 404
+            assert response.headers["cache-control"] == "no-store"
+
+
+def test_watch_qwen_answers_name_qwen(monkeypatch):
+    from types import SimpleNamespace
+    import threading
+    monkeypatch.setattr(api, "_scoped_call", lambda profile, fn: fn())
+    grant = SimpleNamespace(tools=(api.WATCH_QWEN_LIVE_TOKEN,), live_tokens=api.WATCH_LIVE_TOKENS_PER_GRANT,
+                            lock=threading.Lock(), profile="work", limiter_key="work")
+    assert api.run_watch_live_token(grant, provider="qwen")["detail"] == "This call has used all its Qwen Live tokens"
+    grant.live_tokens = 0
+    def broken(**_):
+        raise RuntimeError("boom")
+    failed = api.run_watch_live_token(grant, mint=broken, provider="qwen")
+    assert failed["detail"] == "Minting a Qwen Live token failed on the host (RuntimeError)"
+    assert grant.live_tokens == 0

@@ -23,6 +23,11 @@ Conduit can instead ask for a session billed to this host's OpenAI API key
 (``billing: "api"``), only when the profile turns that on; the two never
 stand in for each other.
 
+Qwen Live: like Gemini Live, Conduit talks to Alibaba Cloud (DashScope)
+directly from the phone or Watch, and the DASHSCOPE_API_KEY stays on this
+host. Conduit asks for a short-lived temporary key per connection; a failed
+mint never falls back to the permanent key or to Gemini.
+
 Grok Live: relays Conduit's realtime socket to xAI, adding this host's
 SuperGrok sign-in (or XAI_API_KEY) on the way. The bearer stays on the host.
 
@@ -239,10 +244,10 @@ def gemini_live_status(get_env: Optional[Callable[[str], Optional[str]]] = None)
 # Direct Live shares Conduit's phone/Watch call shell. Only credentials pass
 # through this host; audio connects directly to Google or Alibaba Cloud.
 QWEN_DEFAULT_MODEL = "qwen3.8-omni-flash-realtime"
-_qwen_mint_limiter = None  # initialized with the other limiters below
+QWEN_DEFAULT_VOICE = "Tina"
 
 
-def qwen_live_settings(get_env=None) -> Dict[str, str]:
+def qwen_live_settings(get_env: Optional[Callable[[str], Optional[str]]] = None) -> Dict[str, str]:
     get_env = get_env or _env_value
     region = str(get_env("CONDUIT_QWEN_LIVE_REGION") or "cn-beijing").strip()
     domains = {"cn-beijing": "dashscope.aliyuncs.com", "ap-southeast-1": "dashscope-intl.aliyuncs.com"}
@@ -254,24 +259,33 @@ def qwen_live_settings(get_env=None) -> Dict[str, str]:
     model = str(get_env("CONDUIT_QWEN_LIVE_MODEL") or QWEN_DEFAULT_MODEL).strip()
     if not re.fullmatch(r"qwen[A-Za-z0-9._-]*realtime[A-Za-z0-9._-]*", model):
         raise TokenError(503, "Set a Qwen Realtime model in CONDUIT_QWEN_LIVE_MODEL")
+    # Bounded like the others: it goes back to the device and on to Alibaba Cloud.
+    voice = str(get_env("CONDUIT_QWEN_LIVE_VOICE") or "").strip() or QWEN_DEFAULT_VOICE
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", voice):
+        raise TokenError(503, "Set a Qwen voice name (letters, digits, - or _) in CONDUIT_QWEN_LIVE_VOICE")
     return {"model": model, "token_url": f"https://{domains[region]}/api/v1/tokens?expire_in_seconds=120",
             "websocket_url": f"wss://{workspace}.{region}.maas.aliyuncs.com/api-ws/v1/realtime?"
                              + urllib.parse.urlencode({"model": model}),
-            "voice": str(get_env("CONDUIT_QWEN_LIVE_VOICE") or "Tina").strip()}
+            "voice": voice}
 
 
-def qwen_live_status(get_env=None) -> Dict[str, Any]:
+def qwen_live_status(get_env: Optional[Callable[[str], Optional[str]]] = None) -> Dict[str, Any]:
     get_env = get_env or _env_value
     try:
         settings = qwen_live_settings(get_env)
     except TokenError as exc:
         return {"provider": "qwen", "available": False, "reason": str(exc), "model": QWEN_DEFAULT_MODEL}
-    return {"provider": "qwen", "available": bool(str(get_env("DASHSCOPE_API_KEY") or "").strip()),
-            "reason": None if str(get_env("DASHSCOPE_API_KEY") or "").strip() else "Set DASHSCOPE_API_KEY on the Hermes host",
-            "model": settings["model"]}
+    if not str(get_env("DASHSCOPE_API_KEY") or "").strip():
+        # The same reason code as /gemini-live/status; Conduit words it.
+        return {"provider": "qwen", "available": False, "reason": "no_api_key", "model": settings["model"]}
+    return {"provider": "qwen", "available": True, "model": settings["model"]}
 
 
-def mint_qwen_live_token(get_env=None, post=None, limiter_key=None) -> Dict[str, Any]:
+def mint_qwen_live_token(get_env: Optional[Callable[[str], Optional[str]]] = None,
+                         post: Optional[Callable[[urllib.request.Request], Any]] = None,
+                         limiter_key: Optional[str] = None) -> Dict[str, Any]:
+    """A DashScope temporary API key (POST /api/v1/tokens: top-level `token`,
+    `expires_at` in Unix seconds) for one Qwen Live connection."""
     get_env = get_env or _env_value
     settings = qwen_live_settings(get_env)
     key = str(get_env("DASHSCOPE_API_KEY") or "").strip()
@@ -502,7 +516,7 @@ class _MintLimiter:
 
 
 _mint_limiter = _MintLimiter(MINT_LIMIT, MINT_WINDOW_S)
-_qwen_mint_limiter = _MintLimiter(MINT_LIMIT, MINT_WINDOW_S)
+_qwen_mint_limiter = _MintLimiter(MINT_LIMIT, MINT_WINDOW_S, message="Too many Qwen Live token requests; try again shortly")
 _search_limiter = _MintLimiter(SEARCH_LIMIT, SEARCH_WINDOW_S, message="Too many web searches; try again shortly")
 
 
@@ -650,16 +664,30 @@ async def get_qwen_live_status(response: Response, profile: Optional[str] = None
         return {"ok": True, **await _run_scoped(profile, qwen_live_status)}
     except TokenError as exc:
         raise HTTPException(exc.status, str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        # Hermes' own 400/404 for a bad or unknown profile
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected("status", exc, feature="Qwen Live")
 
 
 @router.post("/qwen-live/token")
 async def create_qwen_live_token(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    # The body is a usable credential: keep it out of any cache on the way.
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     try:
-        return {"ok": True, **await _run_scoped(profile, lambda: mint_qwen_live_token(limiter_key=_limiter_key(profile)))}
+        result = await _run_scoped(profile, lambda: mint_qwen_live_token(limiter_key=_limiter_key(profile)))
     except TokenError as exc:
+        logger.warning("Qwen Live token request failed: %s", exc)
         raise HTTPException(exc.status, str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected("token", exc, feature="Qwen Live")
+    return {"ok": True, **result}
 
 
 @router.get("/web-search/status")
@@ -8833,7 +8861,9 @@ async def post_phone_wipe(request: Request, response: Response, profile: Optiona
 # minted as /gemini-live/token mints one, for a Watch whose Gemini session
 # broke and can't be resumed while the iPhone is out of reach. It travels
 # sealed like any answer, so the relay never sees it; the Gemini key stays
-# here.
+# here. A Qwen Live call asks for qwen_live_token instead: a DashScope
+# temporary key, minted as /qwen-live/token mints one. Each tool mints only
+# its own provider's credential.
 
 WATCH_CHAT_TOOLS = ("find_chat", "read_chat")
 # The user's spoken answer to what Hermes waits on in the chat a call from
@@ -9680,17 +9710,20 @@ def _run_watch_chat_tool(grant: _WatchGrant, feature: str, timeout: float,
 
 def run_watch_live_token(grant: _WatchGrant,
                          mint: Optional[Callable[..., Dict[str, Any]]] = None, *, provider: str = "gemini") -> Dict[str, Any]:
-    """A fresh provider-specific Live token for the grant's call, as
-    /gemini-live/token answers. A mint that fails, or whose answer never
-    reaches the relay, doesn't count against the grant's tokens; the token
-    itself is never logged."""
-    mint = mint or (mint_qwen_live_token if provider == "qwen" else mint_gemini_live_token)
-    required = WATCH_QWEN_LIVE_TOKEN if provider == "qwen" else WATCH_LIVE_TOKEN
+    """A fresh Live token for the grant's call, as /gemini-live/token (or,
+    for provider "qwen", /qwen-live/token) answers. A mint that fails, or
+    whose answer never reaches the relay, doesn't count against the grant's
+    tokens; the token itself is never logged. One grant serves one call with
+    one provider, so the two tools share the per-grant count."""
+    qwen = provider == "qwen"
+    label = "Qwen Live" if qwen else "Gemini Live"
+    mint = mint or (mint_qwen_live_token if qwen else mint_gemini_live_token)
+    required = WATCH_QWEN_LIVE_TOKEN if qwen else WATCH_LIVE_TOKEN
     if required not in grant.tools:
         return {"ok": False, "status": 403, "detail": "This tool isn't available to the Watch"}
     with grant.lock:
         if grant.live_tokens >= WATCH_LIVE_TOKENS_PER_GRANT:
-            return {"ok": False, "status": 429, "detail": "This call has used all its Gemini Live tokens"}
+            return {"ok": False, "status": 429, "detail": f"This call has used all its {label} tokens"}
         grant.live_tokens += 1
 
     def give_back() -> None:
@@ -9701,15 +9734,15 @@ def run_watch_live_token(grant: _WatchGrant,
         token = _scoped_call(grant.profile, lambda: mint(limiter_key=grant.limiter_key))
     except TokenError as exc:
         give_back()
-        logger.warning("Gemini Live token for a Conduit Watch failed: %s", exc)
+        logger.warning("%s token for a Conduit Watch failed: %s", label, exc)
         return {"ok": False, "status": exc.status, "detail": str(exc)}
     except HTTPException as exc:
         give_back()
         return {"ok": False, "status": exc.status_code, "detail": str(exc.detail)}
     except Exception as exc:  # noqa: BLE001 — named only
         give_back()
-        _log_watch_failure("Gemini Live token for a Conduit Watch failed", exc)
-        return {"ok": False, "status": 500, "detail": f"Minting a Gemini Live token failed on the host ({type(exc).__name__})"}
+        _log_watch_failure(f"{label} token for a Conduit Watch failed", exc)
+        return {"ok": False, "status": 500, "detail": f"Minting a {label} token failed on the host ({type(exc).__name__})"}
     undelivered = _watch_undelivered.get()
     if undelivered is not None:
         undelivered.append(give_back)
