@@ -47,7 +47,8 @@ def test_every_capability_names_a_served_route_family():
         "personality": "/personality", "gpt-live": "/gpt-live/", "grok-live": "/grok-live/",
         "voice-sessions": "/voice/sessions", "voice-tags": "/voice/tags", "voice-summary": "/voice/summary",
         "voice-chat-calls": "/voice/chat-calls",
-        "session-takeover": "/sessions/takeover", "e2e-notifications": "/e2e", "watch-tools": "/watch-tools/",
+        "session-takeover": "/sessions/takeover", "e2e-notifications": "/e2e", "e2e-inline-rotation": "/e2e/rotate",
+        "watch-tools": "/watch-tools/",
         # Jobs, their follow-ups and Gemini Live tokens ride the watch-tools grant route.
         "watch-jobs": "/watch-tools/",
         "watch-job-follow-ups": "/watch-tools/",
@@ -76,6 +77,7 @@ def test_every_capability_names_a_served_route_family():
         "pulse_dismiss": "/pulse/dismiss",
         "present-v1": "/present/",
         "health-sync": "/health/",
+        "shortcut-inbox": "/inbox/",
         "voice-tools": "/voice-tools",
         "location-sync": "/location/",
         # A fresh lookup is the location status route's `locate` answer.

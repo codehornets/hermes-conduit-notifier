@@ -6217,8 +6217,11 @@ _E2E_B64URL = re.compile(r"^[A-Za-z0-9_-]{43}\Z")  # 32 bytes, unpadded
 # Same as e2e.KEY_MAX_AGE_S and e2e.PREVIOUS_KEY_GRACE_S (tests/test_e2e.py
 # checks): the phone rotates a key this old, and the key a rotation replaced
 # opens answers this long.
-E2E_KEY_MAX_AGE_S = 30 * 24 * 3600
+E2E_KEY_MAX_AGE_S = 7 * 24 * 3600
 E2E_PREVIOUS_KEY_GRACE_S = 7 * 24 * 3600
+# Earlier rotation attempts sealed with a replaced key that are remembered
+# (as digests) and refused if they arrive again.
+E2E_ROTATE_RETRIES_KEPT = 16
 _E2E_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _e2e_limiter = _MintLimiter(E2E_LIMIT, E2E_WINDOW_S, message="Too many encryption key requests; try again shortly")
 _e2e_lock = threading.Lock()
@@ -6386,7 +6389,10 @@ def e2e_status(path: Any = None) -> Dict[str, Any]:
         "paired": True,
         "installation_id": state.get("installation_id"),
         "gateway_id": state.get("gateway_id"),
-        "e2e": {"kid": kid, "created_at": record.get("created_at")} if usable else None,
+        "e2e": {"kid": kid, "created_at": record.get("created_at"), "suite": record.get("suite") or "handover"} if usable else None,
+        # Inline rotation (POST /e2e/rotate) and its key exchanges, best
+        # first; the phone picks the best one it can run.
+        "rotate_suites": _e2e_rotate_suites() if usable else [],
         "previous_kid": previous["kid"] if previous else None,
         "rotate": usable and (bool(state.get("rotate_requested_at")) or created is None
                               or now >= created + E2E_KEY_MAX_AGE_S),
@@ -6471,6 +6477,160 @@ def provision_e2e(body: Any, path: Any = None) -> Dict[str, Any]:
         state.pop("rotate_without_overlap", None)
         _save_pairing_state(path, state)
     return {"kid": kid}
+
+
+_e2e_module_lock = threading.Lock()
+_e2e_module_value: Any = None
+_e2e_suites_value: Optional[List[str]] = None
+
+
+def _e2e_module() -> Any:
+    """e2e.py beside this folder, loaded once: the rotation's key exchange."""
+    global _e2e_module_value
+    with _e2e_module_lock:
+        if _e2e_module_value is None:
+            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "e2e.py")
+            spec = importlib.util.spec_from_file_location("conduit_push_dashboard_e2e", path)
+            if spec is None or spec.loader is None:
+                raise TokenError(501, "This plugin install is missing e2e.py; update the plugin")
+            module = importlib.util.module_from_spec(spec)
+            # dataclasses look the module up while the class is built.
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            _e2e_module_value = module
+        return _e2e_module_value
+
+
+def _e2e_rotate_suites() -> List[str]:
+    """The suites this host can run. Only a successful probe is cached: a
+    transient failure (e2e.py unreadable mid-update) is tried again on the
+    next (rate-limited) request instead of turning inline rotation off until
+    a restart."""
+    global _e2e_suites_value
+    if _e2e_suites_value is None:
+        try:
+            _e2e_suites_value = list(_e2e_module().rotate_suites())
+        except Exception:
+            return []
+    return _e2e_suites_value
+
+
+def _e2e_rotate_request_digest(body: Dict[str, Any]) -> str:
+    """Fingerprint of one rotation request: its key ids, suite and sealed
+    content (which carries kid_new and the phone's fresh shares). A resend of
+    the same request matches; a new attempt sealed with the same key doesn't."""
+    material = json.dumps([body.get("kid"), body.get("suite"), body.get("sealed")],
+                          sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def rotate_e2e(body: Any, path: Any = None) -> Dict[str, Any]:
+    """Inline rotation: the phone's request, sealed with the current key,
+    carries its half of a key exchange (X25519, and ML-KEM-768 on iOS 26+);
+    the new secret mixes the exchange with the old secret, so it never
+    crosses the dashboard connection. The old key stays as e2e_previous for
+    E2E_PREVIOUS_KEY_GRACE_S.
+
+    A resend of the request that made the current key (same kid, suite and
+    sealed content) gets the same reply, so a lost reply loses nothing. A
+    different request sealed with that replaced key (a phone that lost its
+    pending exchange, e.g. after a restart, and starts over) is answered as a
+    fresh rotation from the replaced key: the key it never received is
+    dropped. During its overlap the replaced key can thus roll the pairing
+    forward, which adds nothing over dashboard access (POST /e2e can
+    replace the key too). An earlier attempt that was already answered (the last
+    E2E_ROTATE_RETRIES_KEPT), and any other request sealed with a replaced
+    key, is refused with 409.
+
+    A rotation without overlap (`rotate --now`) keeps nothing to resend: its
+    retry is refused with 409 and the phone hands over a new key."""
+    if not isinstance(body, dict):
+        raise TokenError(400, "Expected a JSON object")
+    installation_id, gateway_id = body.get("installation_id"), body.get("gateway_id")
+    if not isinstance(installation_id, str) or not installation_id or not isinstance(gateway_id, str) or not gateway_id:
+        raise TokenError(400, "installation_id and gateway_id are required")
+    if body.get("suite") not in _e2e_rotate_suites():
+        raise TokenError(400, "This host can't run that rotation suite")
+    module = _e2e_module()
+    path = path if path is not None else _pairing_state_path()
+    with _e2e_lock, _pairing_state_lock(path):
+        state = _load_pairing_state(path)
+        if not state:
+            raise TokenError(409, "This Hermes profile isn't paired with Conduit")
+        if state.get("installation_id") != installation_id or state.get("gateway_id") != gateway_id:
+            raise TokenError(409, "This Hermes profile is paired with a different device")
+        current, previous = state.get("e2e"), state.get("e2e_previous")
+        if not isinstance(current, dict):
+            raise TokenError(409, "This pairing has no key to rotate yet")
+        digest = _e2e_rotate_request_digest(body)
+        # The key being rotated: the current one, or (for a phone that never
+        # got the reply of the rotation that replaced it) the replaced one.
+        base = current
+        if isinstance(previous, dict) and isinstance(body.get("kid"), str) and previous.get("kid") == body["kid"]:
+            reply = previous.get("rotate_reply")
+            made_current = isinstance(reply, dict) and reply.get("kid_new") == current.get("kid")
+            # A digest of public request fields, not a secret: a plain
+            # compare also survives a hand-edited, non-ASCII state file.
+            if made_current and previous.get("rotate_request") == digest:
+                return {"rotation": reply}  # the phone missed our answer
+            if not made_current or _e2e_live_previous(state, time.time()) is None:
+                raise TokenError(409, "This key was replaced; send a new one")
+            answered = previous.get("rotate_requests_before")
+            if isinstance(answered, list) and digest in answered:
+                # An earlier attempt, delivered late or replayed: rotating
+                # again would drop the key the phone took since.
+                raise TokenError(409, "This rotation request was already answered")
+            # Same old key, another request: the phone started over without
+            # the key we answered with, so it never holds it.
+            base = previous
+        try:
+            keys = module.derive_keys(str(base.get("kid") or ""), module.unb64u(str(base.get("secret") or "")))
+            rotation = module.answer_rotation(body, keys, module.unb64u(str(base.get("secret") or "")),
+                                              installation_id=installation_id, gateway_id=gateway_id)
+        except module.E2EError as exc:
+            raise TokenError(409, f"The rotation request was refused: {exc}")
+        if rotation.kid_new in (current.get("kid"), previous.get("kid") if isinstance(previous, dict) else None):
+            # The new key id must name one secret only, while either key
+            # still opens answers.
+            raise TokenError(409, "This key id is already in use with a different secret")
+        now = datetime.now(timezone.utc).strftime(_E2E_TIME_FORMAT)
+        if state.get("rotate_without_overlap"):
+            state.pop("e2e_previous", None)
+        else:
+            # Starting over from the replaced key keeps its first retirement
+            # time, so retries never stretch its overlap.
+            retired_at = base.get("retired_at") if base is previous else now
+            record = {"kid": base["kid"], "secret": base["secret"], "retired_at": retired_at or now,
+                      "rotate_reply": rotation.reply, "rotate_request": digest}
+            if base is previous:
+                before = previous.get("rotate_requests_before")
+                before = [d for d in before if isinstance(d, str)] if isinstance(before, list) else []
+                if isinstance(previous.get("rotate_request"), str):
+                    before.append(previous["rotate_request"])
+                record["rotate_requests_before"] = before[-E2E_ROTATE_RETRIES_KEPT:]
+            state["e2e_previous"] = record
+        state["e2e"] = {"kid": rotation.kid_new, "secret": module.b64u(rotation.secret), "created_at": now,
+                        "suite": rotation.suite}
+        state.pop("rotate_requested_at", None)
+        state.pop("rotate_without_overlap", None)
+        _save_pairing_state(path, state)
+    return {"rotation": rotation.reply}
+
+
+@router.post("/e2e/rotate")
+async def post_e2e_rotate(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        await _scoped_acquire(_e2e_limiter, profile)
+        body = await _read_json_body(request, E2E_MAX_BODY_BYTES)
+        return {"ok": True, **(await _run_scoped(profile, lambda: rotate_e2e(body)))}
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected("rotation", exc, feature="Encrypted notifications")
 
 
 @router.get("/e2e")
@@ -8198,6 +8358,188 @@ async def post_location_ingest(request: Request, response: Response,
     await _scoped_acquire(_location_ingest_limiter, profile)
     body = await _read_json_body(request, LOCATION_MAX_INGEST_BODY_BYTES)
     return await _location_route(response, profile, lambda: _location_ingest(body), "upload")
+
+
+# --- Shortcuts inbox ---------------------------------------------------------
+#
+# The user's iPhone Shortcuts automations (a notification from an app they
+# pick, a message, an email, a Wallet payment, an NFC tag, a sound) end in
+# Conduit's Log to Hermes action, which posts each run here as a sealed event
+# (/inbox/ingest) after agreeing a key once (/inbox/key), straight over the
+# dashboard connection, never through the push relay. No chat turn and no
+# push: the conduit_inbox tool reads them (inbox_store.py,
+# conduit-inbox.sqlite3), and Pulse, when it's on, reads them in its report
+# and checks the user's watches when new ones arrive. Status reports counts
+# only. Conduit's Settings page reads a device's own events back sealed for
+# it (/inbox/list), deletes the ones the user picks (/inbox/delete), and
+# wipe deletes a device's or everything.
+
+INBOX_KEY_LIMIT = 10
+INBOX_KEY_WINDOW_S = 60.0
+INBOX_WIPE_LIMIT = 5
+INBOX_WIPE_WINDOW_S = 60.0
+# A burst of notifications can each run an automation.
+INBOX_INGEST_LIMIT = 120
+INBOX_INGEST_WINDOW_S = 60.0
+INBOX_MAX_KEY_BODY_BYTES = 4 * 1024
+# The largest batch the store keeps whole: inbox_store.MAX_EVENTS_PER_BATCH
+# events whose fields are at their MAX_*_CHARS (source 120, title 200, text
+# 4000, amount 40, trigger 40; Conduit cuts to these), at up to 4 UTF-8
+# bytes a character plus id and JSON, sealed and base64url. Kept in step
+# with inbox_store by tests/test_inbox.py. The store still cuts a longer
+# field rather than refuse it, but a batch of such fields from a client
+# that doesn't cut may be refused here (413) instead.
+INBOX_MAX_INGEST_BODY_BYTES = (50 * (4 * (120 + 200 + 4000 + 40 + 40) + 512)) * 4 // 3 + 4096
+# inbox_store.MAX_DELETE ids of MAX_EVENT_ID_CHARS, each quoted with a
+# comma, plus the device id, kid and JSON around them (the same test).
+INBOX_MAX_DELETE_BODY_BYTES = 100 * (80 + 3) + 1024
+
+_inbox_key_limiter = _MintLimiter(INBOX_KEY_LIMIT, INBOX_KEY_WINDOW_S,
+                                  message="Too many inbox key requests; try again shortly")
+_inbox_ingest_limiter = _MintLimiter(INBOX_INGEST_LIMIT, INBOX_INGEST_WINDOW_S,
+                                     message="Too many inbox events; try again shortly")
+_inbox_wipe_limiter = _MintLimiter(INBOX_WIPE_LIMIT, INBOX_WIPE_WINDOW_S,
+                                   message="Too many inbox delete requests; try again shortly")
+INBOX_LIST_LIMIT = 60
+INBOX_LIST_WINDOW_S = 60.0
+_inbox_list_limiter = _MintLimiter(INBOX_LIST_LIMIT, INBOX_LIST_WINDOW_S,
+                                   message="Too many inbox requests; try again shortly")
+INBOX_DELETE_LIMIT = 30
+INBOX_DELETE_WINDOW_S = 60.0
+_inbox_delete_limiter = _MintLimiter(INBOX_DELETE_LIMIT, INBOX_DELETE_WINDOW_S,
+                                     message="Too many inbox delete requests; try again shortly")
+_inbox_store_module: Any = None
+
+
+def _inbox_store() -> Any:
+    """inbox_store.py beside this folder, loaded once."""
+    global _inbox_store_module
+    if _inbox_store_module is None:
+        _inbox_store_module = _plugin_package_module("inbox_store")
+    return _inbox_store_module
+
+
+def _inbox_call(fn: Callable[[Any], Dict[str, Any]]) -> Dict[str, Any]:
+    module = _inbox_store()
+    try:
+        return fn(module.InboxStore(_calls_home()))
+    except module.InboxError as exc:
+        raise TokenError(exc.status, str(exc), exc.code)
+    except sqlite3.DatabaseError:
+        logger.warning("conduit_push: inbox store unreadable", exc_info=True)
+        raise TokenError(503, "The inbox on this host can't be read")
+
+
+async def _inbox_route(response: Response, profile: Optional[str], fn: Callable[[], Dict[str, Any]],
+                       name: str) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"ok": True, **(await _run_scoped(profile, fn))}
+    except TokenError as exc:
+        return _store_refusal(exc)
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected(name, exc, feature="Shortcuts inbox")
+
+
+@router.get("/inbox/status")
+async def get_inbox_status(response: Response, profile: Optional[str] = None,
+                           device_id: Optional[str] = None) -> Dict[str, Any]:
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: {
+        **store.status(device_id), "crypto": _inbox_store().crypto_available()}), "status")
+
+
+@router.post("/inbox/key")
+async def post_inbox_key(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_key_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.register_key(body)), "key")
+
+
+@router.post("/inbox/ingest")
+async def post_inbox_ingest(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_ingest_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_INGEST_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_ingest(body), "upload")
+
+
+def _inbox_ingest(body: Any) -> Dict[str, Any]:
+    result = _inbox_call(lambda store: store.ingest(body))
+    if result.get("stored"):
+        _inbox_tell_pulse()
+    return result
+
+
+def _inbox_tell_pulse() -> None:
+    """New events in: Pulse checks the user's open watches against them
+    (pulse_followup.inbox_arrived). Only where Pulse runs, on this home;
+    the events are stored whatever happens here."""
+    try:
+        pulse_store = _plugin_package_module("pulse_store")
+        followup = _plugin_package_module("pulse_followup")
+        home = Path(_calls_home())
+        if not (home / pulse_store.DB_NAME).exists():
+            return  # Pulse never turned on: leave no file behind
+        if followup.inbox_arrived(pulse_store.open_store(home), time.time()):
+            _wake_running_pulse()
+    except Exception:  # noqa: BLE001 — logging an event never fails on Pulse
+        logger.warning("conduit_push: inbox couldn't tell Pulse about new events", exc_info=True)
+
+
+def _wake_running_pulse() -> int:
+    """Wakes the Pulse loop running in this process: the copy Hermes loaded
+    with the plugin (pulse.register started its thread), not an import of
+    the dashboard's own, whose wake event no loop waits on. A loop in
+    another process finds the marker inbox_arrived left on its next tick
+    (pulse.TICK_S). How many loops it woke."""
+    woken = 0
+    for name, module in list(sys.modules.items()):
+        if module is None or name.rsplit(".", 1)[-1] != "pulse":
+            continue
+        thread, wake = getattr(module, "_thread", None), getattr(module, "wake", None)
+        if callable(wake) and isinstance(thread, threading.Thread) and thread.is_alive():
+            wake()
+            woken += 1
+    return woken
+
+
+@router.post("/inbox/list")
+async def post_inbox_list(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_list_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.list_sealed(body)), "list")
+
+
+@router.post("/inbox/delete")
+async def post_inbox_delete(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_delete_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_DELETE_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.delete_events(body)),
+                              "delete")
+
+
+@router.post("/inbox/wipe")
+async def post_inbox_wipe(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_wipe_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object", headers={"Cache-Control": "no-store"})
+    # Everything only when asked for by name; a device id alone deletes that device's events.
+    if body.get("all") is True and body.get("device_id") is not None:
+        raise HTTPException(status_code=400, detail="Name a device_id or all: true, not both",
+                            headers={"Cache-Control": "no-store"})
+    device_id = None if body.get("all") is True else body.get("device_id")
+    if device_id is None and body.get("all") is not True:
+        raise HTTPException(status_code=400, detail="Name a device_id, or all: true",
+                            headers={"Cache-Control": "no-store"})
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.wipe(device_id)), "delete")
 
 
 # A maps lookup the agent asked the phone for (conduit_maps): the phone,
@@ -15237,6 +15579,8 @@ ROUTE_CAPABILITIES = (
     "voice-chat-calls",
     "session-takeover",
     "e2e-notifications",
+    # POST /e2e/rotate: keys rotate inline through a key exchange.
+    "e2e-inline-rotation",
     "watch-tools",
     "watch-jobs",
     "watch-job-follow-ups",
@@ -15278,6 +15622,8 @@ ROUTE_CAPABILITIES = (
     # sharing.other_profiles: the host's other profiles paired with the
     # same iPhone read the location (location_profiles).
     "location-profiles",
+    # /inbox: events the user's Shortcuts automations log (Log to Hermes).
+    "shortcut-inbox",
     "pairing",
     "self-restart",
     # POST /self/update runs the whole update on the host and notifies.

@@ -13,13 +13,36 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
-## 0.72.0 (2026-10-25)
+## 0.74.0 (2026-10-25)
 
 ### New and improved
 - The Hermes dashboard's Sessions page shows a Conduit card: whether the
   app is reaching this host (connected, or when it was last seen), and
   whether its notifications get through the relay, with the reason when
   they don't.
+
+## 0.73.0 (2026-10-25)
+
+### New and improved
+- Shortcuts automations can log to Hermes. End an automation (a notification
+  from an app you pick, a message, an email, a Wallet payment, an NFC tag, a
+  sound the phone hears) with Conduit's Log to Hermes action, and Hermes can
+  look it up later ("what did my bank send today?") without a reply or a
+  push each time. Sign-in codes are never kept, and events go after 30 days.
+- With Pulse on, its reports read what your automations logged, and when
+  you ask Hermes to tell you when something happens ("let me know when the
+  bank confirms the transfer"), Pulse checks as soon as a new event comes in.
+- Conduit's Settings can show what was logged from your iPhone and delete
+  any of it.
+
+## 0.72.0 (2026-10-24)
+
+### Security
+- Encryption keys for notifications now rotate every 7 days through a key
+  exchange inside the encrypted channel, so new keys never travel over the
+  dashboard connection. On iOS 26 the exchange is quantum-safe (ML-KEM-768
+  with X25519): a recording of today's traffic can't open later
+  notifications, even with a future quantum computer.
 
 ## 0.71.2 (2026-10-24)
 
