@@ -3,7 +3,7 @@
 Hermes Conduit Notifier is the open-source Hermes plugin that connects a Hermes host to the [Hermes Conduit](https://github.com/kaishi00/hermes-conduit) iPhone, iPad and Apple Watch app. It started as the notification sender and now carries most of what Conduit needs from the host:
 
 - **Notifications and calls**: approval, input, reply, failure and background-task notifications, Hermes calling you (CallKit on the phone and Watch), and Lock Screen progress while a turn runs, all delivered through the Conduit push relay in [`relay/`](relay/), end-to-end encrypted where APNs allows.
-- **Live voice**: single-use Gemini Live tokens, GPT-Live sessions on the host's ChatGPT subscription or API key, Grok Live relayed with the host's xAI sign-in, Local Live and Classic voice through your own speech server, voice web lookups, memory and personality for voice, and saved call transcripts.
+- **Live voice**: single-use Gemini Live tokens, temporary Qwen Live credentials, GPT-Live sessions on the host's ChatGPT subscription or API key, Grok Live relayed with the host's xAI sign-in, Local Live and Classic voice through your own speech server, voice web lookups, memory and personality for voice, and saved call transcripts.
 - **Apple Watch**: short-lived grants that let a Watch call run lookups and Hermes jobs, answer what Hermes waits on in a call from Hermes, and stream GPT-Live, Grok and Local Live audio, through the relay, sealed end to end.
 - **Phone data the user opts into**: Apple Health, location, maps, calendar, reminders, Focus, phone status, contacts and alarms, sent by the phone straight to this host and sealed end to end, with the `conduit_health`, `conduit_location`, `conduit_maps`, `conduit_calendar`, `conduit_phone` and `conduit_contacts` tools for the agent, and events from the user's Shortcuts automations through `conduit_inbox`.
 - **Conduit extras**: rich cards and on-screen cards during calls, Artifacts, group pictures, chat takeover, cron notification settings, Conduit settings the agent can change, and one-tap pairing and updates from the app.
@@ -64,6 +64,25 @@ hermes gateway restart
 The dashboard imports the plugin's routes once, so restart the dashboard as
 well (or let Conduit do it: Settings > Conduit plugin > Update runs Hermes' own
 plugin update, the gateway restart and [the dashboard restart](#updating-from-conduit-plugin-024)).
+
+### On the Hermes dashboard (plugin 0.74+)
+
+The dashboard's Sessions page shows a Conduit card at the top, once Conduit
+has used this host. Hermes' own Connected Platforms card lists only the
+gateway's messaging adapters (Matrix, the API server), and Conduit talks to
+the dashboard instead, so it gets its own card:
+
+- **App**: Connected while a Conduit gateway socket that opened a chat is
+  open, or within 5 minutes of Conduit's last request to this plugin; Idle
+  after that, with when it was last seen.
+- **Push notifications**: Delivering (with the last push's time), Failing
+  (with a short reason: the relay unreachable, its answer, a certificate),
+  Refused or Blocked (the same marks `status` reports), Paired with nothing
+  sent yet, or Not paired.
+
+It reads `GET /api/plugins/conduit_push/link-status` every 30 seconds. The
+times live in `conduit-link-status.json` in the profile's Hermes home, written
+at most once a minute each; it holds no credential or relay address.
 
 ## Events
 

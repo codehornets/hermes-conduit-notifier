@@ -20,6 +20,14 @@ checks it). The format is fixed, because Conduit reads it:
   The host supplies temporary credentials; call audio connects directly to
   Alibaba Cloud, without going through the Conduit relay or the Hermes host.
 
+## 0.74.0 (2026-10-25)
+
+### New and improved
+- The Hermes dashboard's Sessions page shows a Conduit card: whether the
+  app is reaching this host (connected, or when it was last seen), and
+  whether its notifications get through the relay, with the reason when
+  they don't.
+
 ## 0.73.0 (2026-10-25)
 
 ### New and improved

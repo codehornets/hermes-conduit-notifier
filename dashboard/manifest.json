@@ -5,6 +5,7 @@
   "icon": "Puzzle",
   "version": "0.75.0",
   "tab": { "path": "/conduit", "hidden": true },
+  "slots": ["sessions:top"],
   "entry": "dist/index.js",
   "api": "plugin_api.py"
 }
