@@ -6108,6 +6108,13 @@ def _enqueue_voice_call_end(profile: Optional[str], session_id: str, engine: str
 # its claim. That turn keeps running in the owner (nothing is interrupted);
 # it is the same exposure as the known limit that the owner isn't told.
 #
+# Hermes' gateway also holds a chat through its durable ledger in the
+# profile's state.db: another bot's message (message_agent) runs in the bot's
+# Bot Chat that way, and every other surface's send is refused until its reply
+# ends, with no claim to drop. The route answers "busy" (surface "bot", or
+# "gateway" for other queued work) without touching the registry, and Conduit
+# sends once the ledger lets go.
+#
 # Only Desktop and TUI turns write a turn marker. A live claim from any other
 # surface (a CLI or kanban worker, a gateway, or a blank one) has no marker
 # to read, so it could look idle mid-turn: it is never dropped and answers
@@ -8560,18 +8567,12 @@ _location_store_module: Any = None
 
 
 def _location_store() -> Any:
-    """location_store.py beside this folder, loaded once."""
+    """location_store.py beside this folder, loaded once (with sealing.py, as
+    part of the private package)."""
     global _location_store_module
-    with _calls_store_lock:
-        if _location_store_module is None:
-            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "location_store.py")
-            spec = importlib.util.spec_from_file_location("conduit_push_dashboard_location_store", path)
-            if spec is None or spec.loader is None:
-                raise TokenError(501, "This plugin install is missing location_store.py; update the plugin")
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            _location_store_module = module
-        return _location_store_module
+    if _location_store_module is None:
+        _location_store_module = _plugin_package_module("location_store")
+    return _location_store_module
 
 
 def _location_call(fn: Callable[[Any], Dict[str, Any]]) -> Dict[str, Any]:
@@ -9423,11 +9424,16 @@ def answer_watch_hermes_call(grant: _WatchGrant, args: Dict[str, Any]) -> Dict[s
     return result
 
 
+# The only flag a Watch call sends: start_job's (#1250).
+WATCH_ARG_FLAGS = frozenset({"joins_call"})
+
+
 def _clean_watch_args(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     return {k: v for k, v in value.items()
-            if isinstance(k, str) and (isinstance(v, str) or (isinstance(v, int) and not isinstance(v, bool)))}
+            if isinstance(k, str) and (isinstance(v, str) or (isinstance(v, int) and not isinstance(v, bool))
+                                       or (k in WATCH_ARG_FLAGS and isinstance(v, bool)))}
 
 
 def run_watch_tool(grant: _WatchGrant, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -10556,6 +10562,19 @@ WATCH_APPROVAL_CHOICES = ("once", "deny")
 WATCH_JOB_PROMPT = ("[Background job started from a Conduit voice conversation. Nobody is watching this chat live, "
                     "so work on it on your own. When you are done, end your final message with a plain-language "
                     "summary that can be read aloud: what you found or did, with the key details.]\n\n{instructions}")
+# A later ordinary request of the call, sent into the chat its first one
+# made (#1250).
+WATCH_JOB_NEXT_PROMPT = ("[The next request from the same Conduit voice conversation. As before, end your final message "
+                         "with a plain-language summary that can be read aloud.]\n\n{instructions}")
+# How often a request waiting for the call's chat checks it again, besides
+# being woken when a job settles.
+WATCH_JOB_CHAT_WAIT_S = 2.0
+# How long the call's chat waits for a cancelled request's turn to end
+# before the next request goes in.
+WATCH_JOB_INTERRUPT_END_S = 5.0
+# How long after that a cancelled request's end may still come, and is
+# told apart from the next request's own. Past it, an end is the next one's.
+WATCH_JOB_LATE_END_S = 10.0
 # Job ids are unique in this process, not per grant: a renewed grant's jobs
 # never share an id with the last grant's, so a cancel can't hit the wrong
 # job.
@@ -10808,6 +10827,10 @@ class _WatchJob:
         # kept in case Hermes refuses the interrupt (cancel).
         self.cancelling = False
         self.held_end: Optional[Tuple[str, Dict[str, Any]]] = None
+        # Its prompt went in and Hermes hasn't ended that turn yet; after a
+        # cancel, the call's chat waits for that end until quiet_by (#1250).
+        self.turn_open = False
+        self.quiet_by = 0.0
         # A follow-up going into the running turn (interrupt_job): None,
         # "sending", "accepted" (Hermes took it into the turn) or "queued"
         # (Hermes runs it as the next turn). Until the turn carries on, an
@@ -10818,6 +10841,9 @@ class _WatchJob:
         self.held_since = 0.0
         # Follow-ups to one job go one at a time, in the order they came.
         self.follow_up_lock = threading.Lock()
+        # An ordinary request (not background, quick or another profile's):
+        # the call's first one makes the chat its later ones go to (#1250).
+        self.joins_call = False
 
     @property
     def active(self) -> bool:
@@ -10916,6 +10942,12 @@ class _WatchJobs:
         # reaper keeps watching while any is in flight.
         self.follow_ups_in_flight = 0
         self.reaping = False
+        # The job whose chat the call's later ordinary requests run in: its
+        # first ordinary one that started (#1250).
+        self.call_chat: Optional[_WatchJob] = None
+        # The first ordinary request while its chat is still being made: one
+        # that starts meanwhile waits for that chat rather than making its own.
+        self.call_chat_claim: Optional[_WatchJob] = None
 
     # Hermes' session API
 
@@ -10976,7 +11008,28 @@ class _WatchJobs:
     def _job_for(self, sid: str) -> Optional[_WatchJob]:
         if not sid:
             return None
-        return next((job for job in self.jobs.values() if sid in (job.session_id, job.stored_session_id)), None)
+        # The call's chat carries one request at a time (#1250): its frames
+        # are the running one's, never a settled earlier one's. Late frames
+        # with no running owner go to the earliest, whose handlers drop them.
+        owners = [job for job in self.jobs.values() if sid in (job.session_id, job.stored_session_id)]
+        return next((job for job in owners if job.active or job.cancelling),
+                    next((job for job in owners if job.turn_open), owners[0] if owners else None))
+
+    def _superseded_turn(self, job: _WatchJob, sid: str) -> Optional[_WatchJob]:
+        """The call's chat (#1250): a cancelled turn on the running job's
+        session whose end may still come. Once that end is overdue, the
+        turn is taken as over and the frames are the running job's."""
+        if not job.active:
+            return None
+        now = time.monotonic()
+        for other in self.jobs.values():
+            if (other is job or not other.turn_open or other.status != "cancelled"
+                    or sid not in (other.session_id, other.stored_session_id)):
+                continue
+            if now < other.quiet_by + WATCH_JOB_LATE_END_S:
+                return other
+            other.turn_open = False
+        return None
 
     def _event(self, kind: str, sid: str, payload: Dict[str, Any]) -> None:
         settled = False
@@ -10984,6 +11037,24 @@ class _WatchJobs:
             job = self._job_for(sid)
             if job is None:
                 return
+            superseded = self._superseded_turn(job, sid)
+            if superseded is not None:
+                # The call's chat (#1250): a session's turns run in order. An
+                # end before the next request's turn shows any sign of life is
+                # the cancelled turn's: however it ended while the next one
+                # waits, and only as an interrupted completion once the next
+                # went in after the hold, when its own end can come first (an
+                # early error).
+                # Anything else means that turn is over and its end isn't coming.
+                if kind in ("message.complete", "error") and (
+                        not job.turn_open or self._reads_as_interrupt(kind, payload)):
+                    job = superseded
+                else:
+                    superseded.turn_open = False
+            if kind in ("message.complete", "error") and job.turn_open:
+                # Its turn is over: the call's chat can take the next one.
+                job.turn_open = False
+                self.changed.notify_all()
             if job.held_completion is not None and kind not in ("message.complete", "error"):
                 # Hermes is still at work on the session: the end it held
                 # waits on, so a quiet stretch isn't read as no turn coming.
@@ -11044,6 +11115,13 @@ class _WatchJobs:
         return payload.get("status") == "interrupted"
 
     @staticmethod
+    def _reads_as_interrupt(kind: str, payload: Dict[str, Any]) -> bool:
+        """An end that says its turn was interrupted: Hermes ends an
+        interrupted turn with a completion marked so (as _settle reads it),
+        while an error is a turn failing, so it is the running one's."""
+        return kind == "message.complete" and payload.get("status") == "interrupted"
+
+    @staticmethod
     def _settle(job: _WatchJob, kind: str, payload: Dict[str, Any]) -> None:
         """The job's turn ended: ``message.complete`` or ``error``."""
         job.approval = None
@@ -11082,6 +11160,11 @@ class _WatchJobs:
         with self.changed:
             job = self._job_for(sid)
             if job is None or not job.active:
+                return
+            if not job.turn_open and self._superseded_turn(job, sid) is not None:
+                # The call's chat (#1250): the cancelled turn is still going
+                # and the next request hasn't gone in, so the ask is the
+                # cancelled one's, which its interrupt ends.
                 return
             if job.held_completion is not None:
                 # Still at work, as any frame for the session says.
@@ -11135,12 +11218,24 @@ class _WatchJobs:
                                    "starting another."}
             self.started += 1
             job = _WatchJob(f"watch-{next(_watch_job_numbers)}", watch_job_title(instructions), profile)
+            # The Watch says whether the user asked to keep it apart; a job on
+            # another profile always is.
+            job.joins_call = args.get("joins_call") is True and profile is None
+            chat: Optional[_WatchJob] = None
+            if job.joins_call:
+                claim = self.call_chat_claim if self.call_chat_claim is not None and self.call_chat_claim.active else None
+                chat = self.call_chat or claim
+                if chat is None:
+                    self.call_chat_claim = job
             self.jobs[job.job_id] = job
         done = threading.Event()
 
         def run() -> None:
             try:
-                answer = self._start_session(job, instructions)
+                if chat is not None:
+                    answer = self._continue_session(job, instructions, chat)
+                else:
+                    answer = self._start_session(job, instructions)
             except Exception as exc:  # noqa: BLE001 — _start_session catches its own
                 _log_watch_failure("Starting a Watch job failed", exc)
                 answer = {"ok": True, "status": "not_started", "title": job.title,
@@ -11150,6 +11245,9 @@ class _WatchJobs:
                         job.status, job.error = "failed", type(exc).__name__
             with self.changed:
                 job.answer_pending = False
+                if self.call_chat_claim is job:
+                    # Made the call's chat, or never will.
+                    self.call_chat_claim = None
                 if answer.get("status") == "not_started":
                     # Nothing ran: it doesn't spend one of the call's jobs.
                     self.started -= 1
@@ -11169,6 +11267,8 @@ class _WatchJobs:
             with self.changed:
                 self.jobs.pop(job.job_id, None)
                 self.started -= 1
+                if self.call_chat_claim is job:
+                    self.call_chat_claim = None
                 self.changed.notify_all()
             return {"ok": True, "status": "not_started", "title": job.title,
                     "message": "Hermes couldn't start the job: the host is too busy right now."}
@@ -11219,6 +11319,7 @@ class _WatchJobs:
             if not cancelled:
                 self.rpc("prompt.submit", {"session_id": sid, "text": WATCH_JOB_PROMPT.format(instructions=instructions)})
                 with self.lock:
+                    job.turn_open = True
                     cancelled = job.status == "cancelled"
                 if cancelled:
                     # Cancelled while its prompt went in: stop that turn.
@@ -11251,6 +11352,10 @@ class _WatchJobs:
             # A cancel between the prompt and here interrupted the turn
             # itself and told the Watch.
             cancelled = job.status == "cancelled"
+            if not cancelled and job.joins_call and job.profile is None and self.call_chat is None:
+                self.call_chat = job
+            if self.call_chat_claim is job:
+                self.call_chat_claim = None
             self.changed.notify_all()
         if cancelled:
             self._close_session(job)
@@ -11263,6 +11368,100 @@ class _WatchJobs:
                 **({"profile": job.profile} if job.profile else {}),
                 "message": f"The job is running on Hermes{where}. Its result will arrive later as a message; "
                            "don't wait for it."}
+
+    def _chat_waits(self, chat: _WatchJob, job: _WatchJob) -> bool:
+        """Whether a request waits on in the call's chat: for the chat to be
+        made, or for the request running there. Called with the lock held."""
+        if self.call_chat is not chat:
+            return chat.active and self.call_chat_claim is chat
+        return self._chat_busy(chat, job)
+
+    def _chat_busy(self, chat: _WatchJob, job: _WatchJob) -> bool:
+        """Whether another request still runs in the call's chat. Called with
+        the lock held."""
+        now = time.monotonic()
+        return any(other is not job and other.session_id == chat.session_id
+                   and (other.active or other.cancelling or (other.turn_open and now < other.quiet_by))
+                   for other in self.jobs.values())
+
+    def _continue_session(self, job: "_WatchJob", instructions: str, chat: "_WatchJob") -> Dict[str, Any]:
+        """Sends the task as the next turn of the call's chat (#1250), once
+        nothing else runs there, as the phone sends a call's requests to its
+        chat; the start's answer."""
+        with self.changed:
+            own = False
+            while True:
+                while not self.ended and job.status == "starting" and self._chat_waits(chat, job):
+                    self.changed.wait(WATCH_JOB_CHAT_WAIT_S)
+                ended, cancelled = self.ended, job.status == "cancelled"
+                if ended or cancelled or self.call_chat is chat:
+                    break
+                # The chat waited for never got made: wait for the one made
+                # since, or for another request making one, or make it.
+                claim = self.call_chat_claim if self.call_chat_claim is not None and self.call_chat_claim.active else None
+                if self.call_chat is not None or (claim is not None and claim is not job):
+                    chat = self.call_chat or claim
+                    continue
+                self.call_chat_claim, own = job, True
+                break
+            if not ended and not cancelled and not own:
+                job.session_id, job.stored_session_id = chat.session_id, chat.stored_session_id
+        if own:
+            return self._start_session(job, instructions)
+        if cancelled:
+            return {"ok": True, "status": "not_started", "title": job.title,
+                    "message": f"{job.title} was cancelled before it started."}
+        if ended:
+            with self.changed:
+                if job.active:
+                    job.status, job.error = "failed", "The call ended before Hermes took it"
+                self.changed.notify_all()
+            # It was the last thing holding the call's transport open.
+            self._close_transport_if_idle()
+            return {"ok": True, "status": "not_started", "title": job.title,
+                    "message": "The call ended before Hermes could take this request."}
+        try:
+            with self.lock:
+                cancelled = job.status == "cancelled"
+            if not cancelled:
+                self.rpc("prompt.submit", {"session_id": job.session_id,
+                                           "text": WATCH_JOB_NEXT_PROMPT.format(instructions=instructions)})
+                with self.lock:
+                    job.turn_open = True
+                    cancelled = job.status == "cancelled"
+                if cancelled:
+                    # Cancelled while its prompt went in: stop that turn, as
+                    # _start_session does. Nothing else ran in the chat.
+                    try:
+                        self.rpc("session.interrupt", {"session_id": job.session_id})
+                    except WatchJobError as exc:
+                        logger.info("Cancelling a starting Watch job failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 — the request didn't go; the model is told
+            with self.changed:
+                if job.active:
+                    job.status = "failed"
+                    job.error = str(exc)[:300] if isinstance(exc, WatchJobError) else type(exc).__name__
+                self.changed.notify_all()
+            if not isinstance(exc, WatchJobError):
+                _log_watch_failure("Continuing a Watch call's chat failed", exc)
+            # The chat stays open while the call runs: it is the call's, and
+            # its earlier jobs'.
+            if self.ended:
+                self._close_session(job)
+            return {"ok": True, "status": "not_started", "title": job.title,
+                    "message": f"Hermes couldn't take the request: {job.error}"}
+        with self.changed:
+            if job.status == "starting":
+                job.status = "running"
+            cancelled = job.status == "cancelled"
+            self.changed.notify_all()
+        if cancelled:
+            return {"ok": True, "status": "not_started", "title": job.title,
+                    "message": f"{job.title} was cancelled before it started."}
+        return {"ok": True, "status": "started", "job_id": job.job_id, "title": job.title,
+                "session_id": job.stored_session_id or job.session_id,
+                "message": "Hermes is working on this in the call's chat, after the earlier requests there. "
+                           "Its result will arrive later as a message; don't wait for it."}
 
     def list(self) -> Dict[str, Any]:
         """Mirrors the phone's list_jobs answer (GeminiLiveToolBridge.listResult)."""
@@ -11321,6 +11520,10 @@ class _WatchJobs:
             else:
                 with self.changed:
                     job.cancelling, job.held_end = False, None
+                    # Hermes ends the interrupted turn on its own time: the
+                    # call's chat waits a little for that end.
+                    job.quiet_by = time.monotonic() + WATCH_JOB_INTERRUPT_END_S
+                    self.changed.notify_all()
         cancelled = [job for job in targets if job not in failed]
         undelivered = _watch_undelivered.get()
         if undelivered is not None and cancelled:
@@ -11706,6 +11909,12 @@ class _WatchJobs:
         with self.lock:
             if job.closed or not job.session_id:
                 return
+            # The call's chat closes once the last request in it is done.
+            sharing = [other for other in self.jobs.values() if other.session_id == job.session_id]
+            if any(other.active or other.cancelling for other in sharing if other is not job):
+                return
+            for other in sharing:
+                other.closed = True
             job.closed = True
         record = self.server._sessions.get(job.session_id)
         if isinstance(record, dict) and record.get("transport") is self.transport:
@@ -12152,8 +12361,12 @@ class _WatchAudioRuntime:
             self.failure = failure
 
     def _step(self, command: list, timeout: float, what: str) -> str:
+        # Hermes points PYTHONPATH at its own site-packages, so pip (and uv)
+        # would count Hermes' cffi and cryptography as installed and leave
+        # them out of an environment the helper runs isolated (#340).
+        env = {name: value for name, value in os.environ.items() if name != "PYTHONPATH"}
         try:
-            done = self._run(command, capture_output=True, text=True, timeout=timeout)
+            done = self._run(command, capture_output=True, text=True, timeout=timeout, env=env)
         except subprocess.TimeoutExpired:
             raise _RuntimeBuildFailed(f"{what} timed out")
         except OSError as exc:
@@ -12175,7 +12388,7 @@ class _WatchAudioRuntime:
         uv = self._which("uv")
         try:
             self._step([self._base_python, "-m", "venv", env_dir], WATCH_AUDIO_VENV_TIMEOUT_S, "Making the environment")
-            self._step([python, "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
+            self._step([python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
                         "--no-warn-script-location", WATCH_AUDIO_AIORTC], WATCH_AUDIO_PIP_TIMEOUT_S, "Installing aiortc")
         except _RuntimeBuildFailed as first:
             # A Python without venv or pip (a distribution's own, say): uv
@@ -15796,6 +16009,34 @@ async def delete_room_image(room_id: str, response: Response) -> Dict[str, Any]:
     return {"ok": True, "removed": removed}
 
 
+# --- Room planner ------------------------------------------------------------
+#
+# A dashboard run as its own process plans the turns of the group rooms it
+# hosts, and it imports these routes before it starts them. room_planner.py
+# beside this folder keeps a long thread getting turns there, as the plugin's
+# own load does in the gateway.
+
+_room_planner_module: Any = None
+
+
+def _guard_room_planner() -> None:
+    global _room_planner_module
+    try:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "room_planner.py")
+        spec = importlib.util.spec_from_file_location("conduit_push_dashboard_room_planner", path)
+        if spec is None or spec.loader is None:
+            raise ImportError("This plugin install is missing room_planner.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.install()
+        _room_planner_module = module
+    except Exception:  # noqa: BLE001 — group rooms only, never the routes
+        logger.warning("Conduit plugin: couldn't guard Hermes' group room planner", exc_info=True)
+
+
+_guard_room_planner()
+
+
 # --- Artifacts ---------------------------------------------------------------
 #
 # GET /artifacts lists what a profile's chats produced (artifacts_index.py
@@ -16596,10 +16837,20 @@ def _notify_self_update(job: Dict[str, Any]) -> None:
             # Per outcome: a failure the restarted dashboard corrects isn't a
             # duplicate of the push the dying one sent.
             event = events.push_event("background_task.finished", identifier=events.event_id("plugin-update", job["id"], job.get("step")),
-                                      profile=profile or "default", title=title, body=body)
+                                      profile=profile or "default", profile_name=_bot_name(client), title=title, body=body)
             client.send_now(event)
     except Exception as exc:  # noqa: BLE001 — a notification is a courtesy; the job file has the outcome
         logger.warning("Conduit plugin: couldn't send the update notification (%s)", type(exc).__name__)
+
+
+def _bot_name(client: Any) -> str:
+    """The profile's bot name for a push (session_titles.bot_name); "" when it
+    can't be read, so the push still goes out with the profile id."""
+    try:
+        return importlib.import_module(f"{client.__package__}.session_titles").bot_name()
+    except Exception:  # noqa: BLE001 — a name is never worth the notification
+        logger.debug("Conduit plugin: no bot name for the update notification", exc_info=True)
+        return ""
 
 
 @router.post("/self/update")

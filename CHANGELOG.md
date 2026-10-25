@@ -13,7 +13,7 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
-## 0.78.0 (2026-10-25)
+## 0.79.0 (2026-10-25)
 
 ### New and improved
 - Conduit's Predictive settings can suggest your next message after a
@@ -24,6 +24,63 @@ checks it). The format is fixed, because Conduit reads it:
   Hermes Desktop shows no notes for them. A faster model can answer
   instead: set `auxiliary.conduit_predict` (provider and model) in the
   profile's config.
+
+## 0.78.0 (2026-10-25)
+
+### New and improved
+- On an Apple Watch call, your requests now stay in one Hermes chat: the
+  first one starts it, and later ones continue it, so Hermes remembers what
+  you asked before. Work you ask for in the background, quick requests and
+  requests for another profile still get their own chat.
+
+## 0.77.7 (2026-10-25)
+
+### Fixes
+- With Settings > Pulse > Model on "Same as the Pulse chat", Pulse's memory,
+  report lists and follow-up checks ran on Hermes's main model instead of the
+  Pulse chat's, so they failed whenever the main model was busy and reports
+  went out without their list. They now run on the Pulse chat's model,
+  unless Hermes's "Pulse memory" model is set to another.
+
+### New and improved
+- `hermes conduit-push pulse status` says which model Pulse runs on.
+
+## 0.77.6 (2026-10-25)
+
+### Fixes
+- A Bot Chat kept saying it was open in another Hermes window while the bot
+  answered a message from another bot, and Take over never cleared it.
+  Conduit now says the bot is busy and sends your message when it finishes.
+
+## 0.77.5 (2026-10-25)
+
+### Fixes
+- A group room could stop answering altogether once one of its threads
+  passed about 24 messages. Hermes could no longer plan the room's next
+  turn, so no member replied again, in that thread or any other, and nothing
+  said why. Rooms now keep answering however long their threads get.
+
+## 0.77.4 (2026-10-25)
+
+### Fixes
+- Turning "Self-improvement updates" off, or on, didn't reach chats that
+  were already open: they kept showing the updates the way they did when
+  they opened, until Hermes restarted. Each update now follows the setting
+  as it is when it's made.
+
+## 0.77.3 (2026-10-25)
+
+### Fixes
+- Notifications from a bot's chat said its profile, like "default", instead
+  of the bot's name. They now use the name the Bots list shows, and so does a
+  call from that bot.
+
+## 0.77.2 (2026-10-25)
+
+### Fixes
+- Preparing GPT-Live for the Watch failed every time with "No module named
+  '_cffi_backend'" on current Hermes, because the install borrowed packages
+  from Hermes instead of adding its own. Tap Prepare again after updating.
 
 ## 0.77.1 (2026-10-25)
 

@@ -109,7 +109,7 @@ The plugin tells a cron run by its task id (`cron:<job id>:…`) or its classic 
 
 Beside notifications, the plugin keeps a Live Activity up to date while a turn you sent from Conduit runs (see [Lock Screen progress](#lock-screen-progress-plugin-032)).
 
-Each notification is titled with the session's title when it has one (for example a Telegram topic name), so you can tell which chat it came from: a reply shows the session title, and the others prefix it (`Approval needed · Infra`). A Conduit Bot Chat, whose title is always `Bot Chat`, is titled with its bot's profile name instead, so you can tell which bot replied. Untitled sessions keep the generic copy. With previews off the title is not shown; `redact on` or end-to-end encryption keeps it from reaching the relay.
+Each notification is titled with the session's title when it has one (for example a Telegram topic name), so you can tell which chat it came from: a reply shows the session title, and the others prefix it (`Approval needed · Infra`). A Conduit Bot Chat, whose title is always `Bot Chat`, is titled with its bot's name instead, as Conduit's Bots list shows it (its Bot Mode title, else its display name, else its profile name), so you can tell which bot replied. Every push also carries that name, so a call from the bot names it too. Untitled sessions keep the generic copy. With previews off the title is not shown; `redact on` or end-to-end encryption keeps it from reaching the relay.
 
 The iOS app controls which categories are enabled, whether notification previews are shown, whether completion sounds play, and whether approval and input-needed notifications play a sound (on by default).
 
@@ -124,7 +124,7 @@ The iOS app controls which categories are enabled, whether notification previews
 - The health, location, maps, calendar, phone, contacts, calls, display and inbox (`conduit_inbox`) tools refuse delegated subagents, including one whose session id a compaction replaced (`compression.in_place: false`): the plugin asks Hermes' delegation flag (Hermes 0.22+) and follows the compaction links in Hermes' session store back to the subagent it was (plugin 0.51.6+).
 - Event titles and bodies are length-limited before delivery.
 - Lock Screen previews are disabled by default in Hermes Conduit.
-- **End-to-end encryption** (plugin 0.5+, relay 0.5+, a Conduit build with encrypted notifications): Conduit creates a secret for each pairing on the phone and hands it to this profile over your Hermes dashboard connection, so it never passes through the relay. From then on every notification's title, body, profile, session and decision card is sealed with it (ChaCha20-Poly1305, keys derived with HKDF-SHA256), the phone decrypts it in a Notification Service Extension, and clarify answers come back sealed for this profile. The relay and APNs see only routing data: the event type, opaque ids, a keyed thread token and timing. A pairing that has a key never sends plaintext content again, and only accepts clarify answers sealed by the phone. `hermes conduit-push status` shows whether it's on; Conduit turns it on by itself when it connects to this host. Run `hermes conduit-push test --corrupt` to check that the phone shows only generic text for a push it can't verify. The secret is only as private in transit as your dashboard connection (HTTPS or a private tunnel is recommended). Keys rotate (plugin 0.71+ and a Conduit build that rotates): Conduit hands over a new secret when the key is 30 days old (7 days with plugin 0.72+), when you tap Rotate in Conduit's Settings > Notifications, or after `hermes conduit-push e2e rotate` on this host, the next time it connects to the dashboard. Pushes are sealed with the new key at once; the old one still opens clarify answers for 7 days, so nothing in flight is lost. For a key that may have leaked, `hermes conduit-push e2e rotate --now` skips that overlap; the current key still seals notifications until Conduit next connects, so `hermes conduit-push unpair` is the way to cut it off at once. A key copied from a backup then stops opening new notifications, though it can still open ones captured while it was in use. From plugin 0.72 Conduit rotates inline instead, every 7 days (`POST /e2e/rotate`): its request, sealed with the current key, carries a fresh X25519 share and, on iOS 26 and later, an ML-KEM-768 encapsulation key; this profile answers with its share and the ML-KEM ciphertext, and both derive the new secret from the exchange mixed with the old secret (HKDF-SHA256). The new secret never crosses the dashboard connection, so only a pairing's first key depends on it, and with ML-KEM even a recording of that first handover can't open notifications after the first rotation. `hermes conduit-push status` says which kind of key is in use. ML-KEM needs `cryptography` with ML-KEM support (version 47 or later, built against OpenSSL 3.5); without it the profile offers X25519 only. To make the first handover quantum-safe too, let your HTTPS front end offer the hybrid TLS group X25519MLKEM768 (nginx 1.25+ with OpenSSL 3.5+: `ssl_ecdh_curve X25519MLKEM768:X25519:secp256r1:secp384r1;`); iOS 26 uses it automatically.
+- **End-to-end encryption** (plugin 0.5+, relay 0.5+, a Conduit build with encrypted notifications): Conduit creates a secret for each pairing on the phone and hands it to this profile over your Hermes dashboard connection, so it never passes through the relay. From then on every notification's title, body, profile (and the bot's name), session and decision card is sealed with it (ChaCha20-Poly1305, keys derived with HKDF-SHA256), the phone decrypts it in a Notification Service Extension, and clarify answers come back sealed for this profile. The relay and APNs see only routing data: the event type, opaque ids, a keyed thread token and timing. A pairing that has a key never sends plaintext content again, and only accepts clarify answers sealed by the phone. `hermes conduit-push status` shows whether it's on; Conduit turns it on by itself when it connects to this host. Run `hermes conduit-push test --corrupt` to check that the phone shows only generic text for a push it can't verify. The secret is only as private in transit as your dashboard connection (HTTPS or a private tunnel is recommended). Keys rotate (plugin 0.71+ and a Conduit build that rotates): Conduit hands over a new secret when the key is 30 days old (7 days with plugin 0.72+), when you tap Rotate in Conduit's Settings > Notifications, or after `hermes conduit-push e2e rotate` on this host, the next time it connects to the dashboard. Pushes are sealed with the new key at once; the old one still opens clarify answers for 7 days, so nothing in flight is lost. For a key that may have leaked, `hermes conduit-push e2e rotate --now` skips that overlap; the current key still seals notifications until Conduit next connects, so `hermes conduit-push unpair` is the way to cut it off at once. A key copied from a backup then stops opening new notifications, though it can still open ones captured while it was in use. From plugin 0.72 Conduit rotates inline instead, every 7 days (`POST /e2e/rotate`): its request, sealed with the current key, carries a fresh X25519 share and, on iOS 26 and later, an ML-KEM-768 encapsulation key; this profile answers with its share and the ML-KEM ciphertext, and both derive the new secret from the exchange mixed with the old secret (HKDF-SHA256). The new secret never crosses the dashboard connection, so only a pairing's first key depends on it, and with ML-KEM even a recording of that first handover can't open notifications after the first rotation. `hermes conduit-push status` says which kind of key is in use. ML-KEM needs `cryptography` with ML-KEM support (version 47 or later, built against OpenSSL 3.5); without it the profile offers X25519 only. To make the first handover quantum-safe too, let your HTTPS front end offer the hybrid TLS group X25519MLKEM768 (nginx 1.25+ with OpenSSL 3.5+: `ssl_ecdh_curve X25519MLKEM768:X25519:secp256r1:secp384r1;`); iOS 26 uses it automatically.
 - `hermes conduit-push redact on` keeps chat content from leaving the gateway: events carry no title or body text, approval cards say "Hermes needs your approval. Open Conduit for details.", and clarify cards replace question text with generic copy. The fields needed to answer stay (session key or request id, question ids, choice labels), so cards raised while the app is backgrounded remain recoverable and answerable. Clarify choice labels still transit the relay because the answer is one of them. `status` shows the current setting; `redact off` restores full content, including for events still waiting in the local delivery queue.
 
 - Besides notifications, the relay carries call pushes (sealed like notifications, except the "stopped ringing" notice), Lock Screen progress (phase, a tool category from a fixed list, tool count and context percentage, never chat text; `redact on` drops the category), Apple Watch grants and audio (sealed per call), the one-time codes that prove a phone holds its APNs token, and short-lived Apple Maps tokens for the host maps engine (the relay never sees the lookups). Health, location, calendar, phone and contacts data never pass through it.
@@ -1254,11 +1254,21 @@ lock, and Conduit's next send claims the chat.
 | POST | `/api/plugins/conduit_push/sessions/takeover` with `{session_ids: [..]}` | `{ok, status, surface?}` |
 
 - `status` is `taken_over` (send again), `free` (nobody else holds it),
-  `busy` (the other app is running a turn on it, or it's a live worker or
-  gateway whose turns can't be seen; ask again shortly, nothing
+  `busy` (the other app is running a turn on it, it's a live worker or
+  gateway whose turns can't be seen, or the gateway's ledger holds work on
+  it; ask again shortly, nothing
   is interrupted; a marker that can't be read counts as running, and only a marker whose writer is provably dead, or a gone owner's marker that names no writer, is ignored) or
   `same_host` (this dashboard process still holds it, for example Conduit on
   another device; that claim is left alone).
+- Hermes' gateway can also hold a chat with no claim at all: work it queued
+  in its durable ledger (`session_admissions` and `worker_executions` in the
+  profile's state.db), such as another bot's message (message_agent) running
+  in a bot's Bot Chat. Hermes refuses every other send to that chat until the
+  work ends, so the route answers `busy` without dropping anything, with
+  `surface` `bot` for another bot's message and `gateway` for other work.
+  Conduit says the bot is answering another bot and sends once it's done
+  (plugin 0.77.6+). A ledger that can't be read is skipped (logged as a
+  warning) and the claim rules apply.
 - The other app writes its turn marker without the registry lock, so a turn
   it starts in the instant between the check and the takeover still loses
   its claim. That turn keeps running there; nothing is interrupted.
@@ -1435,7 +1445,7 @@ message's turn gets one line of context, for example
   that Desktop and Conduit both have open isn't placed as Conduit's
   (reply_sources), so neither gets a line, as before.
 
-## Predictions for Conduit (plugin 0.78+)
+## Predictions for Conduit (plugin 0.79+)
 
 Conduit's Predictive settings (all off until you turn them on) suggest your
 next message after a reply, offer words for a draft when you pause typing,
@@ -1513,6 +1523,25 @@ methods the plugin guards, the plugin guards the rest and logs a warning
 naming what's missing. If Hermes' session store (`state.db`) can't be read
 when the plugin needs it to tell whether a session is a room, the plugin logs
 a warning and treats that session as an ordinary chat.
+
+## Long group room threads (plugin 0.77.6+)
+
+Hermes plans a gateway-hosted room's next turn from the last 24 messages of
+each thread. Before planning, it matches each member reply among them to the
+user message the reply answered. Once the oldest of those messages is a reply
+whose user message was left out, the match fails on every attempt, so the room
+gets no more turns, in that thread or any other, and Hermes logs nothing. The
+plugin fills in each left-out user message for that match: its place in the
+room log is the seq the reply's turn id starts with (Hermes builds turn ids
+from it), so the planner plans the same turns it would with the whole thread.
+The plugin's gateway load guards the planner there, and its dashboard routes
+guard it in a dashboard that runs as its own process and hosts rooms itself
+(with `plugins.isolation: host` the routes load in a plugin host process
+instead, so they don't guard that dashboard's rooms). Anything else wrong with
+a thread still fails the way Hermes fails it. The plugin logs once, at info
+level, the first time it fills a message in, and leaves the planner alone,
+saying so at info level, when Hermes' planner has no
+`_derive_member_watermarks`.
 
 ## Artifacts (plugin 0.40+)
 
@@ -2349,6 +2378,17 @@ seals the answers back. This host opens no inbound route of its own.
   about, listing and cancelling them past a renewal, and the job limit
   counts per call. A renewal that leaves out `max_jobs`, `job_options` or
   `job_profiles` keeps the call's.
+- **The call's chat** (plugin 0.78): a `start_job` with `joins_call: true`
+  is ordinary work, not asked for in the background, in a separate chat or
+  quickly, and not for another profile (the Watch decides, as the phone's
+  calls do). The call's first such job that starts makes its chat. Each later
+  one is still a job of its own, with its own id and news, but runs as that
+  chat's next turn, once nothing else runs there, so Hermes keeps the
+  earlier requests. A request waiting its turn is answered `accepted` after
+  18 s, can be cancelled without touching the running one, and is answered
+  `not_started` if the call ends first. The chat closes after its last
+  request settles once the call has ended. Without `joins_call`, or from an
+  older Watch app, each job gets a chat of its own, as before.
 - **Jobs on another profile** (plugin 0.11): `job_profiles` lists the user's
   other profiles (at most 32 names) a call's jobs may run on, as the phone's
   "for Fam, …" jobs do. A `start_job` with `profile` naming one of them runs
@@ -2448,7 +2488,9 @@ relay key. The host still opens no inbound route.
   sign-in never enters the helper. On any Hermes install, `prepare` makes the
   plugin's own environment for it: `python -m venv` from the Python Hermes
   runs, or `uv` where that Python has no venv or pip, then
-  `pip install aiortc==1.15.0` (about 150 MB). It goes in
+  `pip install aiortc==1.15.0` (about 150 MB), run isolated and without
+  Hermes' `PYTHONPATH` so it installs everything aiortc needs rather than
+  counting on packages Hermes already has. It goes in
   `~/.hermes/conduit_push/watch-audio-env` (under `HERMES_HOME` when that's
   set, or `CONDUIT_WATCH_AUDIO_ENV`). Nothing is installed into Hermes' own
   Python; if that Python already has `aiortc`, it's used as it is.
