@@ -19,7 +19,7 @@
   <main class="document">
     <div class="eyebrow">Hermes Conduit</div>
     <h1>Privacy Policy</h1>
-    <p class="meta">Effective October 19, 2026</p>
+    <p class="meta">Effective October 25, 2026</p>
     <p>This policy explains how Hermes Conduit handles information in the iPhone, iPad and Apple Watch apps (including CarPlay, widgets, Live Activities, Shortcuts and the share extension), the optional Hermes Conduit Notifier plugin that runs on your Hermes host, and the optional Conduit push relay used to deliver Apple Push Notification service (APNs) notifications, calls and Apple Watch traffic.</p>
 
     <h2>Summary</h2>
@@ -58,7 +58,7 @@
       <li>A gateway display name, plugin version and randomly generated, revocable pairing credentials.</li>
       <li>For notification delivery: event type, event identifier, session identifier, profile name, gateway identifier, and limited notification title and body text supplied by your gateway. This text can reach the relay even when notification previews are disabled, unless end-to-end encryption is on for that pairing (see below).</li>
       <li>For approval and clarify cards: the routing identifier (the session identifier used as an approval session key, or a clarify request ID), approval description or clarify questions, available choice labels, and, for clarify responses, the answers you submit.</li>
-      <li>For calls from Hermes: a call identifier, the kind of call and the related session identifiers, and, with previews on, the call's title and reason; and when a call stops ringing, how it ended. Your device shows the caller name from your profile.</li>
+      <li>For calls from Hermes: a call identifier, the kind of call and the related session identifiers, and, with previews on, the call's title and reason; and when a call stops ringing, how it ended. For a call answered on your Apple Watch that stays on your iPhone's headset, whether it is muted or ended, and which device said so. Your device shows the caller name from your profile.</li>
       <li>For Lock Screen and Dynamic Island progress while a turn runs: the turn's phase (such as thinking or running a tool), a general tool category from a fixed list, the number of tools used and how full the context is. The chat's title stays on your device.</li>
       <li>Basic request metadata used for security, rate limiting, diagnostics, and abuse prevention, such as request path, response status and time. The relay uses your IP address to apply rate limits and does not write it to its logs or saved state.</li>
     </ul>
@@ -103,6 +103,18 @@
       <li>You can turn sharing off at any time and delete the copy on your gateway from Conduit's Calendar &amp; phone settings.</li>
     </ul>
 
+    <h2>Optional events from Shortcuts automations</h2>
+    <p>Conduit's Log to Hermes action lets a Shortcuts automation you set up send an event to your Hermes gateway, so your agent can look it up later: for example a notification from an app you pick, a message, an email, a Wallet payment, an NFC tag or a sound the phone hears. Nothing is sent until you add the action to an automation, and an event carries only what that automation passes to it (who it's from, a title, details, an amount and what triggered it). Because these can be other people's notifications, messages and emails, they may contain other people's words.</p>
+    <ul>
+      <li>Events go from your device directly to the Hermes gateway you configured, over your dashboard connection, encrypted end to end with a key your device and your gateway agree on. They never pass through the Conduit notification relay or any server operated by Conduit, and Conduit's developer never receives them.</li>
+      <li>Anything that looks like a sign-in code or sign-in link is dropped, on your device and again on your gateway.</li>
+      <li>When your gateway can't be reached, events wait on your device for the next run or until Conduit connects, in a file excluded from backups.</li>
+      <li>Your gateway keeps each event for 30 days and at most 5,000 per device, oldest out first.</li>
+      <li>Your agent and, if you use it, Pulse can read these events when they answer you or check on something you asked to be told about, which means they are sent to the AI model provider your Hermes agent uses (and, for a hosted agent, to its host). Their privacy terms apply to what they receive.</li>
+      <li>Events are not used for advertising, marketing or data mining and are not sold.</li>
+      <li>You can see and delete what your device logged, one event or everything, from Conduit's Settings &gt; Shortcuts inbox, and stop logging by removing the action from your automations.</li>
+    </ul>
+
     <h2>Other connections</h2>
     <ul>
       <li>To tell you when a Conduit plugin update is available, Conduit reads the plugin's public version file from GitHub (<code>raw.githubusercontent.com</code>) at most once an hour.</li>
@@ -112,7 +124,7 @@
     </ul>
 
     <h2>Retention and deletion</h2>
-    <p>On-device information remains until you remove it, sign out, disable the related feature, or uninstall the app. Notification registrations remain active until notifications are disabled, the registration is invalidated, or deletion is requested; when the relay is full, it removes the longest-inactive registrations first. Disabling notifications prevents further delivery and revokes the app's local notification credential. Short-lived pairing codes and device token checks expire after ten minutes, and event identifiers used to prevent duplicate delivery expire after approximately 24 hours. Clarify decision records, including questions, choices, and submitted answers, expire after approximately two hours. Call rings and Lock Screen progress are kept only in the relay's memory, and Apple Watch grants end with the call, after at most 30 minutes. When the relay processes state, it removes expired records from its in-memory state; an expired record may remain in the saved file until a later state update rewrites that file.</p>
+    <p>On-device information remains until you remove it, sign out, disable the related feature, or uninstall the app. Notification registrations remain active until notifications are disabled, the registration is invalidated, or deletion is requested; when the relay is full, it removes the longest-inactive registrations first. Disabling notifications prevents further delivery and revokes the app's local notification credential. Short-lived pairing codes and device token checks expire after ten minutes, and event identifiers used to prevent duplicate delivery expire after approximately 24 hours. Clarify decision records, including questions, choices, and submitted answers, expire after approximately two hours. Call rings and Lock Screen progress are kept only in the relay's memory (a ring's mute and end for as long as the call lasts, at most four hours), and Apple Watch grants end with the call, after at most 30 minutes. When the relay processes state, it removes expired records from its in-memory state; an expired record may remain in the saved file until a later state update rewrites that file.</p>
     <p>To request deletion of notification relay information, contact <a href="mailto:support@milim.dev?subject=Hermes%20Conduit%20deletion%20request">support@milim.dev</a>. We may ask for limited installation information to locate the registration. Information stored by your Hermes gateway must be deleted through that gateway's operator, and information sent to a voice or AI model provider through that provider.</p>
 
     <h2>Sharing</h2>

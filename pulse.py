@@ -165,6 +165,11 @@ def stop(timeout: float = 1.0) -> None:
         thread.join(timeout)
 
 
+def wake() -> None:
+    """Runs the next tick now instead of after TICK_S (new inbox events)."""
+    _wake.set()
+
+
 def open_store(home: Optional[Path] = None) -> store.PulseStore:
     return store.open_store(home or get_hermes_home())
 
@@ -723,7 +728,11 @@ def _memory_run(home: Path, home_chat_id: str, now: float, stopped: threading.Ev
         # Do it is the user's own ask: its chat is read whatever follow-ups'
         # switch or budget (at most a few reads per tap, MAX_CHECKS a run).
         acts = bool(pulse_store.due_acts(now))
-        if used >= cap and not follows and not acts:
+        # Cards held for the morning brief are read again before it, on the
+        # follow-up budget, whatever follow-ups' switch: they hold report
+        # cards too, and a stale card shouldn't reach the brief either way.
+        holds = follow_used < follow_cap and bool(pulse_store.held_cards(1))
+        if used >= cap and not follows and not acts and not holds:
             return  # `pulse status` says so
         profiles = pulse_store.get("report_profiles")
         sources = memory_sources(pulse_store, home, home_chat_id, profiles)
@@ -748,6 +757,18 @@ def _memory_run(home: Path, home_chat_id: str, now: float, stopped: threading.Ev
                                         budget=float("inf"), done=acted)
                 finally:
                     _count_checks(pulse_store, acted)  # in the totals, not the follow-up day's budget
+            if holds:
+                try:
+                    followup.check_held(pulse_store, home, lambda instructions, text: _memory_llm(
+                                            instructions, text, purpose="pulse follow-up"), zone=zone,
+                                        now=max(now, time.time()),
+                                        still_leader=lambda: not stopped.is_set() and _leads(pulse_store),
+                                        budget=follow_cap - follow_used, done=checked)
+                except Exception:  # noqa: BLE001 — the brief tells them as they were
+                    logger.warning("conduit_push: Pulse held card checks failed", exc_info=True)
+                finally:
+                    if not follows:
+                        _count_checks(pulse_store, checked)  # else the follow-up run counts them with its own
             if follows:
                 # After memory, so a promise it just read is scheduled now.
                 now = max(now, time.time())
@@ -756,6 +777,7 @@ def _memory_run(home: Path, home_chat_id: str, now: float, stopped: threading.Ev
                 pulse_store.expire_items(due_before=now - memory.EXPIRE_S, now=now)
                 followup.schedule(pulse_store, now)
                 followup.check_all_now(pulse_store, now)
+                followup.check_watches_now(pulse_store, now)
                 try:
                     followup.run(pulse_store, home, lambda instructions, text: _memory_llm(
                                      instructions, text, purpose="pulse follow-up"), zone=zone, now=now,

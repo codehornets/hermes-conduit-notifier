@@ -171,17 +171,33 @@ def _keep_provisioned_key(value: dict[str, Any], path: Path) -> None:
         or current.get("gateway_id") != value.get("gateway_id")
     ):
         return
-    if "e2e" not in value or _key_created_at(current["e2e"]) > _key_created_at(value["e2e"]):
+    # A tie (two keys stored in the same second) goes to the file: only the
+    # dashboard stores keys, so the file's is the newer one.
+    if "e2e" not in value or (
+        current["e2e"] != value["e2e"] and _key_created_at(current["e2e"]) >= _key_created_at(value["e2e"])
+    ):
         value["e2e"] = current["e2e"]
+        # The rotation that stored it came with these: the key it replaced
+        # and the cleared request.
+        for field in ("e2e_previous", "rotate_requested_at", "rotate_without_overlap"):
+            if field in current:
+                value[field] = current[field]
+            else:
+                value.pop(field, None)
 
 
 def _key_created_at(record: Any) -> str:
     return str(record.get("created_at") or "") if isinstance(record, dict) else ""
 
 
-def remove_state() -> None:
+def remove_state(credential: str | None = None, *, unpaired: bool = False) -> None:
+    """Remove the saved pairing; with ``credential``, only while the saved
+    pairing still carries it, and with ``unpaired`` only while none is saved
+    (a leftover file), so a pairing claimed meanwhile stays."""
     path = state_path()
     with state_file_lock(path):
+        if (credential is not None or unpaired) and (load_state() or {}).get("credential") not in (None, credential):
+            return
         try:
             path.unlink()
         except FileNotFoundError:
@@ -251,18 +267,19 @@ class UnpairedLocally(RuntimeError):
 def unpair() -> bool:
     state = load_state()
     if not state:
-        remove_state()
+        remove_state(unpaired=True)
         return False
     try:
         url = check_request_url(f"{str(state.get('relay_url') or '').rstrip('/')}/v1/gateways/current")
     except ValueError:
-        remove_state()
+        remove_state(state["credential"])
         raise UnpairedLocally(
             "Removed this profile's pairing, but its saved relay URL is not https://, so the relay was not told. "
             "Remove this gateway in Conduit to revoke it there."
         ) from None
     request_json(url, method="DELETE", credential=state["credential"])
-    remove_state()
+    # A pairing claimed while the relay revoked this one is not the one revoked.
+    remove_state(state["credential"])
     return True
 
 
@@ -466,13 +483,15 @@ def opened_answers(status: dict[str, Any], state: dict[str, Any], request_id: st
         "request_id": request_id,
     }
     try:
-        keys = e2e.keys_from_state(state)
+        # The key a rotation just replaced still opens answers the phone
+        # sealed before it learned of the new one.
+        keys = e2e.answer_keys(state)
         opened = dict(status)
         if has_answer:
-            opened["answer"] = e2e.open_answer(status.get("answer"), keys, question_id="", **context)
+            opened["answer"] = e2e.open_answer_any(status.get("answer"), keys, question_id="", **context)
         if has_answers:
             opened["answers"] = {
-                str(qid): e2e.open_answer(value, keys, question_id=str(qid), **context)
+                str(qid): e2e.open_answer_any(value, keys, question_id=str(qid), **context)
                 for qid, value in status["answers"].items()
             }
         return opened
@@ -489,13 +508,40 @@ def e2e_status(state: dict[str, Any] | None = None) -> dict[str, Any]:
         usable = e2e.keys_from_state(state or {}) is not None
     except Exception:
         usable = False
+    previous = e2e.previous_key_record(state or {})
     return {
         # On only with a key that can actually seal; a broken one sends
         # content-free events and reads as off here.
         "enabled": usable,
         "kid": record.get("kid") if isinstance(record, dict) else None,
+        "created_at": record.get("created_at") if isinstance(record, dict) else None,
+        "suite": (record.get("suite") or "handover") if isinstance(record, dict) else None,
+        "previous_kid": previous.get("kid") if previous else None,
+        "rotate_requested": bool((state or {}).get("rotate_requested_at")),
+        "rotate_without_overlap": bool((state or {}).get("rotate_without_overlap")),
+        "rotation_due": usable and e2e.rotation_due(state or {}),
         "crypto": e2e.available(),
     }
+
+
+def request_key_rotation(*, without_overlap: bool = False) -> bool:
+    """Asks the paired phone for a new encryption key on its next dashboard
+    connect. ``without_overlap`` (a key that may have leaked) also drops the
+    previous key now, and the current one as soon as the new one arrives;
+    until then the current key still seals pushes (unpair cuts it off now).
+    False when the profile isn't paired or has no key."""
+    def change(state: dict[str, Any]) -> bool:
+        if state.get("e2e") is None:
+            return False
+        state["rotate_requested_at"] = time.strftime(e2e.KEY_TIME_FORMAT, time.gmtime())
+        if without_overlap:
+            state["rotate_without_overlap"] = True
+            state.pop("e2e_previous", None)
+        else:
+            state.pop("rotate_without_overlap", None)
+        return True
+
+    return update_state(change)
 
 
 def post_event(payload: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
@@ -693,9 +739,12 @@ def stop(timeout: float = 1.0) -> None:
 # event_id per pairing and answers a repeat as a duplicate, and an event's id
 # stays the same from one send to the next (redaction and encryption re-key it
 # the same way every time). One thread delivers everything, so the retries of
-# one event stop after RETRY_BUDGET seconds instead of holding up the rest.
+# one event stop after RETRY_BUDGET seconds instead of holding up the rest:
+# the waits for an answer count, so a send is cut to what the budget has left.
 RETRY_DELAYS = (1.0, 2.0, 4.0)
 RETRY_BUDGET = 30.0
+SEND_TIMEOUT = 15.0
+MIN_SEND_TIMEOUT = 1.0
 
 # A 401 or 403 is the relay (or something in front of it) refusing this host,
 # and the next event would be refused the same way. Notifications are parked
@@ -786,7 +835,7 @@ def _deliver(event: dict[str, Any], *, sleep: Callable[[float], None] = _pause,
                         event.get("type", "event"), _pause_reason(state), paused_until - now)
             return False
         try:
-            _send(event, state)
+            _send(event, state, timeout=max(MIN_SEND_TIMEOUT, min(SEND_TIMEOUT, started + RETRY_BUDGET - now)))
         except Exception as error:
             if delay is not None and _worth_retrying(error) and clock() - started + delay <= RETRY_BUDGET:
                 logger.info("Conduit notification delivery for %s will be retried: %s", event.get("type", "event"), error)

@@ -6290,6 +6290,15 @@ E2E_WINDOW_S = 60.0
 E2E_MAX_BODY_BYTES = 4 * 1024
 _E2E_KID = re.compile(r"^[0-9a-f]{32}\Z")
 _E2E_B64URL = re.compile(r"^[A-Za-z0-9_-]{43}\Z")  # 32 bytes, unpadded
+# Same as e2e.KEY_MAX_AGE_S and e2e.PREVIOUS_KEY_GRACE_S (tests/test_e2e.py
+# checks): the phone rotates a key this old, and the key a rotation replaced
+# opens answers this long.
+E2E_KEY_MAX_AGE_S = 7 * 24 * 3600
+E2E_PREVIOUS_KEY_GRACE_S = 7 * 24 * 3600
+# Earlier rotation attempts sealed with a replaced key that are remembered
+# (as digests) and refused if they arrive again.
+E2E_ROTATE_RETRIES_KEPT = 16
+_E2E_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _e2e_limiter = _MintLimiter(E2E_LIMIT, E2E_WINDOW_S, message="Too many encryption key requests; try again shortly")
 _e2e_lock = threading.Lock()
 
@@ -6394,9 +6403,49 @@ def _e2e_crypto_available() -> bool:
     return True
 
 
+def _e2e_time(value: Any) -> Optional[float]:
+    try:
+        return datetime.strptime(str(value), _E2E_TIME_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _e2e_live_previous(state: Dict[str, Any], now: float) -> Optional[Dict[str, Any]]:
+    """The key the last rotation replaced, while it still opens answers."""
+    record = state.get("e2e_previous")
+    if not isinstance(record, dict) or not isinstance(record.get("kid"), str) or not _E2E_KID.match(record["kid"]):
+        return None
+    retired = _e2e_time(record.get("retired_at"))
+    if retired is None or now >= retired + E2E_PREVIOUS_KEY_GRACE_S:
+        return None
+    return record
+
+
+def _e2e_prune_previous(path: Any, now: float) -> None:
+    """Deletes a replaced key once its overlap is over, so its secret doesn't
+    sit on disk (and in backups) until the next rotation. Best effort: a
+    status read never fails on it, and an expired key opens nothing anyway."""
+    try:
+        with _e2e_lock, _pairing_state_lock(path):
+            state = _load_pairing_state(path)
+            if state and "e2e_previous" in state and _e2e_live_previous(state, now) is None:
+                state.pop("e2e_previous", None)
+                _save_pairing_state(path, state)
+    except OSError:
+        pass
+
+
 def e2e_status(path: Any = None) -> Dict[str, Any]:
-    """This profile's pairing and key state. Never includes the secret."""
-    state = _load_pairing_state(path if path is not None else _pairing_state_path())
+    """This profile's pairing and key state. Never includes the secret.
+
+    ``rotate`` asks the phone for a new key: requested from the host
+    (`hermes conduit-push e2e rotate`), or the key is past
+    E2E_KEY_MAX_AGE_S. A phone that sees the field knows this plugin keeps
+    the replaced key for answers, so rotating loses nothing, unless
+    ``rotate_without_overlap`` says the host asked to drop it (a key that may
+    have leaked)."""
+    path = path if path is not None else _pairing_state_path()
+    state = _load_pairing_state(path)
     crypto = _e2e_crypto_available()
     if not state:
         return {"paired": False, "crypto": crypto}
@@ -6406,11 +6455,24 @@ def e2e_status(path: Any = None) -> Dict[str, Any]:
     # A key whose secret is unusable reads as none, so the phone replaces it.
     if not isinstance(secret, str) or not _E2E_B64URL.match(secret):
         kid = None
+    usable = isinstance(kid, str) and bool(_E2E_KID.match(kid))
+    now = time.time()
+    created = _e2e_time(record.get("created_at")) if usable else None
+    previous = _e2e_live_previous(state, now) if usable else None
+    if state.get("e2e_previous") is not None and previous is None:
+        _e2e_prune_previous(path, now)
     return {
         "paired": True,
         "installation_id": state.get("installation_id"),
         "gateway_id": state.get("gateway_id"),
-        "e2e": {"kid": kid} if isinstance(kid, str) and _E2E_KID.match(kid) else None,
+        "e2e": {"kid": kid, "created_at": record.get("created_at"), "suite": record.get("suite") or "handover"} if usable else None,
+        # Inline rotation (POST /e2e/rotate) and its key exchanges, best
+        # first; the phone picks the best one it can run.
+        "rotate_suites": _e2e_rotate_suites() if usable else [],
+        "previous_kid": previous["kid"] if previous else None,
+        "rotate": usable and (bool(state.get("rotate_requested_at")) or created is None
+                              or now >= created + E2E_KEY_MAX_AGE_S),
+        "rotate_without_overlap": usable and bool(state.get("rotate_without_overlap")),
         "crypto": crypto,
         # The relay answered 401 to this pairing's last delivery (client.py):
         # it no longer knows this gateway, so the phone should pair again.
@@ -6426,7 +6488,17 @@ def provision_e2e(body: Any, path: Any = None) -> Dict[str, Any]:
 
     Only for the pairing the phone owns: the installation and gateway ids
     must match this profile's pairing, so a key for another phone (or an old
-    pairing) is refused. Replaces an earlier key for the same pairing.
+    pairing) is refused. A new key for the same pairing is a rotation: the
+    key it replaces still opens answers for E2E_PREVIOUS_KEY_GRACE_S (unless
+    the host asked to rotate without overlap), and pushes use the new one.
+    Only the last replaced key is kept: a second rotation inside the overlap
+    retires the one before it at once. Keys rotate days apart, and answers
+    are sealed seconds after the push they answer, so none is lost in
+    practice. While its overlap lasts, the replaced key can't come back: a
+    delayed retry of its handover must not roll the pairing back. After that
+    (or after a rotation without overlap, or a second one inside it) the host
+    no longer knows the key; the phone never sends a key it retired, and
+    every POST already needs the dashboard sign-in, so no tombstones are kept.
     """
     if not isinstance(body, dict):
         raise TokenError(400, "Expected a JSON object")
@@ -6451,13 +6523,190 @@ def provision_e2e(body: Any, path: Any = None) -> Dict[str, Any]:
             raise TokenError(409, "Pair this Hermes profile with Conduit again to turn on encryption")
         if state.get("installation_id") != installation_id or state.get("gateway_id") != gateway_id:
             raise TokenError(409, "This Hermes profile is paired with a different device")
+        now = datetime.now(timezone.utc)
+        current = state.get("e2e")
+        if isinstance(current, dict) and current.get("kid") == kid:
+            if isinstance(current.get("secret"), str) and hmac.compare_digest(current["secret"], secret):
+                return {"kid": kid}  # a retry of a key already stored
+            # Key ids are random per key: the same id with another secret
+            # would make answers ambiguous during the overlap.
+            raise TokenError(409, "This key id is already in use with a different secret")
+        previous_record = state.get("e2e_previous")
+        if isinstance(previous_record, dict) and previous_record.get("kid") == kid:
+            raise TokenError(409, "This key was replaced; send a new one")
+        rotated = isinstance(current, dict) and isinstance(current.get("kid"), str) and current["kid"] != kid \
+            and isinstance(current.get("secret"), str) and _E2E_B64URL.match(current["secret"])
+        if rotated and not state.get("rotate_without_overlap"):
+            state["e2e_previous"] = {
+                "kid": current["kid"],
+                "secret": current["secret"],
+                "retired_at": now.strftime(_E2E_TIME_FORMAT),
+            }
+        else:
+            state.pop("e2e_previous", None)
         state["e2e"] = {
             "kid": kid,
             "secret": secret,
-            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "created_at": now.strftime(_E2E_TIME_FORMAT),
         }
+        state.pop("rotate_requested_at", None)
+        state.pop("rotate_without_overlap", None)
         _save_pairing_state(path, state)
     return {"kid": kid}
+
+
+_e2e_module_lock = threading.Lock()
+_e2e_module_value: Any = None
+_e2e_suites_value: Optional[List[str]] = None
+
+
+def _e2e_module() -> Any:
+    """e2e.py beside this folder, loaded once: the rotation's key exchange."""
+    global _e2e_module_value
+    with _e2e_module_lock:
+        if _e2e_module_value is None:
+            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "e2e.py")
+            spec = importlib.util.spec_from_file_location("conduit_push_dashboard_e2e", path)
+            if spec is None or spec.loader is None:
+                raise TokenError(501, "This plugin install is missing e2e.py; update the plugin")
+            module = importlib.util.module_from_spec(spec)
+            # dataclasses look the module up while the class is built.
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            _e2e_module_value = module
+        return _e2e_module_value
+
+
+def _e2e_rotate_suites() -> List[str]:
+    """The suites this host can run. Only a successful probe is cached: a
+    transient failure (e2e.py unreadable mid-update) is tried again on the
+    next (rate-limited) request instead of turning inline rotation off until
+    a restart."""
+    global _e2e_suites_value
+    if _e2e_suites_value is None:
+        try:
+            _e2e_suites_value = list(_e2e_module().rotate_suites())
+        except Exception:
+            return []
+    return _e2e_suites_value
+
+
+def _e2e_rotate_request_digest(body: Dict[str, Any]) -> str:
+    """Fingerprint of one rotation request: its key ids, suite and sealed
+    content (which carries kid_new and the phone's fresh shares). A resend of
+    the same request matches; a new attempt sealed with the same key doesn't."""
+    material = json.dumps([body.get("kid"), body.get("suite"), body.get("sealed")],
+                          sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def rotate_e2e(body: Any, path: Any = None) -> Dict[str, Any]:
+    """Inline rotation: the phone's request, sealed with the current key,
+    carries its half of a key exchange (X25519, and ML-KEM-768 on iOS 26+);
+    the new secret mixes the exchange with the old secret, so it never
+    crosses the dashboard connection. The old key stays as e2e_previous for
+    E2E_PREVIOUS_KEY_GRACE_S.
+
+    A resend of the request that made the current key (same kid, suite and
+    sealed content) gets the same reply, so a lost reply loses nothing. A
+    different request sealed with that replaced key (a phone that lost its
+    pending exchange, e.g. after a restart, and starts over) is answered as a
+    fresh rotation from the replaced key: the key it never received is
+    dropped. During its overlap the replaced key can thus roll the pairing
+    forward, which adds nothing over dashboard access (POST /e2e can
+    replace the key too). An earlier attempt that was already answered (the last
+    E2E_ROTATE_RETRIES_KEPT), and any other request sealed with a replaced
+    key, is refused with 409.
+
+    A rotation without overlap (`rotate --now`) keeps nothing to resend: its
+    retry is refused with 409 and the phone hands over a new key."""
+    if not isinstance(body, dict):
+        raise TokenError(400, "Expected a JSON object")
+    installation_id, gateway_id = body.get("installation_id"), body.get("gateway_id")
+    if not isinstance(installation_id, str) or not installation_id or not isinstance(gateway_id, str) or not gateway_id:
+        raise TokenError(400, "installation_id and gateway_id are required")
+    if body.get("suite") not in _e2e_rotate_suites():
+        raise TokenError(400, "This host can't run that rotation suite")
+    module = _e2e_module()
+    path = path if path is not None else _pairing_state_path()
+    with _e2e_lock, _pairing_state_lock(path):
+        state = _load_pairing_state(path)
+        if not state:
+            raise TokenError(409, "This Hermes profile isn't paired with Conduit")
+        if state.get("installation_id") != installation_id or state.get("gateway_id") != gateway_id:
+            raise TokenError(409, "This Hermes profile is paired with a different device")
+        current, previous = state.get("e2e"), state.get("e2e_previous")
+        if not isinstance(current, dict):
+            raise TokenError(409, "This pairing has no key to rotate yet")
+        digest = _e2e_rotate_request_digest(body)
+        # The key being rotated: the current one, or (for a phone that never
+        # got the reply of the rotation that replaced it) the replaced one.
+        base = current
+        if isinstance(previous, dict) and isinstance(body.get("kid"), str) and previous.get("kid") == body["kid"]:
+            reply = previous.get("rotate_reply")
+            made_current = isinstance(reply, dict) and reply.get("kid_new") == current.get("kid")
+            # A digest of public request fields, not a secret: a plain
+            # compare also survives a hand-edited, non-ASCII state file.
+            if made_current and previous.get("rotate_request") == digest:
+                return {"rotation": reply}  # the phone missed our answer
+            if not made_current or _e2e_live_previous(state, time.time()) is None:
+                raise TokenError(409, "This key was replaced; send a new one")
+            answered = previous.get("rotate_requests_before")
+            if isinstance(answered, list) and digest in answered:
+                # An earlier attempt, delivered late or replayed: rotating
+                # again would drop the key the phone took since.
+                raise TokenError(409, "This rotation request was already answered")
+            # Same old key, another request: the phone started over without
+            # the key we answered with, so it never holds it.
+            base = previous
+        try:
+            keys = module.derive_keys(str(base.get("kid") or ""), module.unb64u(str(base.get("secret") or "")))
+            rotation = module.answer_rotation(body, keys, module.unb64u(str(base.get("secret") or "")),
+                                              installation_id=installation_id, gateway_id=gateway_id)
+        except module.E2EError as exc:
+            raise TokenError(409, f"The rotation request was refused: {exc}")
+        if rotation.kid_new in (current.get("kid"), previous.get("kid") if isinstance(previous, dict) else None):
+            # The new key id must name one secret only, while either key
+            # still opens answers.
+            raise TokenError(409, "This key id is already in use with a different secret")
+        now = datetime.now(timezone.utc).strftime(_E2E_TIME_FORMAT)
+        if state.get("rotate_without_overlap"):
+            state.pop("e2e_previous", None)
+        else:
+            # Starting over from the replaced key keeps its first retirement
+            # time, so retries never stretch its overlap.
+            retired_at = base.get("retired_at") if base is previous else now
+            record = {"kid": base["kid"], "secret": base["secret"], "retired_at": retired_at or now,
+                      "rotate_reply": rotation.reply, "rotate_request": digest}
+            if base is previous:
+                before = previous.get("rotate_requests_before")
+                before = [d for d in before if isinstance(d, str)] if isinstance(before, list) else []
+                if isinstance(previous.get("rotate_request"), str):
+                    before.append(previous["rotate_request"])
+                record["rotate_requests_before"] = before[-E2E_ROTATE_RETRIES_KEPT:]
+            state["e2e_previous"] = record
+        state["e2e"] = {"kid": rotation.kid_new, "secret": module.b64u(rotation.secret), "created_at": now,
+                        "suite": rotation.suite}
+        state.pop("rotate_requested_at", None)
+        state.pop("rotate_without_overlap", None)
+        _save_pairing_state(path, state)
+    return {"rotation": rotation.reply}
+
+
+@router.post("/e2e/rotate")
+async def post_e2e_rotate(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        await _scoped_acquire(_e2e_limiter, profile)
+        body = await _read_json_body(request, E2E_MAX_BODY_BYTES)
+        return {"ok": True, **(await _run_scoped(profile, lambda: rotate_e2e(body)))}
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected("rotation", exc, feature="Encrypted notifications")
 
 
 @router.get("/e2e")
@@ -6708,6 +6957,9 @@ def pair_profile(body: Any, profile: Optional[str] = None, path: Any = None,
         if previous.get("e2e") is not None and previous.get("installation_id") == state["installation_id"] \
                 and previous.get("gateway_id") == state["gateway_id"]:
             state["e2e"] = previous["e2e"]
+            for field in ("e2e_previous", "rotate_requested_at", "rotate_without_overlap"):
+                if field in previous:
+                    state[field] = previous[field]
         _save_pairing_state(path, state)
     old_credential, old_relay = previous.get("credential"), previous.get("relay_url")
     if isinstance(old_credential, str) and old_credential and old_credential != state["credential"] \
@@ -6942,7 +7194,7 @@ async def put_chat_on_screen(request: Request, response: Response, profile: Opti
 CALLS_LIMIT = 30
 CALLS_WINDOW_S = 60.0
 CALLS_MAX_BODY_BYTES = 4096
-_CALL_WATCH_ID = re.compile(r"^[0-9a-f]{24}$")
+_CALL_WATCH_ID = re.compile(r"^[0-9a-f]{24}\Z")
 _calls_limiter = _MintLimiter(CALLS_LIMIT, CALLS_WINDOW_S, message="Too many call requests; try again shortly")
 _calls_store_module: Any = None
 _calls_store_lock = threading.Lock()
@@ -7061,6 +7313,106 @@ def record_call_outcome(body: Any) -> Dict[str, Any]:
         raise TokenError(400, str(exc))
 
 
+def call_waiting(session_id: Any) -> Dict[str, Any]:
+    """What Hermes waits on in a chat a call is about (a question batch's
+    choices, an approval's command and description), for a call answered
+    with no chat open: the Apple Watch's. Kept only while alert calls are
+    on (calls_store.note_waiting); ``waiting`` is null otherwise."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise TokenError(400, "Name the chat's session_id")
+    return {"waiting": _calls_store().CallStore(_calls_home()).waiting_for(session_id)}
+
+
+def answer_call_waiting(body: Any) -> Dict[str, Any]:
+    """The user's spoken answer, on a call from Hermes, to what Hermes waits
+    on in its chat: a question's ``answer`` (a choice's number or label, "the
+    recommended one", or their own words) for ``question`` (its number in the
+    batch), or an approval's ``choice`` (once or deny, with ``reason``). The
+    agent's process passes it to Hermes within seconds. An approval's answer
+    waits to hear that it did: "answered" only once Hermes took it."""
+    if not isinstance(body, dict):
+        raise TokenError(400, "Expected a JSON object")
+    store = _calls_store().CallStore(_calls_home())
+    return _approval_delivered(store, _answer_waiting(store, body))
+
+
+def _answer_waiting(store: Any, body: Any) -> Dict[str, Any]:
+    if not isinstance(body, dict):
+        raise TokenError(400, "Expected a JSON object")
+    try:
+        return store.answer_waiting(
+            body.get("session_id"), answer=body.get("answer"), choice=body.get("choice"),
+            question=body.get("question"), reason=body.get("reason"))
+    except ValueError as exc:
+        raise TokenError(400, str(exc))
+
+
+# How a call's approval answer fared, for the call to say (calls_store
+# DELIVERY_STATES). Read by the model, so not localized.
+_APPROVAL_NOT_DELIVERED = {
+    "missed": ("too_late", "It didn't go through: Hermes wasn't waiting on that approval any more (it was "
+                              "answered in Conduit, or timed out), so nothing was {done}. The user can check the chat "
+                              "in Conduit."),
+    "withdrawn": ("failed", "It didn't go through: Hermes didn't pick the answer up in time, so nothing was {done}. "
+                            "The user can answer it in Conduit."),
+    "claimed": ("unconfirmed", "Hermes hasn't confirmed the answer yet, so it may not have gone through. The user can "
+                          "check the chat in Conduit."),
+}
+
+
+# Watch calls waiting at once to hear how their approval answer fared: each
+# holds a worker (the Watch tools' pool, or its Local Live call's own) for up
+# to calls_store.APPROVAL_DELIVERY_WAIT_S. One user's Watch answers one at a
+# time; the bound only keeps a burst from taking the pool. The HTTP route
+# waits on the event loop instead (_approval_delivered_async).
+_APPROVAL_DELIVERY_WAITS = threading.BoundedSemaphore(2)
+
+
+def _approval_delivered(store: Any, result: Dict[str, Any]) -> Dict[str, Any]:
+    """``answer_waiting``'s result, with an approval's answer as it fared:
+    the call says it went only when Hermes took it."""
+    answer_id = result.pop("answer_id", None)
+    if answer_id is None or result.get("status") != "answered":
+        return result
+    # A moment for a slot first: a fresh answer is taken back only past that.
+    if _APPROVAL_DELIVERY_WAITS.acquire(timeout=1.0):
+        try:
+            fared = store.approval_delivery(answer_id)
+        finally:
+            _APPROVAL_DELIVERY_WAITS.release()
+    else:
+        # Too many waiting already: no wait, so an answer nothing took yet
+        # is taken back and the user answers in Conduit.
+        fared = store.approval_delivery(answer_id, wait_s=0)
+    return _approval_outcome(result, fared)
+
+
+async def _approval_delivered_async(store: Any, result: Dict[str, Any]) -> Dict[str, Any]:
+    """_approval_delivered for a route: it waits on the event loop, holding
+    no worker meanwhile."""
+    answer_id = result.pop("answer_id", None)
+    if answer_id is None or result.get("status") != "answered":
+        return result
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _calls_store().APPROVAL_DELIVERY_WAIT_S
+    while True:
+        fared = await asyncio.to_thread(store.approval_fared, answer_id)
+        if fared is not None:
+            break
+        if loop.time() >= deadline:
+            fared = await asyncio.to_thread(store.approval_delivery, answer_id, wait_s=0)
+            break
+        await asyncio.sleep(0.2)
+    return _approval_outcome(result, fared)
+
+
+def _approval_outcome(result: Dict[str, Any], fared: str) -> Dict[str, Any]:
+    if fared == "resolved":
+        return result
+    status, message = _APPROVAL_NOT_DELIVERED.get(fared, _APPROVAL_NOT_DELIVERED["missed"])
+    return {"status": status, "message": message.format(done="approved" if result.get("choice") == "once" else "denied")}
+
+
 async def _calls_route(profile: Optional[str], response: Response, fn: Callable[[], Dict[str, Any]],
                        route: str) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
@@ -7108,6 +7460,31 @@ async def delete_call_watch(watch_id: str, response: Response, profile: Optional
 async def put_call_presence(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     body = await _read_json_body(request, CALLS_MAX_BODY_BYTES)
     return await _calls_route(profile, response, lambda: set_call_presence(body), "presence")
+
+
+@router.get("/calls/waiting")
+async def get_call_waiting(response: Response, session_id: Optional[str] = None,
+                           profile: Optional[str] = None) -> Dict[str, Any]:
+    return await _calls_route(profile, response, lambda: call_waiting(session_id), "waiting")
+
+
+@router.post("/calls/waiting/answer")
+async def post_call_waiting_answer(request: Request, response: Response,
+                                   profile: Optional[str] = None) -> Dict[str, Any]:
+    body = await _read_json_body(request, CALLS_MAX_BODY_BYTES)
+    stores: list = []
+
+    def answer() -> Dict[str, Any]:
+        stores.append(_calls_store().CallStore(_calls_home()))
+        return _answer_waiting(stores[0], body)
+
+    result = await _calls_route(profile, response, answer, "answer")
+    if "answer_id" not in result:
+        return result
+    try:
+        return {"ok": True, **(await _approval_delivered_async(stores[0], result))}
+    except Exception as exc:
+        raise _unexpected("answer", exc, feature="Calls")
 
 
 @router.post("/calls/outcomes")
@@ -8059,6 +8436,188 @@ async def post_location_ingest(request: Request, response: Response,
     return await _location_route(response, profile, lambda: _location_ingest(body), "upload")
 
 
+# --- Shortcuts inbox ---------------------------------------------------------
+#
+# The user's iPhone Shortcuts automations (a notification from an app they
+# pick, a message, an email, a Wallet payment, an NFC tag, a sound) end in
+# Conduit's Log to Hermes action, which posts each run here as a sealed event
+# (/inbox/ingest) after agreeing a key once (/inbox/key), straight over the
+# dashboard connection, never through the push relay. No chat turn and no
+# push: the conduit_inbox tool reads them (inbox_store.py,
+# conduit-inbox.sqlite3), and Pulse, when it's on, reads them in its report
+# and checks the user's watches when new ones arrive. Status reports counts
+# only. Conduit's Settings page reads a device's own events back sealed for
+# it (/inbox/list), deletes the ones the user picks (/inbox/delete), and
+# wipe deletes a device's or everything.
+
+INBOX_KEY_LIMIT = 10
+INBOX_KEY_WINDOW_S = 60.0
+INBOX_WIPE_LIMIT = 5
+INBOX_WIPE_WINDOW_S = 60.0
+# A burst of notifications can each run an automation.
+INBOX_INGEST_LIMIT = 120
+INBOX_INGEST_WINDOW_S = 60.0
+INBOX_MAX_KEY_BODY_BYTES = 4 * 1024
+# The largest batch the store keeps whole: inbox_store.MAX_EVENTS_PER_BATCH
+# events whose fields are at their MAX_*_CHARS (source 120, title 200, text
+# 4000, amount 40, trigger 40; Conduit cuts to these), at up to 4 UTF-8
+# bytes a character plus id and JSON, sealed and base64url. Kept in step
+# with inbox_store by tests/test_inbox.py. The store still cuts a longer
+# field rather than refuse it, but a batch of such fields from a client
+# that doesn't cut may be refused here (413) instead.
+INBOX_MAX_INGEST_BODY_BYTES = (50 * (4 * (120 + 200 + 4000 + 40 + 40) + 512)) * 4 // 3 + 4096
+# inbox_store.MAX_DELETE ids of MAX_EVENT_ID_CHARS, each quoted with a
+# comma, plus the device id, kid and JSON around them (the same test).
+INBOX_MAX_DELETE_BODY_BYTES = 100 * (80 + 3) + 1024
+
+_inbox_key_limiter = _MintLimiter(INBOX_KEY_LIMIT, INBOX_KEY_WINDOW_S,
+                                  message="Too many inbox key requests; try again shortly")
+_inbox_ingest_limiter = _MintLimiter(INBOX_INGEST_LIMIT, INBOX_INGEST_WINDOW_S,
+                                     message="Too many inbox events; try again shortly")
+_inbox_wipe_limiter = _MintLimiter(INBOX_WIPE_LIMIT, INBOX_WIPE_WINDOW_S,
+                                   message="Too many inbox delete requests; try again shortly")
+INBOX_LIST_LIMIT = 60
+INBOX_LIST_WINDOW_S = 60.0
+_inbox_list_limiter = _MintLimiter(INBOX_LIST_LIMIT, INBOX_LIST_WINDOW_S,
+                                   message="Too many inbox requests; try again shortly")
+INBOX_DELETE_LIMIT = 30
+INBOX_DELETE_WINDOW_S = 60.0
+_inbox_delete_limiter = _MintLimiter(INBOX_DELETE_LIMIT, INBOX_DELETE_WINDOW_S,
+                                     message="Too many inbox delete requests; try again shortly")
+_inbox_store_module: Any = None
+
+
+def _inbox_store() -> Any:
+    """inbox_store.py beside this folder, loaded once."""
+    global _inbox_store_module
+    if _inbox_store_module is None:
+        _inbox_store_module = _plugin_package_module("inbox_store")
+    return _inbox_store_module
+
+
+def _inbox_call(fn: Callable[[Any], Dict[str, Any]]) -> Dict[str, Any]:
+    module = _inbox_store()
+    try:
+        return fn(module.InboxStore(_calls_home()))
+    except module.InboxError as exc:
+        raise TokenError(exc.status, str(exc), exc.code)
+    except sqlite3.DatabaseError:
+        logger.warning("conduit_push: inbox store unreadable", exc_info=True)
+        raise TokenError(503, "The inbox on this host can't be read")
+
+
+async def _inbox_route(response: Response, profile: Optional[str], fn: Callable[[], Dict[str, Any]],
+                       name: str) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"ok": True, **(await _run_scoped(profile, fn))}
+    except TokenError as exc:
+        return _store_refusal(exc)
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+    except Exception as exc:
+        raise _unexpected(name, exc, feature="Shortcuts inbox")
+
+
+@router.get("/inbox/status")
+async def get_inbox_status(response: Response, profile: Optional[str] = None,
+                           device_id: Optional[str] = None) -> Dict[str, Any]:
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: {
+        **store.status(device_id), "crypto": _inbox_store().crypto_available()}), "status")
+
+
+@router.post("/inbox/key")
+async def post_inbox_key(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_key_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.register_key(body)), "key")
+
+
+@router.post("/inbox/ingest")
+async def post_inbox_ingest(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_ingest_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_INGEST_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_ingest(body), "upload")
+
+
+def _inbox_ingest(body: Any) -> Dict[str, Any]:
+    result = _inbox_call(lambda store: store.ingest(body))
+    if result.get("stored"):
+        _inbox_tell_pulse()
+    return result
+
+
+def _inbox_tell_pulse() -> None:
+    """New events in: Pulse checks the user's open watches against them
+    (pulse_followup.inbox_arrived). Only where Pulse runs, on this home;
+    the events are stored whatever happens here."""
+    try:
+        pulse_store = _plugin_package_module("pulse_store")
+        followup = _plugin_package_module("pulse_followup")
+        home = Path(_calls_home())
+        if not (home / pulse_store.DB_NAME).exists():
+            return  # Pulse never turned on: leave no file behind
+        if followup.inbox_arrived(pulse_store.open_store(home), time.time()):
+            _wake_running_pulse()
+    except Exception:  # noqa: BLE001 — logging an event never fails on Pulse
+        logger.warning("conduit_push: inbox couldn't tell Pulse about new events", exc_info=True)
+
+
+def _wake_running_pulse() -> int:
+    """Wakes the Pulse loop running in this process: the copy Hermes loaded
+    with the plugin (pulse.register started its thread), not an import of
+    the dashboard's own, whose wake event no loop waits on. A loop in
+    another process finds the marker inbox_arrived left on its next tick
+    (pulse.TICK_S). How many loops it woke."""
+    woken = 0
+    for name, module in list(sys.modules.items()):
+        if module is None or name.rsplit(".", 1)[-1] != "pulse":
+            continue
+        thread, wake = getattr(module, "_thread", None), getattr(module, "wake", None)
+        if callable(wake) and isinstance(thread, threading.Thread) and thread.is_alive():
+            wake()
+            woken += 1
+    return woken
+
+
+@router.post("/inbox/list")
+async def post_inbox_list(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_list_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.list_sealed(body)), "list")
+
+
+@router.post("/inbox/delete")
+async def post_inbox_delete(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_delete_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_DELETE_BODY_BYTES)
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.delete_events(body)),
+                              "delete")
+
+
+@router.post("/inbox/wipe")
+async def post_inbox_wipe(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    await _scoped_acquire(_inbox_wipe_limiter, profile)
+    body = await _read_json_body(request, INBOX_MAX_KEY_BODY_BYTES)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object", headers={"Cache-Control": "no-store"})
+    # Everything only when asked for by name; a device id alone deletes that device's events.
+    if body.get("all") is True and body.get("device_id") is not None:
+        raise HTTPException(status_code=400, detail="Name a device_id or all: true, not both",
+                            headers={"Cache-Control": "no-store"})
+    device_id = None if body.get("all") is True else body.get("device_id")
+    if device_id is None and body.get("all") is not True:
+        raise HTTPException(status_code=400, detail="Name a device_id, or all: true",
+                            headers={"Cache-Control": "no-store"})
+    return await _inbox_route(response, profile, lambda: _inbox_call(lambda store: store.wipe(device_id)), "delete")
+
+
 # A maps lookup the agent asked the phone for (conduit_maps): the phone,
 # woken by a location push, fetches the lookup sealed for it alone and posts
 # its Apple Maps answer sealed back. Neither passes through the relay.
@@ -8259,6 +8818,13 @@ async def post_phone_wipe(request: Request, response: Response, profile: Optiona
 # restart drops them and the Watch falls back to the iPhone.
 # (hermes-conduit designs/apple-watch-voice-direct.md)
 #
+# A grant can also carry answer_call: on a call from Hermes about a question
+# or an approval, the user's spoken answer to it (answer_call_waiting), for
+# the chat the grant names in answer_sessions and no other. It approves or
+# denies only with answer_approvals: the user lets the Watch answer
+# approvals by voice. A Local Live call on the grant answers it with the
+# user's words on the host (_local_live_call_answer).
+#
 # A grant can also carry find_chat and read_chat: the user's earlier chats on
 # the grant's profile, found by Hermes' own session search and read as the
 # iPhone reads them for a live call (watch chats, below).
@@ -8270,7 +8836,10 @@ async def post_phone_wipe(request: Request, response: Response, profile: Optiona
 # here.
 
 WATCH_CHAT_TOOLS = ("find_chat", "read_chat")
-WATCH_TOOLS = ("web_search", "recall_memory") + WATCH_CHAT_TOOLS
+# The user's spoken answer to what Hermes waits on in the chat a call from
+# Hermes is about (answer_call_waiting), wrist up or down.
+WATCH_CALL_ANSWER = "answer_call"
+WATCH_TOOLS = ("web_search", "recall_memory") + WATCH_CHAT_TOOLS + (WATCH_CALL_ANSWER,)
 WATCH_LIVE_TOKEN = "live_token"
 WATCH_QWEN_LIVE_TOKEN = "qwen_live_token"
 # Tokens one grant may mint: a few fresh sessions per call, never a stream.
@@ -8283,7 +8852,7 @@ WATCH_GRANTS_PER_PROFILE = 2
 WATCH_GRANT_LIMIT = 10
 WATCH_GRANT_WINDOW_S = 60.0
 # Tools, the job cap and the phone's job model settings.
-WATCH_GRANT_MAX_BODY_BYTES = 2048
+WATCH_GRANT_MAX_BODY_BYTES = 4096
 # The relay holds a poll this long when no call waits.
 WATCH_POLL_WAIT_MS = 25_000
 WATCH_POLL_TIMEOUT_S = WATCH_POLL_WAIT_MS / 1000 + 10
@@ -8303,9 +8872,9 @@ _WATCH_INFO = {
     "result": b"conduit-watch-tools-v1 result host-to-watch",
 }
 _WATCH_AAD_TAG = "conduit-watch-tools/1"
-_WATCH_ID = re.compile(r"^[A-Za-z0-9_-]{22}$")
-_WATCH_NONCE = re.compile(r"^[A-Za-z0-9_-]{16}$")
-_WATCH_CT = re.compile(r"^[A-Za-z0-9_-]{22,}$")
+_WATCH_ID = re.compile(r"^[A-Za-z0-9_-]{22}\Z")
+_WATCH_NONCE = re.compile(r"^[A-Za-z0-9_-]{16}\Z")
+_WATCH_CT = re.compile(r"^[A-Za-z0-9_-]{22,}\Z")
 # The relay keys travel to it: HTTPS only (tests widen this for a local relay).
 _WATCH_RELAY_SCHEMES: Tuple[str, ...] = ("https://",)
 _watch_grant_limiter = _MintLimiter(WATCH_GRANT_LIMIT, WATCH_GRANT_WINDOW_S,
@@ -8447,6 +9016,12 @@ class _WatchGrant:
         # Summaries made for read_chat, by (session id, turns covered,
         # whether the page held the whole chat).
         self.chat_summaries: Dict[Tuple[str, int, bool], str] = {}
+        # The chat a call from Hermes is about, by the ids its session goes
+        # by: the only one answer_call answers.
+        self.answer_sessions: Tuple[str, ...] = ()
+        # Whether answer_call may approve or deny there: the user lets the
+        # Watch answer approvals by voice.
+        self.answer_approvals = False
         self.seen: set = set()
         self.lock = threading.Lock()
         self.closed = threading.Event()
@@ -8543,6 +9118,44 @@ def _scoped_call(profile: Optional[str], fn: Callable[[], Dict[str, Any]]) -> Di
         return fn()
 
 
+def _watch_answer_sessions(value: Any) -> Tuple[str, ...]:
+    """The ids of the chat a Watch call from Hermes is about (up to 4), or
+    none when malformed."""
+    if not isinstance(value, list) or not 0 < len(value) <= 4:
+        return ()
+    ids = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    # The store's own bound, in UTF-8 bytes, so no id it refuses is granted.
+    if len(ids) != len(value) or any(len(item.encode("utf-8", "replace")) > 512 or not item.isprintable() for item in ids):
+        return ()
+    return tuple(dict.fromkeys(ids))
+
+
+def answer_watch_hermes_call(grant: _WatchGrant, args: Dict[str, Any]) -> Dict[str, Any]:
+    """answer_call: the user's spoken answer to what Hermes waits on in the
+    grant's call from Hermes (answer_call_waiting), never another chat's.
+    An approval only when the user lets the Watch answer them by voice."""
+    if "choice" in args and not grant.answer_approvals:
+        return {"status": "refused",
+                "message": "Approvals aren't answered by voice on this Watch call. "
+                           "The user can answer it in Conduit on their iPhone."}
+    result: Dict[str, Any] = {"status": "not_waiting",
+                              "message": "Hermes isn't waiting on the user in that chat any more."}
+    refused: Optional[TokenError] = None
+    for session_id in grant.answer_sessions:
+        try:
+            result = answer_call_waiting({**args, "session_id": session_id})
+        except TokenError as error:
+            # This chat waits on the other kind (an approval, not a
+            # question): another of the call's chats may be the one.
+            refused = error
+            continue
+        if result.get("status") != "not_waiting":
+            return result
+    if refused is not None:
+        raise refused
+    return result
+
+
 def _clean_watch_args(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -8564,6 +9177,14 @@ def run_watch_tool(grant: _WatchGrant, request: Dict[str, Any]) -> Dict[str, Any
         return run_watch_job_call(grant, tool, args)
     if tool in (WATCH_LIVE_TOKEN, WATCH_QWEN_LIVE_TOKEN):
         return run_watch_live_token(grant, provider="qwen" if tool == WATCH_QWEN_LIVE_TOKEN else "gemini")
+    if tool == WATCH_CALL_ANSWER:
+        try:
+            return {"ok": True, **_scoped_call(grant.profile, lambda: answer_watch_hermes_call(grant, args))}
+        except TokenError as exc:
+            return {"ok": False, "status": exc.status, "detail": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — named; the message can carry the answer
+            _log_watch_failure("Answering Hermes for a Conduit Watch call failed", exc)
+            return {"ok": False, "status": 500, "detail": f"The answer didn't reach Hermes ({type(exc).__name__})"}
     if tool == "find_chat":
         with grant.lock:
             run: Dict[str, Any] = {"dispatched_after": grant.chat_searches}
@@ -9296,6 +9917,10 @@ def open_watch_grant(body: Any, *, profile: Optional[str], ticket_home: Optional
     # Only a grant that runs jobs reads them, as job_options.
     job_profiles = _clean_job_profiles(body.get("job_profiles"), own=profile, ticket_home=ticket_home) if server is not None else ()
     tools = tuple(tool for tool in WATCH_TOOLS if tool in requested)
+    answer_sessions = _watch_answer_sessions(body.get("answer_sessions"))
+    if not answer_sessions:
+        # answer_call answers only the chat of the call from Hermes it names.
+        tools = tuple(tool for tool in tools if tool != WATCH_CALL_ANSWER)
     if any(tool in WATCH_CHAT_TOOLS for tool in tools) and session_routes() is None:
         # A Hermes without the session search route: the Watch asks the
         # iPhone instead, which searches the titles it lists.
@@ -9319,6 +9944,8 @@ def open_watch_grant(body: Any, *, profile: Optional[str], ticket_home: Optional
             raise TokenError(503, "GEMINI_API_KEY is not set on this Hermes host")
         if all(tool in WATCH_CHAT_TOOLS for tool in requested):
             raise TokenError(501, "Searching chats needs a newer Hermes on this host")
+        if all(tool == WATCH_CALL_ANSWER for tool in requested):
+            raise TokenError(400, "answer_call needs answer_sessions: the chat of the call from Hermes")
         raise TokenError(501, "This host can't run Hermes jobs for the Watch")
     max_calls = WATCH_JOB_GRANT_MAX_CALLS if server is not None else WATCH_GRANT_MAX_CALLS
     if not _e2e_crypto_available():
@@ -9357,6 +9984,9 @@ def open_watch_grant(body: Any, *, profile: Optional[str], ticket_home: Optional
     ttl = _watch_grant_ttl(response.get("expires_at"), now)
     grant = _WatchGrant(grant_id=grant_id, profile=profile, tools=tools, secret=secret, relay_url=relay_url,
                         credential=credential, expires_at=time.monotonic() + ttl, max_calls=max_calls)
+    if WATCH_CALL_ANSWER in tools:
+        grant.answer_sessions = answer_sessions
+        grant.answer_approvals = body.get("answer_approvals") is True
     if audio:
         if response.get("audio") is not True:
             # A relay from before Watch audio opened a grant without it.
@@ -10193,7 +10823,8 @@ class _WatchJobs:
                 "request_id": text("request_id", 128),
                 "server_request_id": server_request_id,
                 "command": shown_command,
-                "cut": shown_command != command,
+                # No command to show is never shown whole: it can only be denied.
+                "cut": not command or shown_command != command,
                 "description": text("description", 500) or "Approval required",
             }
             job.approval["fingerprint"] = _watch_approval_fingerprint(job.approval, command)
@@ -10702,7 +11333,7 @@ class _WatchJobs:
             # The Watch showed only part of the command: approving it would
             # approve what the user never saw.
             return {"ok": False, "status": 400,
-                    "detail": "The command was too long to show whole, so it can only be denied"}
+                    "detail": "The command could not be shown whole, so it can only be denied"}
         params: Dict[str, Any] = {"session_id": job.session_id, "choice": choice}
         if approval["request_id"]:
             params["request_id"] = approval["request_id"]
@@ -12209,7 +12840,7 @@ class _WatchCallChat:
                     "id": secrets.token_hex(8), "request_id": text("request_id", 128), "at": time.monotonic(),
                     "server_request_id": text("server_request_id", 128),
                     "command": command[:LOCAL_LIVE_WATCH_APPROVAL_COMMAND_CHARS],
-                    "cut": len(command) > LOCAL_LIVE_WATCH_APPROVAL_COMMAND_CHARS,
+                    "cut": not command or len(command) > LOCAL_LIVE_WATCH_APPROVAL_COMMAND_CHARS,
                     "description": text("description", 500) or "Approval required",
                 })
             return True
@@ -12366,6 +12997,10 @@ class _LocalLiveWatchTurns:
         # (once a reply) and keeps the turn open for what Hermes says after.
         self.watch_approvals = False
         self.approval_told = False
+        # A call from Hermes about a question or approval in its chat (the
+        # grant's answer_sessions): while Hermes waits there, the user's
+        # words answer it, and this returns what the call says.
+        self.answer_call: Optional[Callable[[str], Optional[str]]] = None
 
     def start(self, turn_id: str, text: str, deliver: Callable[[str, str], None]) -> None:
         with self.lock:
@@ -12414,6 +13049,16 @@ class _LocalLiveWatchTurns:
             with self.lock:
                 self._finish(turn_id)
             return
+        if self.answer_call is not None:
+            try:
+                line = self.answer_call(words)
+            except Exception as exc:  # noqa: BLE001 — named; the message can carry the answer
+                logger.info("A Watch Local Live call's answer didn't reach Hermes: %s", type(exc).__name__)
+                line = LOCAL_LIVE_WATCH_FAILURE_LINE
+            if line:
+                with self.lock:
+                    self._say(line, turn_id, generation)
+                return
         following: Optional[_LocalLiveWatchReply] = None
         try:
             with self.lock:
@@ -12577,6 +13222,113 @@ class _LocalLiveWatchTurns:
         self.spoken = _SpokenText()
         self.turn = None
         deliver("done", "")
+
+
+_LOCAL_LIVE_YES = frozenset({
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "go ahead", "do it", "approve", "approve it",
+    "allow it", "run it", "yes please", "yes go ahead", "yes do it", "yes run it", "yes allow it",
+})
+_LOCAL_LIVE_NO = frozenset({
+    "no", "nope", "nah", "deny", "deny it", "don't", "do not", "don't run it", "don't do it", "no thanks",
+    "no thank you", "no don't", "stop", "cancel", "no deny it",
+})
+_LOCAL_LIVE_ASKS = frozenset({
+    "what", "why", "how", "which", "who", "when", "where", "is", "are", "does", "do", "can", "could",
+    "will", "would", "should", "explain", "tell",
+})
+
+
+def _local_live_yes_no(words: str) -> Optional[bool]:
+    """A plain spoken yes (True) or no (False) to an approval; None for
+    anything else, which approves nothing."""
+    plain = " ".join(re.sub(r"[^\w\s']", " ", words.lower()).split())
+    if plain in _LOCAL_LIVE_YES:
+        return True
+    if plain in _LOCAL_LIVE_NO:
+        return False
+    return None
+
+
+def _local_live_asks(words: str) -> bool:
+    """Words that ask about the choice rather than make it."""
+    first = words.lower().split()[0].strip(",.!?") if words.split() else ""
+    return words.rstrip().endswith("?") or first in _LOCAL_LIVE_ASKS
+
+
+def _local_live_question_line(question: Dict[str, Any]) -> str:
+    choices = question.get("choices") or []
+    line = f"Next: {question.get('question', '')}"
+    if choices:
+        line += " " + " ".join(f"{number}: {choice}." for number, choice in enumerate(choices, 1))
+        line += " Say the number of your choice, or answer in your own words."
+    else:
+        line += " Answer in your own words."
+    return line
+
+
+def _local_live_call_answer(grant: _WatchGrant, words: str) -> Optional[str]:
+    """A Watch Local Live call that answers a call from Hermes: the user's
+    words answer what Hermes waits on in the call's chat (answer_call_waiting,
+    as answer_call does for the other modes), and this is what the call says
+    after. A question takes any words, by number, label or "the recommended
+    one", and words that ask go as a request to explain first. An approval
+    takes only a plain yes or no, and only when the user lets the Watch
+    answer approvals by voice; a question about it denies it with the
+    question, so Hermes explains and asks again. None: nothing waits, or the
+    words don't answer it, and they go to the call's own chat."""
+    store_module = _calls_store()
+    with _profile_scope(grant.profile):
+        store = store_module.CallStore(_calls_home())
+        for session_id in grant.answer_sessions:
+            waiting = store.waiting_for(session_id)
+            if not waiting:
+                continue
+            if waiting["kind"] == "question":
+                if all(question["answered"] for question in waiting["questions"]):
+                    continue
+                lead = store_module.ASKS_FIRST_LEAD
+                answer = f"{lead} {words}" if _local_live_asks(words) and not words.casefold().startswith(lead.casefold()) else words
+                result = store.answer_waiting(session_id, answer=answer)
+                if result.get("status") != "answered" or "answer" not in result:
+                    return result.get("message") or None
+                if answer.casefold().startswith(lead.casefold()):
+                    return "I've asked Hermes. It will explain, then ask again."
+                line = f"Got it: {result['answer']}. Hermes has your answer."
+                if isinstance(result.get("next"), dict):
+                    line += " " + _local_live_question_line(result["next"])
+                return line
+            if waiting.get("answered"):
+                continue
+            said = _local_live_yes_no(words)
+            asks = said is None and _local_live_asks(words)
+            if said is None and not asks:
+                return None
+            if not grant.answer_approvals:
+                return "Hermes is waiting on your approval in that chat. Answer it in Conduit on your iPhone."
+            if asks:
+                result = _approval_delivered(store, store.answer_waiting(
+                    session_id, choice="deny", reason=f"{store_module.ASKS_FIRST_LEAD} {words}"))
+                return ("I've asked Hermes. It will explain, then ask again."
+                        if result.get("status") == "answered" else _local_live_undelivered(result))
+            result = _approval_delivered(store, store.answer_waiting(session_id, choice="once" if said else "deny"))
+            if result.get("status") != "answered":
+                return _local_live_undelivered(result)
+            return "Approved once. Hermes runs it now." if result.get("choice") == "once" else "Denied. Hermes won't run it."
+    return None
+
+
+def _local_live_undelivered(result: Dict[str, Any]) -> Optional[str]:
+    """What a Watch Local Live call says when its approval answer didn't
+    reach Hermes (_approval_delivered), to the user rather than a model."""
+    if result.get("status") == "too_late":
+        return "That didn't go through: Hermes wasn't waiting on it any more. Check the chat in Conduit."
+    if result.get("status") == "failed":
+        return "That didn't go through, so nothing changed. Answer it in Conduit on your iPhone."
+    if result.get("status") == "unconfirmed":
+        return "Hermes hasn't confirmed it yet. Check the chat in Conduit."
+    if result.get("status") == "refused":
+        return "I can't approve that one by voice. Say no to deny it, or approve it in Conduit on your iPhone."
+    return result.get("message") or None
 
 
 class _LocalLiveWatchCall:
@@ -12753,6 +13505,9 @@ class _LocalLiveWatchSession(_WatchAudioSession):
             chat, resumed = await self._chat(server)
             runner = self.runner = _LocalLiveWatchTurns(chat)
             self.chat = chat
+            grant = self.bridge.grant
+            if getattr(grant, "answer_sessions", ()):
+                runner.answer_call = lambda words: _local_live_call_answer(grant, words)
             if self.watch_approvals:
                 with contextlib.suppress(Exception):
                     self.approval_timeout = await asyncio.wait_for(
@@ -14298,7 +15053,7 @@ ROOM_IMAGE_LIMIT = 60
 ROOM_IMAGE_WINDOW_S = 600.0
 _room_image_limiter = _MintLimiter(ROOM_IMAGE_LIMIT, ROOM_IMAGE_WINDOW_S,
                                    message="Too many picture changes; try again shortly")
-_ROOM_IMAGE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+_ROOM_IMAGE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,200}\Z")
 _room_image_lock = threading.Lock()
 # Writes wait on one another (the locks below), so they get their own threads
 # rather than the default pool other routes share.
@@ -14731,6 +15486,8 @@ ROUTE_CAPABILITIES = (
     "voice-chat-calls",
     "session-takeover",
     "e2e-notifications",
+    # POST /e2e/rotate: keys rotate inline through a key exchange.
+    "e2e-inline-rotation",
     "watch-tools",
     "watch-jobs",
     "watch-job-follow-ups",
@@ -14745,6 +15502,9 @@ ROUTE_CAPABILITIES = (
     "hermes-calls",
     "hermes-call-presence",
     "hermes-call-outcomes",
+    # GET /calls/waiting, POST /calls/waiting/answer, and answer_call on a
+    # Watch grant: a call reads and answers what Hermes waits on.
+    "hermes-call-answers",
     "conduit-settings",
     "conduit-prefs",
     "pulse",
@@ -14769,6 +15529,8 @@ ROUTE_CAPABILITIES = (
     # sharing.other_profiles: the host's other profiles paired with the
     # same iPhone read the location (location_profiles).
     "location-profiles",
+    # /inbox: events the user's Shortcuts automations log (Log to Hermes).
+    "shortcut-inbox",
     "pairing",
     "self-restart",
     # POST /self/update runs the whole update on the host and notifies.
@@ -15015,6 +15777,9 @@ SELF_UPDATE_CHATS_LIMIT_S = 7200.0
 SELF_UPDATE_NOTIFY_DELAY_S = 5.0
 # A job that hasn't moved for this long is over, however it was left.
 SELF_UPDATE_STALE_S = 3600.0
+# A gateway restart that fails this shortly before a new dashboard starts
+# took the dashboard down with it (a service manager restarting both).
+SELF_UPDATE_TAKEN_DOWN_S = 300.0
 SELF_UPDATE_RUNNING = ("downloading", "restarting_gateway", "waiting_for_chats", "restarting_dashboard")
 # Reentrant: a start reads the status under it too.
 _self_update_lock = threading.RLock()
@@ -15253,11 +16018,34 @@ def _self_update_status(path: Path, now: Optional[float],
     return job
 
 
+def _windows_pid_running(pid: int) -> bool:
+    """Windows has no signal 0: os.kill(pid, 0) there terminates the process.
+    Open it for a query instead; one this process may not open counts as
+    running."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such process
+    try:
+        code = wintypes.DWORD()
+        return not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _another_live_process(pid: Any) -> bool:
     """Whether `pid` is a running process other than this one. The dashboard's
     re-exec keeps its pid; a dashboard restarted any other way has a new one."""
-    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid <= 2**31 - 1 or pid == os.getpid():
         return False
+    if os.name == "nt":
+        return _windows_pid_running(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -15267,13 +16055,29 @@ def _another_live_process(pid: Any) -> bool:
     return True
 
 
+def _taken_down_by_gateway_restart(job: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """A job its dashboard marked failed as it went down with the gateway restart.
+
+    A service manager can restart the dashboard together with the gateway, so
+    the restart command it was waiting on dies with it and reads as failed.
+    The new plugin is what this process loaded: that update finished.
+    """
+    return (job.get("step") == "failed" and job.get("failed_step") == "restarting_gateway"
+            and not job.get("code")
+            and (now or time.time()) - _job_time(job.get("finished_at")) <= SELF_UPDATE_TAKEN_DOWN_S)
+
+
 def finish_self_update_after_restart(path: Optional[Path] = None,
                                      notify: Optional[Callable[[Dict[str, Any]], None]] = None,
                                      delay: float = SELF_UPDATE_NOTIFY_DELAY_S) -> Optional[Dict[str, Any]]:
-    """In a new dashboard process: ends a job the previous process left running."""
+    """In a new dashboard process: ends a job the previous process left running,
+    or one it marked failed as the gateway restart took it down."""
     path = path or _self_update_path()
     job = _read_self_update(path)
-    if job is None or job.get("step") not in SELF_UPDATE_RUNNING or job.get("boot_id") == BOOT_ID:
+    if job is None or job.get("boot_id") == BOOT_ID:
+        return None
+    taken_down = _taken_down_by_gateway_restart(job)
+    if job.get("step") not in SELF_UPDATE_RUNNING and not (taken_down and LOADED_VERSION == job.get("version")):
         return None
     if _another_live_process(job.get("pid")):
         # Another process loading this file (a probe), while the dashboard runs the job.
@@ -15281,6 +16085,8 @@ def finish_self_update_after_restart(path: Optional[Path] = None,
     # Pulled (it has a version) and this process loaded it: done, whatever
     # restarted the dashboard (an update's own re-exec or a /self/restart).
     if job.get("version") is not None and LOADED_VERSION == job["version"]:
+        for key in ("failed_step", "detail", "code"):
+            job.pop(key, None)
         job.update(step="done", loaded_version=LOADED_VERSION, finished_at=time.time())
     else:
         _self_update_failed(job, "The dashboard restarted before the update finished")
@@ -15325,7 +16131,9 @@ def _notify_self_update(job: Dict[str, Any]) -> None:
             if not client.load_state():
                 return
             events = sys.modules[f"{client.__package__}.events"]
-            event = events.push_event("background_task.finished", identifier=events.event_id("plugin-update", job["id"]),
+            # Per outcome: a failure the restarted dashboard corrects isn't a
+            # duplicate of the push the dying one sent.
+            event = events.push_event("background_task.finished", identifier=events.event_id("plugin-update", job["id"], job.get("step")),
                                       profile=profile or "default", title=title, body=body)
             client.send_now(event)
     except Exception as exc:  # noqa: BLE001 — a notification is a courtesy; the job file has the outcome

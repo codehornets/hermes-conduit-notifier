@@ -13,12 +13,131 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
-## 0.70.0 (2026-10-24)
+## 0.75.0 (2026-10-25)
 
 ### New and improved
 - Qwen Live is a separate voice provider on iPhone and Apple Watch.
   The host supplies temporary credentials; call audio connects directly to
   Alibaba Cloud, without going through the Conduit relay or the Hermes host.
+
+## 0.73.0 (2026-10-25)
+
+### New and improved
+- Shortcuts automations can log to Hermes. End an automation (a notification
+  from an app you pick, a message, an email, a Wallet payment, an NFC tag, a
+  sound the phone hears) with Conduit's Log to Hermes action, and Hermes can
+  look it up later ("what did my bank send today?") without a reply or a
+  push each time. Sign-in codes are never kept, and events go after 30 days.
+- With Pulse on, its reports read what your automations logged, and when
+  you ask Hermes to tell you when something happens ("let me know when the
+  bank confirms the transfer"), Pulse checks as soon as a new event comes in.
+- Conduit's Settings can show what was logged from your iPhone and delete
+  any of it.
+
+## 0.72.0 (2026-10-24)
+
+### Security
+- Encryption keys for notifications now rotate every 7 days through a key
+  exchange inside the encrypted channel, so new keys never travel over the
+  dashboard connection. On iOS 26 the exchange is quantum-safe (ML-KEM-768
+  with X25519): a recording of today's traffic can't open later
+  notifications, even with a future quantum computer.
+
+## 0.71.2 (2026-10-24)
+
+### Fixes
+- A notification no longer shows a file's path on the host
+  (MEDIA:/opt/data/cache/…): replies, questions, approvals, calls, updates
+  and phone changes show a paperclip and the file's name, or its type when
+  the name is only a code. So do the answer card under a question or an
+  approval, and the call screen.
+
+## 0.71.1 (2026-10-24)
+
+### Fixes
+- Pictures Hermes made with image generation now show in Artifacts. Without
+  the update, a chat's generated images are missing from its Artifacts list
+  and from the Artifacts page.
+
+## 0.71.0 (2026-10-24)
+
+### New and improved
+- Encryption keys for notifications now rotate. Conduit hands this host a
+  new key every 30 days, or sooner when you ask (`hermes conduit-push e2e
+  rotate`). The old key still opens your answers for 7 days, so nothing in
+  flight is lost; `rotate --now` drops it at once for a key that may have
+  leaked.
+
+## 0.70.3 (2026-10-24)
+
+### Fixes
+- A Pulse reminder held back for a free slot no longer goes out the next
+  day for something you did while it waited: it's checked again first.
+- The morning brief leaves out news that got done or went out of date
+  while it waited for the brief. Undo on the card puts it back.
+- Pulse checks see the calendar and open reminders on your phone, so
+  something you already planned there isn't nagged about.
+- The report also looks at later chats for things you asked Pulse to watch
+  and things you wanted to start, and for items from your other profiles.
+- After Do it, Pulse also notices when you got it done in another chat.
+
+## 0.70.2 (2026-10-24)
+
+### Fixes
+- Pulse no longer asks about something you finished later in another chat or
+  a cron run, or that a newer release moved past: a follow-up and the report
+  now read later chats on the same subject, follow a long chat into its
+  continuation, and see what Hermes is still running in the background.
+- A week-old follow-up checks once more before asking whether you still want
+  it, so a finished one closes instead.
+- On Windows, the dashboard's check for an update still in progress could
+  end the process it looked at. It now only asks Windows whether it runs.
+
+## 0.70.1 (2026-10-24)
+
+### Fixes
+- Answering an approval by voice on the Apple Watch could say "approved"
+  when nothing ran, because the request had just been answered elsewhere or
+  timed out. The call now says so instead, and says "approved" only once
+  Hermes has taken the answer.
+
+## 0.70.0 (2026-10-24)
+
+### New and improved
+- A call from Hermes about a question or an approval can be answered on the
+  Apple Watch, even with your iPhone out of reach: the Watch reads out the
+  choices (and which one Hermes recommends) or the command, and your spoken
+  answer goes to Hermes. Needs approval, question and failure calls on.
+- With the Watch on Local Live, a call from Hermes rings it too, and what
+  you say answers what Hermes asked.
+
+## 0.69.2 (2026-10-24)
+
+### Security
+- A Watch could approve "once" a request that showed no command at all.
+  Such a request can now only be denied, like one too long to show whole.
+
+### Fixes
+- On a Hermes that doesn't name its turns, the Lock Screen could keep
+  showing a finished reply as running. It now ends after two minutes at most.
+- Unpairing while a new pairing was claimed could delete the new one.
+- A calendar or reminder link with no host name is refused instead of
+  dropped by the phone.
+- When the relay stopped answering, each notification could hold up the
+  ones behind it for about a minute, until some were dropped. Each now gives
+  up after about 30 seconds.
+- A call watch run that Hermes names only by its job said the phone would
+  ring when it couldn't; it now says what it found instead.
+- A calendar store written by a newer plugin says to update the plugin
+  instead of asking you to try again forever.
+- Malformed answers or reports from the phone no longer cause server errors.
+
+## 0.69.1 (2026-10-24)
+
+### Fixes
+- An update from Conduit could read as failed ("the gateway didn't restart")
+  when the host restarts the dashboard together with the gateway. The update
+  had worked: the restarted dashboard now finishes it and says so.
 
 ## 0.69.0 (2026-10-24)
 
