@@ -359,6 +359,25 @@ def test_the_settings_page_reads_its_own_events_sealed_a_page_at_a_time(store, p
         _opened(phone, sealed, "request-0002")
 
 
+def test_a_list_read_across_a_new_device_key_is_refused(store, phone, monkeypatch):
+    # The device registers again between the key check and the events read: its
+    # new key's events must never be sealed to the old kid.
+    fresh = Phone()
+    real_key = store._device_key
+
+    def key_then_register(db, device_id, kid, purpose=inbox.INFO_INGEST):
+        key = real_key(db, device_id, kid, purpose)
+        monkeypatch.setattr(store, "_device_key", real_key)
+        fresh.accept(store.register_key(fresh.key_request()))
+        store.ingest(fresh.seal(_batch(_event("new-key"))))
+        return key
+
+    monkeypatch.setattr(store, "_device_key", key_then_register)
+    with pytest.raises(inbox.InboxError) as refused:
+        store.list_sealed({"device_id": DEVICE, "kid": phone.kid, "request_id": "request-0001"})
+    assert refused.value.code == "unknown_key"
+
+
 def test_the_settings_page_deletes_only_what_it_names_from_its_own(store, phone):
     store.ingest(phone.seal(_batch(_event("evt-1"), _event("evt-2"))))
     other = Phone("phone-installation-2")

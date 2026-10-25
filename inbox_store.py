@@ -466,6 +466,14 @@ class InboxStore:
                 " FROM events e JOIN devices d ON d.id = e.device"
                 f" WHERE {' AND '.join(clauses)} ORDER BY e.at_utc DESC, e.id DESC LIMIT ?",
                 (*params, limit + 1)).fetchall()
+            # Each SELECT here is its own snapshot, so a re-registration (and the
+            # new key's events) can land between the key check and the read.
+            # Every registration mints a new kid, so checking again means the
+            # answer is sealed to ``kid`` only if no newer key's events were read.
+            row = db.execute("SELECT kid FROM devices WHERE id=?", (device_id,)).fetchone()
+            if row is None or row[0] != kid:
+                raise InboxError("unknown_key", "This device's inbox key isn't on this profile; set it up again",
+                                 status=409)
         events = []
         for event_id, kind, _, at_local, source, title, text, amount in rows[:limit]:
             item = {"id": event_id, "kind": kind, "at": at_local, "source": source, "title": title, "text": text,
