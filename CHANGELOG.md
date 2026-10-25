@@ -13,7 +13,7 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
-## 0.77.0 (2026-10-25)
+## 0.78.0 (2026-10-25)
 
 ### New and improved
 - Conduit's Predictive settings can suggest your next message after a
@@ -24,6 +24,35 @@ checks it). The format is fixed, because Conduit reads it:
   Hermes Desktop shows no notes for them. A faster model can answer
   instead: set `auxiliary.conduit_predict` (provider and model) in the
   profile's config.
+
+## 0.77.1 (2026-10-25)
+
+### Fixes
+- Pulse could ask about something you'd already finished in a long chat,
+  because it read only that chat's last messages. It now also reads what the
+  chat said on the same subject before them.
+- Reading your older chats, Pulse could remind you of something days after
+  its time, like a 4 PM reminder five days late. One it finds there more than
+  half a day after its time is now set aside, not sent.
+- What you send with Do it, and Hermes's answer to it, no longer become new
+  things for Pulse to follow up on, even when Hermes answers much later. An
+  offer in Hermes's answer could turn into a promise, and Pulse would then nag
+  about it.
+- Pulse's report now says only what it was given. It could repeat what it
+  had said in earlier turns as if it were news, and blame a reminder job
+  that doesn't exist.
+
+## 0.77.0 (2026-10-25)
+
+### New and improved
+- Every item in Pulse's report now gets Do it and Done, dates and things
+  worth knowing that Pulse found on its own included. Before, only items
+  about something Pulse remembers had them.
+- Do it on one of those opens the chat Pulse found it in, or a new chat when
+  it came from somewhere else, like your calendar or reminders. Pulse then
+  reads what came of it and marks the card done by itself once it's taken
+  care of.
+- Done tells Pulse an item is handled, and the next report knows it's done.
 
 ## 0.76.0 (2026-10-25)
 

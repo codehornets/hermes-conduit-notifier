@@ -1435,7 +1435,7 @@ message's turn gets one line of context, for example
   that Desktop and Conduit both have open isn't placed as Conduit's
   (reply_sources), so neither gets a line, as before.
 
-## Predictions for Conduit (plugin 0.77+)
+## Predictions for Conduit (plugin 0.78+)
 
 Conduit's Predictive settings (all off until you turn them on) suggest your
 next message after a reply, offer words for a draft when you pause typing,
