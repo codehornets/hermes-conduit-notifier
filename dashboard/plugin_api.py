@@ -14799,8 +14799,16 @@ def _note_app_request(connection: Any) -> None:
         if str(connection.url.path).endswith(LINK_STATUS_PATH) or not _from_conduit(connection.headers):
             return
         key = _limiter_key(connection.query_params.get("profile"))
+        now = time.time()
         with _link_status_lock:
-            _link_app_noted[key] = time.time()
+            if key not in _link_app_noted and len(_link_app_noted) >= LIMITER_MAX_KEYS:
+                # Bounded whatever profiles callers send: sightings past the
+                # window go first, and a still-full map turns new keys away.
+                for stale in [k for k, at in _link_app_noted.items() if now - at > LINK_APP_RECENT_S]:
+                    del _link_app_noted[stale]
+                if len(_link_app_noted) >= LIMITER_MAX_KEYS:
+                    return
+            _link_app_noted[key] = now
     except Exception:  # noqa: BLE001 — never fails Conduit's request
         logger.debug("Conduit: request not noted for the link status", exc_info=True)
 

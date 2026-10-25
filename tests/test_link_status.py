@@ -204,6 +204,20 @@ def test_a_browser_request_and_the_card_itself_dont_count(route):
     assert _status(route)["app"]["state"] == "never"
 
 
+def test_sightings_stay_bounded_whatever_profiles_callers_send(monkeypatch):
+    monkeypatch.setattr(api, "LIMITER_MAX_KEYS", 3)
+    note = lambda profile: api._note_app_request(types.SimpleNamespace(
+        url=types.SimpleNamespace(path=f"{BASE}/sessions/desktop-views"),
+        headers={"user-agent": CONDUIT}, query_params={"profile": profile}))
+    for profile in ("a", "b", "c", "d"):
+        note(profile)
+    assert len(api._link_app_noted) == 3 and api._limiter_key("d") not in api._link_app_noted
+    # A sighting past the window makes room.
+    api._link_app_noted[api._limiter_key("a")] -= api.LINK_APP_RECENT_S + 1
+    note("d")
+    assert api._limiter_key("d") in api._link_app_noted and api._limiter_key("a") not in api._link_app_noted
+
+
 def test_an_old_sighting_reads_as_idle(route, tmp_path):
     link.app_seen(tmp_path, now=1.0)
     body = _status(route)
