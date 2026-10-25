@@ -7,7 +7,7 @@ import time
 import pytest
 
 from test_pulse import ROOT, SID, _load, cli, control, pulse, store
-from test_pulse_followup import CHAT, check_now, followup, live, llm_saying, promise, tell  # noqa: F401
+from test_pulse_followup import CHAT, _iso, check_now, followup, live, llm_saying, logged, promise, tell  # noqa: F401
 
 learning = _load("conduit_push.pulse_learning", ROOT / "pulse_learning.py")
 
@@ -257,16 +257,109 @@ def test_held_cards_go_out_in_the_morning_brief_once(live):
     assert len(live.sent()) == 1
 
 
-def test_no_brief_without_held_cards_or_before_its_time(live):
-    brief_due_now(live)
-    pulse.tick()
-    assert live.sent() == []
+def test_the_brief_comes_every_morning_with_nothing_held_but_not_before_its_time(live):
     from datetime import datetime, timezone
+    live.store.set("time_zone", "UTC")
     live.store.set("brief_time", datetime.fromtimestamp(time.time() + 3600, timezone.utc).strftime("%H:%M"))
     control.set_level(live.store, "followup", "brief")
     tell(live)
     pulse.tick()
     assert live.sent() == [] and len(live.store.held_cards(10)) == 1
+    live.store.set("followups", False)
+    control.done(live.store, live.store.held_cards(10)[0]["id"], True)
+    brief_due_now(live)
+    pulse.tick()
+    [text] = live.sent()  # nothing held, and the brief still comes
+    assert text.startswith("Pulse morning brief ") and "Pulse holds no news for this brief" in text
+    assert pulse.brief.MEMORY_OFF in text  # memory is off here: no claim that nothing is open
+    assert followup_or_brief_kinds(live) == ["brief"]
+    [attempt] = live.store.in_flight()
+    live.store.update_attempt(attempt["attempt_id"], state=store.DELIVERED)
+    pulse.tick()
+    assert len(live.sent()) == 1  # once a day
+
+
+def test_a_brief_with_nothing_kept_still_reads_the_calendar(live, monkeypatch):
+    live.store.set("memory", True)
+    monkeypatch.setattr(pulse.report, "phone_context",
+                        lambda home, now: ("## Calendar, the next 2 days (phone synced 5 min ago)\n- Dentist (09:30)",
+                                           None))
+    brief_due_now(live)
+    pulse.tick()
+    [text] = live.sent()
+    # What Pulse keeps is empty, and the calendar is still what's on.
+    assert "Pulse holds no news for this brief and remembers nothing still open." in text
+    assert text.index(pulse.brief.CALENDAR_COUNTS) < text.index("- Dentist (09:30)")
+    assert "Nothing open" not in text and pulse.brief.MEMORY_OFF not in text
+
+
+def test_the_empty_brief_names_only_what_pulse_read():
+    nothing = pulse.brief._nothing
+    assert nothing(True, True, "Sat 24 Oct 18:00") == (
+        "Pulse holds no news for this brief, remembers nothing still open, and the phone's automations logged "
+        "nothing since Sat 24 Oct 18:00. The calendar and reminders below, if any, still count.")
+    # Memory off, no Shortcuts inbox: it claims nothing about either.
+    off = nothing(False, False, "Sat 24 Oct 18:00")
+    assert off == ("Pulse holds no news for this brief. Pulse memory is off, so it doesn't track open promises or "
+                   "to-dos. The calendar and reminders below, if any, still count.")
+
+
+def followup_or_brief_kinds(live):
+    return [row["kind"] for row in live.store.in_flight()]
+
+
+def test_the_brief_sums_up_what_is_open_and_what_happened_since(live):
+    live.store.set("memory", True)
+    promise(live, "Hermes will send the release notes once the deploy is out.")
+    live.db.session(sid="other", title="Release", pinned=0)
+    live.db.message("assistant", "Sent the release notes for the deploy.", sid="other", at=time.time() - 60)
+    brief_due_now(live)
+    pulse.tick()
+    [text] = live.sent()
+    assert "send the release notes" in text and "## Later on the same subject" in text
+    assert "Sent the release notes" in text and pulse.brief.HELD_TITLE not in text
+
+
+def test_the_brief_reads_what_the_phone_logged_since_the_last_report_fenced(live):
+    logged(live.home,
+           {"id": "old", "kind": "notification", "at": _iso(time.time() - 3 * 86400), "source": "Desjardins",
+            "text": "Rent paid"},
+           {"id": "new", "kind": "notification", "at": _iso(time.time() - 3600), "source": "UPS",
+            "text": "Your parcel is out for delivery"})
+    brief_due_now(live)
+    pulse.tick()
+    [text] = live.sent()
+    assert "Your parcel is out for delivery" in text and "Rent paid" not in text  # since the last report only
+    assert "## Logged on the phone since " in text and "other people's words" in text
+    assert "Pulse holds no news" not in text  # it logged something
+    fence = text.split("<<<context ", 1)[1].split("\n", 1)[0]
+    assert text.rstrip().endswith(f"context {fence}>>>")
+
+
+def test_a_long_brief_is_cut_to_the_reports_budget(live, monkeypatch):
+    monkeypatch.setenv(pulse.report.LCM_THRESHOLD, "6000")
+    text = pulse.brief.text_for("x" * 20_000)("t1")
+    assert len(text) <= pulse.report.report_budget() and text.rstrip().endswith(">>>")
+
+
+def test_a_busy_brief_keeps_the_calendar_and_lets_the_held_news_go(live, monkeypatch):
+    from datetime import timezone
+    monkeypatch.delenv(pulse.report.LCM_THRESHOLD, raising=False)
+    live.store.set("memory", True)
+    phone = ("## Calendar, the next 2 days (phone synced 5 min ago)\n"
+             + "\n".join(f"- Meeting {n} {'m' * 95} (2026-10-25 {n % 24:02d}:00)" for n in range(25))
+             + "\n\n## Open reminders\n" + "\n".join(f"- Reminder {n} {'r' * 95} (due 2026-10-26)" for n in range(25)))
+    monkeypatch.setattr(pulse.report, "phone_context", lambda home, now: (phone, None))
+    monkeypatch.setattr(pulse.report, "remembered_lines",
+                        lambda items, zone: (pulse.report.REMEMBERED_TITLE + "\n" + "o" * 3_400, []))
+    monkeypatch.setattr(pulse.report, "inbox_context", lambda home, since, title="": title + "\n" + "i" * 2_000)
+    cards = [{"news": f"Held {n} " + "h" * 390, "chat_title": "Deploy"} for n in range(pulse.brief.MAX_CARDS)]
+    context = pulse.brief.context(live.home, live.store, cards, home_chat_id="home", now=time.time(),
+                                  zone=timezone.utc)
+    text = pulse.brief.text_for(context)("t1")
+    # Over the budget, the cut takes the held news (each shows as its own card), never the day's calendar.
+    assert len(context) > pulse.report.report_budget() and len(text) <= pulse.report.report_budget()
+    assert phone in text and f"- Held {pulse.brief.MAX_CARDS - 1} " not in text
 
 
 def test_a_brief_turn_pushes(live):
@@ -281,6 +374,12 @@ def test_a_brief_turn_pushes(live):
     assert pulse.pushes(SID, "turn-b") is True
     assert pulse.push_copy(SID, "turn-b", "Two things waited.") == {
         "title_label": "pulse.brief", "title": "Your morning brief", "body": "Two things waited."}
+    # The summary line is the push; the lines under it are for the card.
+    assert pulse.push_copy(SID, "turn-b", "\nA calm day, two things open.\n- Send the notes\n- Call Sam")["body"] \
+        == "A calm day, two things open."
+    # A first line that runs on is cut to what a push should carry.
+    body = pulse.push_copy(SID, "turn-b", "A long day. " * 40 + "\n- Send the notes")["body"]
+    assert len(body) == pulse.brief.SUMMARY_LIMIT and body.endswith("…")
 
 
 def test_a_failed_push_becomes_a_card_once_follow_ups_go_quiet(live):
@@ -331,6 +430,9 @@ def test_a_card_put_away_while_its_brief_is_out_waits_for_the_next(live):
 
 
 def test_brief_time_setting(live):
+    # By default the brief comes an hour before the first report, never with it.
+    assert pulse.brief.DEFAULT_TIME == store.DEFAULTS["brief_time"] == "07:00"
+    assert store.DEFAULTS["brief_time"] not in store.DEFAULTS["report_time"].split(",")
     control.update(live.store, {"brief_time": "7:30"})
     assert live.store.get("brief_time") == "07:30"
     for bad in ("7:30,9:00", "noon", 7):
@@ -984,7 +1086,8 @@ def test_a_held_card_swiped_away_stays_out_of_the_brief(live):
     assert live.store.held_cards(10) == [] and live.store.held_count() == 0
     brief_due_now(live)
     pulse.tick()
-    assert live.sent() == []
+    [text] = live.sent()
+    assert pulse.brief.HELD_TITLE not in text and "everything is green" not in text
 
 
 def test_a_remembered_thing_swiped_away_rests_a_week(live):

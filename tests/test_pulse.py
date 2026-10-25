@@ -541,7 +541,15 @@ def live(tmp_path, monkeypatch):
     # The daily report runs on the clock; its own tests turn it on.
     pulse_store.set("daily_report", False)
     pulse_store.set("memory", False)  # likewise memory, which needs a model
+    brief_off_the_clock(pulse_store, tmp_path)
     return types.SimpleNamespace(ctx=ctx, fake=fake, sent=sent, store=pulse_store)
+
+
+def brief_off_the_clock(pulse_store, home):
+    """The morning brief goes out every day on the clock; its own tests set
+    its time. Ten hours ahead, its last slot is always too old to send."""
+    zone = pulse.report_zone(pulse_store, home)
+    pulse_store.set("brief_time", datetime.fromtimestamp(time.time() + 10 * 3600, zone).strftime("%H:%M"))
 
 
 def test_nothing_is_sent_while_pulse_is_off(live, db):
@@ -1310,7 +1318,15 @@ def test_report_command(live, db, capsys, monkeypatch):
     assert run("all-profiles") == 0 and live.store.get("report_profiles") == "all"
     capsys.readouterr()
     cli.dispatch(types.SimpleNamespace(conduit_push_action="pulse", pulse_action="status", value=""))
-    assert "Shadow reports at 07:30 (Europe/Paris); next " in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Shadow reports at 07:30 (Europe/Paris); next " in out
+    live.store.set("brief_time", "06:15")
+    cli.dispatch(types.SimpleNamespace(conduit_push_action="pulse", pulse_action="status", value=""))
+    assert "Morning brief at 06:15 (Europe/Paris); next " in capsys.readouterr().out
+    live.store.set("enabled", False)
+    cli.dispatch(types.SimpleNamespace(conduit_push_action="pulse", pulse_action="status", value=""))
+    assert "Morning brief: off while Pulse is" in capsys.readouterr().out
+    live.store.set("enabled", True)
     assert run("8:00, 17:00,12:30") == 0 and live.store.get("report_time") == "08:00,12:30,17:00"
     assert run("8:00,24:00") == 2 and live.store.get("report_time") == "08:00,12:30,17:00"
     assert run("off") == 0 and live.store.get("daily_report") is False
@@ -2222,6 +2238,7 @@ def test_pulse_routes(remembering, db, monkeypatch):
         "followup": "screen"}
     assert http.put(f"{base}/levels", json={"kind": "followup", "level": "loud"}).status_code == 400
     assert "pulse" in api.ROUTE_CAPABILITIES and "pulse_feed" in api.ROUTE_CAPABILITIES
+    assert "pulse_daily_brief" in api.ROUTE_CAPABILITIES  # Settings > Pulse says the brief comes every day
     # A host that never turned Pulse on is answered without a file left behind.
     fresh = home / "fresh"
     fresh.mkdir()
