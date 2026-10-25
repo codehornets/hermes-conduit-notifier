@@ -6314,6 +6314,182 @@ async def post_turn_surface(request: Request, response: Response) -> Dict[str, A
     return {"ok": True, "recorded": recorded}
 
 
+# --- Predictions (predict.py) -------------------------------------------------
+#
+# Conduit's opt-in Predictive features ask about a chat open on this host:
+# suggested replies, guesses for an unsent draft, and whether the agent wants
+# a turn while the user looks at the chat. Each is answered by a fork of the
+# live chat, as Hermes' /btw is (same prompt cache, every tool refused,
+# nothing saved), but only to the device that asked: prompt.btw's answer goes
+# to every client, and Hermes Desktop shows it as a note. The fork runs on the
+# chat's own model, or on `auxiliary.conduit_predict` ({provider, model}) in
+# the chat's profile config when Conduit asks for the fast one.
+
+PREDICT_LIMIT = 40
+PREDICT_WINDOW_S = 60.0
+PREDICT_MAX_BODY_BYTES = 8192
+PREDICT_WORKERS = 4
+PREDICT_FORK_ITERATIONS = 3
+PREDICT_TASK = "conduit_predict"
+_predict_limiter = _MintLimiter(PREDICT_LIMIT, PREDICT_WINDOW_S,
+                                message="Too many predictions; try again shortly")
+_predict_executor = ThreadPoolExecutor(max_workers=PREDICT_WORKERS, thread_name_prefix="conduit-predict")
+_predict_module: Any = None
+_predict_lock = threading.Lock()
+# Chats with a prediction running: one at a time each, so a fast typist
+# can't queue forks behind a slow model.
+_predict_running: set = set()
+# Predictions answered today, by local date: shown in Conduit's settings.
+_predict_counts: Dict[str, int] = {}
+
+
+def _predict() -> Any:
+    """predict.py beside this folder, loaded once."""
+    global _predict_module
+    with _predict_lock:
+        if _predict_module is None:
+            path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "predict.py")
+            spec = importlib.util.spec_from_file_location("conduit_push_dashboard_predict", path)
+            if spec is None or spec.loader is None or not os.path.isfile(path):
+                raise TokenError(501, "This plugin install is missing predict.py; update the plugin")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _predict_module = module
+        return _predict_module
+
+
+def _predict_profile_scope(session: dict) -> Any:
+    """Hermes' scope for the chat's own profile (config, secrets), as its
+    side agents use; none on a Hermes without it."""
+    server = sys.modules.get("tui_gateway.server")
+    scope = getattr(server, "_session_profile_runtime_scope", None)
+    return scope(session) if callable(scope) else contextlib.nullcontext()
+
+
+def _predict_fast_model() -> Dict[str, Any]:
+    """``auxiliary.conduit_predict`` from the active profile's config, or {}."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+    except Exception:  # noqa: BLE001 — no fast model, the chat's own model answers
+        return {}
+    auxiliary = config.get("auxiliary") if isinstance(config, dict) else None
+    task = auxiliary.get(PREDICT_TASK) if isinstance(auxiliary, dict) else None
+    if not isinstance(task, dict) or not str(task.get("model") or "").strip():
+        return {}
+    return task
+
+
+def _predict_fork_answer(agent: Any, history: List[Dict[str, Any]], question: str,
+                         task_cfg: Dict[str, Any]) -> str:
+    """The question answered by a no-tools fork of the live chat. A Hermes
+    without the fork's parts answers through its plain /btw (the chat's own
+    model)."""
+    try:
+        from agent.background_review import (
+            _digest_history, _record_review_usage_to_parent, _snapshot_review_usage, build_cache_parity_fork)
+        from agent.side_question import _FORK_PROMPT, trim_snapshot_for_fork
+        from hermes_cli.plugins import clear_thread_tool_whitelist, set_thread_tool_whitelist
+    except ImportError:
+        try:
+            from agent.side_question import answer_side_question
+        except ImportError:
+            raise TokenError(501, "This Hermes can't answer side questions; update Hermes")
+        return answer_side_question(question, history, parent_agent=agent) or ""
+    fork, _runtime, routed = build_cache_parity_fork(agent, task_cfg or None,
+                                                     max_iterations=PREDICT_FORK_ITERATIONS,
+                                                     write_origin="conduit_predict")
+    try:
+        set_thread_tool_whitelist(set(), deny_msg_fmt=(
+            "Prediction denied tool call: {tool_name}. Tools are disabled here; answer from the conversation."))
+        snapshot = trim_snapshot_for_fork(history)
+        result = fork.run_conversation(user_message=f"{_FORK_PROMPT}\n\nSide question: {question}",
+                                       conversation_history=_digest_history(snapshot) if routed else snapshot)
+        text = (result or {}).get("final_response", "") or ""
+        if not text and result and result.get("error"):
+            raise RuntimeError(str(result["error"]))
+        return text.strip()
+    finally:
+        clear_thread_tool_whitelist()
+        for step in (lambda: _record_review_usage_to_parent(agent, _snapshot_review_usage(fork)),
+                     fork.shutdown_memory_provider, fork.close):
+            try:
+                step()
+            except Exception:  # noqa: BLE001 — teardown never fails the answer
+                pass
+
+
+def run_prediction(body: Any) -> Dict[str, Any]:
+    """Answers one prediction request (worker thread)."""
+    module = _predict()
+    try:
+        request = module.parse(body)
+    except ValueError as exc:
+        raise TokenError(400, str(exc))
+    server = _hermes_session_api()
+    session = server._sessions.get(request.session_id) if server is not None else None
+    agent = session.get("agent") if isinstance(session, dict) else None
+    if agent is None:
+        raise TokenError(404, "That chat isn't open on the host")
+    with _predict_lock:
+        if request.session_id in _predict_running:
+            raise TokenError(429, "A prediction for this chat is still running")
+        _predict_running.add(request.session_id)
+    try:
+        history = list(getattr(agent, "_session_messages", None) or session.get("history") or [])
+        with _predict_profile_scope(session):
+            task_cfg = _predict_fast_model() if request.model == "fast" else {}
+            text = _predict_fork_answer(agent, history, module.question(request), task_cfg)
+    finally:
+        with _predict_lock:
+            _predict_running.discard(request.session_id)
+    today = time.strftime("%Y-%m-%d")
+    with _predict_lock:
+        for day in [day for day in _predict_counts if day != today]:
+            del _predict_counts[day]
+        _predict_counts[today] = _predict_counts.get(today, 0) + 1
+    return module.answer(request, text)
+
+
+def prediction_status() -> Dict[str, Any]:
+    """The fast model, if the profile names one, and today's count."""
+    task = _predict_fast_model()
+    with _predict_lock:
+        today = _predict_counts.get(time.strftime("%Y-%m-%d"), 0)
+    return {"fast_model": str(task.get("model")).strip() if task else None, "today": today}
+
+
+@router.get("/predict")
+async def get_predict(response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return {"ok": True, **(await _run_scoped(profile, prediction_status))}
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
+    except Exception as exc:
+        raise _unexpected("predict status", exc, feature="Predictions")
+
+
+@router.post("/predict")
+async def post_predict(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    no_store = {"Cache-Control": "no-store"}
+    await _scoped_acquire(_predict_limiter, profile)
+    body = await _read_json_body(request, PREDICT_MAX_BODY_BYTES)
+    wait_s = body.get("wait_s") if isinstance(body, dict) else None
+    wait_s = float(wait_s) if isinstance(wait_s, (int, float)) and not isinstance(wait_s, bool) and wait_s > 0 else 20.0
+    try:
+        work = asyncio.get_running_loop().run_in_executor(_predict_executor, run_prediction, body)
+        result = await asyncio.wait_for(work, timeout=min(wait_s, 30.0) + 1.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="The prediction took too long", headers=no_store)
+    except TokenError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers=no_store)
+    except Exception as exc:
+        raise _unexpected("predict", exc, feature="Predictions")
+    return {"ok": True, **result}
+
+
 # --- End-to-end encrypted notifications (#431) -------------------------------
 #
 # Conduit creates a per-pairing secret on the phone and hands it to this
@@ -15766,6 +15942,9 @@ ROUTE_CAPABILITIES = (
     "cron-notifications",
     "reply-sources",
     "chat-on-screen",
+    # POST /predict, GET /predict: Conduit's Predictive features, answered
+    # by a no-tools fork of the chat for the asking device only.
+    "predict",
     "room-files",
     "room-images",
     "speech-server",
