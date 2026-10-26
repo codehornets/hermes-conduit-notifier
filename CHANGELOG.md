@@ -13,7 +13,7 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
-## 0.79.0 (2026-10-26)
+## 0.80.0 (2026-10-26)
 
 ### New and improved
 - Conduit's Predictive settings can suggest your next message after a
@@ -24,6 +24,19 @@ checks it). The format is fixed, because Conduit reads it:
   Hermes Desktop shows no notes for them. A faster model can answer
   instead: set `auxiliary.conduit_predict` (provider and model) in the
   profile's config.
+
+## 0.79.0 (2026-10-26)
+
+### New and improved
+- In a group room that includes another Hermes's agent, your agent now
+  follows your rules for that room, on your own host: by default it talks
+  without tools, asks you before sharing anything personal, can't search your
+  past chats, and saves nothing from the room to its memory or skills. It's
+  told who's asking, so other people's requests can't change what it shares,
+  and anything in its replies that looks like a password or key is removed.
+  Past-chat search no longer finds those rooms. Rooms of only your own agents
+  work as before. If Hermes can't read its chat records for a moment, tool
+  calls are blocked until it can, so a room's rules are never skipped.
 
 ## 0.78.3 (2026-10-26)
 
