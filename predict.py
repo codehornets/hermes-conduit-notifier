@@ -40,7 +40,8 @@ MIN_COUNT, MAX_COUNT, DEFAULT_COUNT = 1, 5, 3
 # Continuations of a draft: always up to three, a few words each.
 MAX_NEXT = 3
 MAX_NEXT_CHARS = 60
-# The prompt asks for 140; a longer reply is clipped here, not dropped.
+# The prompt asks for 140; a reply that runs over is kept up to this, and
+# a longer one is left out.
 MAX_REPLY_CHARS = 280
 MAX_WHY_CHARS = 160
 MAX_PLAN_CHARS = 400
