@@ -6424,9 +6424,9 @@ def _predict_fork_answer(agent: Any, history: List[Dict[str, Any]], question: st
             raise RuntimeError(str(result["error"]))
         return text.strip()
     finally:
-        clear_thread_tool_whitelist()
-        for step in (lambda: _record_review_usage_to_parent(agent, _snapshot_review_usage(fork)),
-                     fork.shutdown_memory_provider, fork.close):
+        for step in (clear_thread_tool_whitelist,
+                     lambda: _record_review_usage_to_parent(agent, _snapshot_review_usage(fork)),
+                     lambda: fork.shutdown_memory_provider(), lambda: fork.close()):
             try:
                 step()
             except Exception:  # noqa: BLE001 — teardown never fails the answer

@@ -1468,7 +1468,7 @@ it as a `[btw …]` note), the route answers only the device that asked.
   until the user writes). An answer that isn't the JSON asked for comes back
   with `"parsed": false` and nothing to suggest. Capability `predict`.
 - One prediction at a time per chat (429), at most 4 running on the host
-  (503), 40 a minute per profile. One that outlasts `wait_s` answers 504 and
+  (503), 40 a minute for the whole host. One that outlasts `wait_s` answers 504 and
   is left to finish; its chat is free again when it does. `GET …/predict`
   answers `{"fast_model": "<model>" | null, "today": <count>}`.
 - `"model": "fast"` answers on `auxiliary.conduit_predict` (`provider`,

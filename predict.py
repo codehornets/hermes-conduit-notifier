@@ -82,7 +82,8 @@ def _quoted_draft(draft: str) -> str:
 
 
 def _seconds(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 10 * 365 * 86400:
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or value != value
+            or value < 0 or value > 10 * 365 * 86400):
         raise ValueError(f"facts.{name} must be a number of seconds")
     return int(value)
 
