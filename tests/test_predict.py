@@ -114,7 +114,8 @@ def test_a_wanted_turn_carries_the_hidden_nudge():
                                      '"plan":"Check the backup task.","ask_again_in_seconds":60}')
     assert result["take_turn"] is True and result["ask_again_in_seconds"] is None
     assert result["why"] == "The rerun should be past a third."
-    assert result["nudge"].startswith("[Conduit] The user has had this chat open for 3 min 12 s")
+    assert result["nudge"].startswith("[Conduit] It has been 3 min 12 s since your last reply, and the user"
+                                      " has had this chat open for 2 min 40 s without writing.")
     assert "Check the backup task." in result["nudge"] and result["nudge"].endswith("[SILENT].")
 
 
@@ -243,6 +244,18 @@ def test_predictions_are_limited_per_minute(gateway, client, monkeypatch):
     gateway._sessions["s1"] = {"agent": FakeAgent([])}
     codes = [client.post(f"{BASE}/predict", json={"session_id": "s1", "kind": "replies"}).status_code
              for _ in range(3)]
+    assert codes == [200, 200, 429]
+
+
+def test_the_prediction_limit_is_one_for_the_host(gateway, client, monkeypatch):
+    import contextlib
+
+    monkeypatch.setattr(api, "_predict_limiter", api._MintLimiter(2, 60.0))
+    monkeypatch.setattr(api, "_profile_scope", lambda profile: contextlib.nullcontext())
+    gateway._sessions["s1"] = {"agent": FakeAgent([])}
+    codes = [client.post(f"{BASE}/predict", params={"profile": name},
+                         json={"session_id": "s1", "kind": "replies"}).status_code
+             for name in ("current", "main", "work")]
     assert codes == [200, 200, 429]
 
 

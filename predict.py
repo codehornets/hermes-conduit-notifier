@@ -206,9 +206,9 @@ def nudge(request: Request, why: str, plan: str) -> str:
     facts = request.facts
     said = f' When asked, you wanted a turn: "{why}".' if why else " When asked, you wanted a turn."
     planned = f' Your plan: "{plan}".' if plan else ""
-    return (f"[Conduit] The user has had this chat open for {duration(facts['last_reply_s'])} since your last"
-            f" reply without writing.{said}{planned} Go ahead if it still helps them. If not, answer exactly"
-            " [SILENT].")
+    return (f"[Conduit] It has been {duration(facts['last_reply_s'])} since your last reply, and the user has"
+            f" had this chat open for {duration(facts['on_screen_s'])} without writing.{said}{planned} Go ahead"
+            " if it still helps them. If not, answer exactly [SILENT].")
 
 
 _FENCE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")

@@ -586,12 +586,14 @@ def _limited(limiter: "_MintLimiter", profile: Optional[str], fn: Callable[[], _
     return run
 
 
-async def _scoped_acquire(limiter: "_MintLimiter", profile: Optional[str]) -> None:
+async def _scoped_acquire(limiter: "_MintLimiter", profile: Optional[str], key: Optional[str] = None) -> None:
     """A slot of ``limiter`` taken before a route reads its body, once
     Hermes' scope has accepted ``profile`` (an unknown one is refused there
-    and never gets a bucket)."""
+    and never gets a bucket). ``key`` names the bucket when it isn't the
+    profile's own."""
+    bucket = _limiter_key(profile) if key is None else key
     try:
-        await _run_scoped(profile, lambda: limiter.acquire(_limiter_key(profile)))
+        await _run_scoped(profile, lambda: limiter.acquire(bucket))
     except TokenError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc), headers={"Cache-Control": "no-store"})
     except HTTPException as exc:
@@ -6524,7 +6526,9 @@ async def get_predict(response: Response, profile: Optional[str] = None) -> Dict
 async def post_predict(request: Request, response: Response, profile: Optional[str] = None) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     no_store = {"Cache-Control": "no-store"}
-    await _scoped_acquire(_predict_limiter, profile)
+    # One bucket for the host: the fork runs under the chat's own profile
+    # whatever ?profile= names, so a bucket per profile could be sidestepped.
+    await _scoped_acquire(_predict_limiter, profile, key="")
     body = await _read_json_body(request, PREDICT_MAX_BODY_BYTES)
     try:
         module, asked, session, agent = _predict_request(body)
