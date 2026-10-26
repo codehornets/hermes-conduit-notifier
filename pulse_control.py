@@ -10,8 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from . import pulse, pulse_delivery, pulse_followup, pulse_hermes, pulse_learning, pulse_memory, pulse_quiet
+from . import pulse, pulse_candidates, pulse_delivery, pulse_followup, pulse_hermes, pulse_learning, pulse_memory
+from . import pulse_quiet
 from . import pulse_host as host
+from . import pulse_report
 
 RECENT = 5
 ITEMS = 200
@@ -422,9 +424,150 @@ def acted(pulse_store: Any, card_id: Any, now: Optional[float] = None) -> bool:
     return _learning(lambda: pulse_followup.act(pulse_store, card_id, now=time.time() if now is None else now))
 
 
-def learned(pulse_store: Any) -> dict[str, Any]:
-    """What ratings taught Pulse, newest first, and each kind's loudness."""
-    return {"lessons": pulse_learning.learned(pulse_store), "levels": pulse_learning.levels(pulse_store)}
+def learned(pulse_store: Any, home: Optional[Path] = None, now: Optional[float] = None) -> dict[str, Any]:
+    """What ratings taught Pulse, newest first, each kind's loudness, and
+    what learning holds about each thing it has votes for, strongest first
+    (pulse_prefs' Learned.preferences), a chat's with its profile, id and
+    title, as What Pulse left out names it (``_chat_title``). A reset
+    lesson about a chat carries the same."""
+    found = pulse_store.learned(time.time() if now is None else now).preferences()
+    for entry in found:
+        if entry["scope"] == "place":
+            entry.update(_chat_of(pulse_store, home, entry["value"]))
+    lessons = [_reset_entry(pulse_store, home, lesson) for lesson in pulse_learning.learned(pulse_store)]
+    return {"lessons": lessons, "levels": pulse_learning.levels(pulse_store), "preferences": found}
+
+
+def _reset_entry(pulse_store: Any, home: Optional[Path], lesson: dict) -> dict:
+    """A lesson as `learned` lists it: a reset about a chat with the chat's
+    profile, id and title, and its text naming the chat."""
+    if lesson["what"] == pulse_learning.RESET and lesson["kind"] == "place" and lesson["value"].startswith("chat:"):
+        lesson.update(_chat_of(pulse_store, home, lesson["value"]))
+        lesson["text"] = pulse_learning.describe(lesson)
+    return lesson
+
+
+def _chat_of(pulse_store: Any, home: Optional[Path], place: str) -> dict[str, str]:
+    """A chat place's profile, id and title (pulse_prefs.place); {} for
+    another place, or one that names no chat."""
+    parts = place.split(":", 2)
+    if parts[0] != "chat" or len(parts) != 3:
+        return {}
+    _, profile, chat_id = parts
+    return {"profile": profile, "chat_id": chat_id,
+            "chat_title": _chat_title(pulse_store, home, profile, chat_id) if chat_id else ""}
+
+
+def reset(pulse_store: Any, scope: Any, value: Any = "", now: Optional[float] = None,
+          home: Optional[Path] = None) -> dict:
+    """Forgets what learning holds about one thing, or everything
+    (pulse_learning.reset); the lesson, which Undo takes back. Refused
+    while Pulse is off, as a rating is."""
+    if not pulse_store.get("enabled"):
+        raise Refused("pulse_off")
+    lesson = _learning(lambda: pulse_learning.reset(pulse_store, scope, value, time.time() if now is None else now))
+    return _reset_entry(pulse_store, home, pulse_learning.lesson_entry(lesson))
+
+
+# What Pulse left out: the journal's candidates from the last LEFT_OUT_S
+# (or its latest report's, when that's older) that didn't come up, at most
+# LEFT_OUT of them, those learning or the user's own rules kept out first.
+LEFT_OUT_S = 86400.0
+LEFT_OUT = 100
+# The journal rows read for it, newest first: far more than a day's lists
+# hold, so the order above is kept whatever ``limit`` cuts.
+LEFT_OUT_ROWS = 5000
+LEFT_OUT_ORDER = (pulse_candidates.QUIETED, pulse_candidates.MUTED, pulse_candidates.OFF,
+                  pulse_candidates.OVER_LIMIT, pulse_candidates.SKIPPED, pulse_candidates.NOT_PICKED,
+                  pulse_candidates.RESTING, pulse_candidates.UNANSWERED)
+
+
+def _on_the_way(pulse_store: Any) -> str:
+    """The report run whose picks are on their way to the Pulse screen, its
+    list made and its report ready or sent, not refused: what it picked has
+    come up already, though its cards haven't landed. What a run that was
+    dropped or refused picked never came up. "" for none."""
+    run = pulse_store.get(pulse.REPORT_RUN)
+    run = run if isinstance(run, dict) else {}
+    going = run.get("state") in (pulse.RUN_READY, pulse.RUN_SENT) and not run.get("refused")
+    return str(run.get("id") or "") if going else ""
+
+
+def _left_out_since(pulse_store: Any, now: float) -> float:
+    """Where What Pulse left out starts: the last day, or the latest report
+    when that's older."""
+    latest = pulse_store.latest_candidate_at()
+    return min(now - LEFT_OUT_S, latest) if latest is not None else now - LEFT_OUT_S
+
+
+def left_out(pulse_store: Any, home: Optional[Path] = None, now: Optional[float] = None,
+             limit: int = LEFT_OUT) -> list[dict[str, Any]]:
+    """What the latest reports considered and left out, and why, for What
+    Pulse left out: each thing once (a remembered item, or the same text, by
+    its newest decision), not one that came up in that report or later,
+    learning's and the user's rules' first, then the rest, newest and most
+    valued first within each. One brought up (``bring_up``) says which card
+    it became, whichever report's candidate was brought up, however long
+    ago."""
+    seen: set[Any] = set()
+    out = []
+    for row in pulse_store.left_out(_left_out_since(pulse_store, time.time() if now is None else now), LEFT_OUT_ROWS,
+                                    _on_the_way(pulse_store)):
+        # One report can know a thing as a remembered item and another as
+        # words alone, and an item's words can change: it is one thing.
+        if row["thing"] in seen or row["later"] or not row["text"]:
+            continue
+        seen.add(row["thing"])
+        out.append({"id": row["id"], "created_at": row["created_at"], "kind": row["kind"], "text": row["text"],
+                    "why": row["why"], "decision": row["decision"], "skip": row["skip"], "value": row["value"],
+                    "learned": pulse_learning.factor_entry(row["factor"]), "origin": row["origin"],
+                    "source": row["source"], "area": row["area"], "profile": row["profile"] or "",
+                    "chat_id": row["chat_id"] or "", "chat_title": "", "item_id": row["item_id"],
+                    "due_at": row["due_at"], "card_id": row["card_id"]})
+    order = {decision: n for n, decision in enumerate(LEFT_OUT_ORDER)}
+    out.sort(key=lambda entry: (order.get(entry["decision"], len(order)), -entry["created_at"],
+                                -(entry["value"] or 0), entry["id"]))
+    out = out[:limit]
+    # Titles only for what's listed: each can be a read of Hermes's chats.
+    titles: dict[tuple[str, str], str] = {}
+    for entry in out:
+        chat = (entry["profile"], entry["chat_id"])
+        if chat[1] and chat not in titles:
+            titles[chat] = _chat_title(pulse_store, home, *chat)
+        entry["chat_title"] = titles.get(chat, "")
+    return out
+
+
+def _chat_title(pulse_store: Any, home: Optional[Path], profile: str, chat_id: str) -> str:
+    """A chat's title as What Pulse learned names it, the one its newest
+    card gave it, or as Hermes has it for a chat no card came from yet."""
+    return pulse_store.card_chat_title(profile, chat_id) or (
+        pulse_followup.chat_title(Path(home), {"profile": profile, "chat_id": chat_id}) if home is not None else "")
+
+
+def bring_up(pulse_store: Any, candidate_id: Any, home: Optional[Path] = None,
+             now: Optional[float] = None) -> dict[str, Any]:
+    """Makes a card on the Pulse screen of something a report left out
+    (``left_out``), as a report card: its thumbs, Do it and Done teach Pulse
+    about things like it. The card it already became, if it or another
+    candidate about the same thing did. Refused while Pulse is off, and for
+    a candidate whose thing came up or the journal no longer has."""
+    if not pulse_store.get("enabled"):
+        raise Refused("pulse_off")
+    if not isinstance(candidate_id, int) or isinstance(candidate_id, bool):
+        raise Refused("invalid", field="id")
+    found = pulse_store.candidate(candidate_id)
+    if found is None or found["decision"] == pulse_candidates.SURFACED or not found["text"]:
+        raise Refused("invalid", field="id")
+    now = time.time() if now is None else now
+    row = pulse_learning.left_out_card(
+        pulse_store, found, kinds=pulse_report.KINDS, now=now,
+        item_chat_title=lambda item: _chat_title(pulse_store, home, item["profile"], item["chat_id"]))
+    card_id = pulse_store.bring_up(candidate_id, row, _left_out_since(pulse_store, now), _on_the_way(pulse_store))
+    card = pulse_store.card(card_id) if card_id is not None else None
+    if card is None:
+        raise Refused("invalid", field="id")
+    return pulse_learning.card_entry(card, pulse_store.done_marks([card["id"]]).get(card["id"]))
 
 
 def undo(pulse_store: Any, lesson_id: Any, now: Optional[float] = None) -> bool:

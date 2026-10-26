@@ -12,11 +12,12 @@ Never raises into a hook: callers wrap it. Off unless ``enabled`` is set.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from . import pulse_prefs as prefs
 
@@ -214,7 +215,15 @@ CREATE TABLE IF NOT EXISTS cards (
     briefed_at REAL,
     rating TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL DEFAULT '',
-    rated_at REAL
+    rated_at REAL,
+    -- The biggest part learning played in bringing it up (pulse_prefs'
+    -- Learned.factor, JSON; "" for none), for its Why?.
+    learned TEXT NOT NULL DEFAULT '',
+    -- Where it came from and how soon it was due as it came up
+    -- (pulse_prefs.place and band), which its signals carry once the
+    -- journal no longer has its candidate.
+    place TEXT NOT NULL DEFAULT '',
+    band TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS cards_created ON cards(created_at);
 -- What ratings taught Pulse (pulse_learning): each row changes what Pulse
@@ -338,6 +347,8 @@ def _check_marks(marks: str) -> None:
 
 # A report's item on its own card (pulse_learning.add_noticed_cards).
 NOTICED = "noticed"
+# A lesson that forgets what learning holds about something (pulse_learning.reset).
+RESET = "reset"
 # Why an item memory learned after its time had passed is closed (pulse_memory.LATE_S).
 LATE_BY = "expiry: learned after its time had passed"
 # The report attempts split into such cards, newest last: their typed
@@ -347,7 +358,7 @@ SPLIT_REPORTS = "split_reports"
 SPLIT_ITEMS = '"split"'
 
 CARD_COLUMNS = ("kind", "item_id", "level", "title", "quote", "news", "why", "profile", "chat_id", "chat_title",
-                "message_id", "topic", "brief", "created_at")
+                "message_id", "topic", "brief", "created_at", "learned", "place", "band")
 # Card columns added after the first build, oldest first, with their types.
 # Columns a table gained after stores existed, added to a store from before.
 _ADDED_COLUMNS = (("cards", "topic", "TEXT NOT NULL DEFAULT ''"), ("cards", "brief", "TEXT NOT NULL DEFAULT ''"),
@@ -356,7 +367,9 @@ _ADDED_COLUMNS = (("cards", "topic", "TEXT NOT NULL DEFAULT ''"), ("cards", "bri
                   ("candidates", "band", "TEXT NOT NULL DEFAULT ''"), ("candidates", "place", "TEXT NOT NULL DEFAULT ''"),
                   ("candidates", "score", "REAL"), ("candidates", "factor", "TEXT NOT NULL DEFAULT ''"),
                   ("candidates", "floor", "INTEGER NOT NULL DEFAULT 0"),
-                  ("candidates", "level", "TEXT NOT NULL DEFAULT ''"))
+                  ("candidates", "level", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "learned", "TEXT NOT NULL DEFAULT ''"), ("cards", "place", "TEXT NOT NULL DEFAULT ''"),
+                  ("cards", "band", "TEXT NOT NULL DEFAULT ''"))
 # What report cards said for Why? before a candidate's reason did (an item's card,
 # never shown; a whole report's card), and the setting that says a store has
 # cleared them.
@@ -1391,6 +1404,87 @@ class PulseStore:
                                (card_id,)).fetchone()
         return dict(row) if row else None
 
+    def left_out(self, since: float, limit: int, on_the_way: str = "") -> list[dict]:
+        """The candidates journaled from ``since`` on that didn't come up,
+        newest first, each with the thing it is about (``things``) as
+        ``thing``, whether that thing came up (``_came_up_rows``, with what
+        report run ``on_the_way`` picked) in the same run or later as
+        ``later``, and as ``card_id`` the card it was brought up as
+        (``bring_up``), or another candidate about the same thing was,
+        however long ago (``_brought_rows``). A card that has been pruned
+        isn't named, since bringing the thing up would make another."""
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(
+                "SELECT * FROM candidates WHERE created_at >= ? AND decision!='surfaced' "
+                "ORDER BY created_at DESC, id LIMIT ?", (since, limit))]
+            came = _came_up_rows(conn, since, on_the_way)
+            held = _brought_rows(conn)
+        thing = things([*rows, *came, *held])
+        came_up = _came_up(came, thing)
+        kept = {row["card_id"] for row in held}
+        brought: dict[Any, int] = {}
+        for row in held:
+            key = thing(row)
+            if key is not None:
+                brought.setdefault(key, row["card_id"])
+        for row in rows:
+            row["thing"] = thing(row)
+            if row["card_id"] not in kept:
+                row["card_id"] = brought.get(row["thing"])
+            row["later"] = came_up.get(row["thing"], -math.inf) >= row["created_at"]
+        return rows
+
+    def latest_candidate_at(self) -> Optional[float]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT MAX(created_at) FROM candidates").fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+    def candidate(self, candidate_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        return dict(row) if row else None
+
+    def bring_up(self, candidate_id: int, row: dict[str, Any], since: float,
+                 on_the_way: str = "") -> Optional[int]:
+        """Makes a card of a candidate that didn't come up (``row``, its
+        columns) and notes it on the candidate, in one write: its signals
+        carry the candidate's kind, place and band. The card it already has,
+        if another tap made one first (and it's still kept), or that another
+        candidate about the same thing was brought up as, however long ago,
+        which ``left_out`` names; None when the journal no longer has the
+        candidate, or the thing came up meanwhile, read as ``left_out``
+        reads it from ``since`` (and ``on_the_way``): it hides what came up,
+        but a list read before still offers it."""
+        _check_columns(row, CARD_COLUMNS)
+        with _lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                found = conn.execute("SELECT item_id, text, created_at, card_id, "
+                                     "EXISTS(SELECT 1 FROM cards WHERE cards.id=candidates.card_id) "
+                                     "AS kept FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+                if found is None or (found["card_id"] is not None and found["kept"]):
+                    conn.execute("ROLLBACK")
+                    return None if found is None else int(found["card_id"])
+                came_up, made = _thing_since(conn, found, since, on_the_way)
+                if came_up or made is not None:
+                    conn.execute("ROLLBACK")
+                    return made
+                card_id = int(conn.execute(f"INSERT INTO cards({', '.join(row)}) VALUES({', '.join('?' * len(row))})",
+                                           tuple(row.values())).lastrowid)
+                conn.execute("UPDATE candidates SET card_id=? WHERE id=?", (card_id, candidate_id))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return card_id
+
+    def card_chat_title(self, profile: str, chat_id: str) -> str:
+        """The title the newest card from this chat gave it; "" for none."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT chat_title FROM cards WHERE profile=? AND chat_id=? AND chat_title!='' "
+                               "ORDER BY id DESC LIMIT 1", (profile, chat_id)).fetchone()
+        return row["chat_title"] if row else ""
+
     def run_candidates(self, run_id: str) -> list[dict]:
         """A run's candidates: its picks in their order, then the rest as listed."""
         with self._connect() as conn:
@@ -1412,18 +1506,31 @@ class PulseStore:
                                                       (since,))]
 
     def learned(self, now: float) -> prefs.Learned:
-        """What the signals add up to at ``now`` (pulse_prefs.learn), fitted
-        again only once they change or LEARNED_FOR_S goes by: the tick asks
-        every half minute while a follow-up waits to go out."""
+        """What the signals add up to at ``now`` (pulse_prefs.learn), without
+        what the resets in force forgot, fitted again only once either
+        changes or LEARNED_FOR_S goes by: the tick asks every half minute
+        while a follow-up waits to go out."""
         since = now - prefs.KEEP_S
         with self._connect() as conn:
-            totals = tuple(conn.execute("SELECT COUNT(*), TOTAL(at), TOTAL(useful), TOTAL(weight) FROM signals "
-                                        "WHERE at >= ?", (since,)).fetchone())
+            rows = [dict(row) for row in conn.execute("SELECT * FROM signals WHERE at >= ? ORDER BY at, card_id, what",
+                                                      (since,))]
+            resets = tuple((row["kind"], row["value"], float(row["created_at"])) for row in conn.execute(
+                "SELECT kind, value, created_at FROM lessons WHERE what=? AND undone_at IS NULL ORDER BY id",
+                (RESET,)))
+        if not rows and not resets:
+            # Nothing to fit and nothing to keep. A host that never turned
+            # Pulse on reads through a scratch store with a path of its
+            # own, which would leave the cache an entry heavier per read.
+            return prefs.learn(rows, now, resets)
+        # From the rows just read, not read again: the fit and what the
+        # cache says it was fitted from are then the same signals.
+        totals = (len(rows), sum(row["at"] or 0 for row in rows), sum(row["useful"] or 0 for row in rows),
+                  sum(row["weight"] or 0 for row in rows))
         kept = _learned.get(str(self.path))
-        if kept is not None and kept[0] == totals and 0 <= now - kept[1] < LEARNED_FOR_S:
+        if kept is not None and kept[0] == (totals, resets) and 0 <= now - kept[1] < LEARNED_FOR_S:
             return kept[2]
-        fitted = prefs.learn(self.signals(since), now)
-        _learned[str(self.path)] = (totals, now, fitted)
+        fitted = prefs.learn(rows, now, resets)
+        _learned[str(self.path)] = ((totals, resets), now, fitted)
         return fitted
 
     def prune_signals(self, before: float) -> int:
@@ -1445,8 +1552,9 @@ class PulseStore:
 def _signal_attrs(conn: sqlite3.Connection, card_id: int) -> Optional[dict[str, Any]]:
     """What a card's signals carry: its kind, place and band as it came up
     (from its candidate when the journal still has it, else as the card's
-    earlier signals had them), and when it was pushed, if it was. None for a
-    card that takes none (a report or brief as a whole)."""
+    earlier signals had them, else as the card kept them), and when it was
+    pushed, if it was. None for a card that takes none (a report or brief as
+    a whole)."""
     card = conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
     if card is None or card["kind"] not in ("followup", NOTICED):
         return None
@@ -1460,6 +1568,10 @@ def _signal_attrs(conn: sqlite3.Connection, card_id: int) -> Optional[dict[str, 
     kept = conn.execute("SELECT kind, place, band FROM signals WHERE card_id=? LIMIT 1", (card_id,)).fetchone()
     if kept is not None:
         return {"kind": kept["kind"], "place": kept["place"], "band": kept["band"], "pushed": pushed}
+    if card["band"]:
+        # Kept on the card as it came up (0.84.0), for a first signal after the journal let its candidate go.
+        return {"kind": "followup" if card["kind"] == "followup" else card["topic"] or "other",
+                "place": card["place"], "band": card["band"], "pushed": pushed}
     item = conn.execute("SELECT due_at FROM items WHERE id=?", (card["item_id"],)).fetchone() \
         if card["item_id"] is not None else None
     band = prefs.band(item["due_at"], float(card["created_at"])) if item is not None else ""
@@ -1550,6 +1662,96 @@ def _sync_signals(conn: sqlite3.Connection, gaps: dict[str, list[sqlite3.Row]]) 
     for row in gaps["unmarked"]:
         conn.execute("UPDATE signals SET weight=? WHERE card_id=? AND what=?",
                      (prefs.ACT_SENT, row["card_id"], prefs.ACT))
+
+
+def same_text(text: str) -> str:
+    """A candidate's text spaced and cased alike, so the same thing found
+    twice reads as one."""
+    return " ".join(text.split()).casefold()
+
+
+def same_thing(row: Any) -> list[tuple[str, Any]]:
+    """What a candidate is about: its remembered item, and its text."""
+    keys: list[tuple[str, Any]] = [("item", row["item_id"])] if row["item_id"] is not None else []
+    text = same_text(row["text"] or "")
+    return keys + [("text", text)] if text else keys
+
+
+def things(rows: Sequence[Any]) -> Callable[[Any], Optional[tuple[str, Any]]]:
+    """The thing each of ``rows`` is about, as a key its rows share (None for
+    a row with neither item nor text): rows sharing a remembered item or a
+    text (``same_thing``) are one thing, and so is every row joined to them
+    that way, so an item whose words changed between reports, and words a
+    report found on their own, are still the one thing."""
+    parent: dict[tuple[str, Any], tuple[str, Any]] = {}
+
+    def root(key: tuple[str, Any]) -> tuple[str, Any]:
+        while parent.setdefault(key, key) != key:
+            parent[key] = key = parent[parent[key]]
+        return key
+
+    for row in rows:
+        keys = same_thing(row)
+        for key in keys[1:]:
+            parent[root(key)] = root(keys[0])
+
+    def thing(row: Any) -> Optional[tuple[str, Any]]:
+        keys = same_thing(row)
+        return root(keys[0]) if keys else None
+    return thing
+
+
+def _came_up(came: Sequence[Any], thing: Callable[[Any], Optional[tuple[str, Any]]]) -> dict[Any, float]:
+    """When each thing last came up, by what came up (``_came_up_rows``)."""
+    came_up: dict[Any, float] = {}
+    for row in came:
+        key = thing(row)
+        if key is not None:
+            came_up[key] = max(came_up.get(key, row["created_at"]), row["created_at"])
+    return came_up
+
+
+def _came_up_rows(conn: sqlite3.Connection, since: float, on_the_way: str) -> list[Any]:
+    """What came up from ``since`` on, as rows ``things`` reads: the
+    candidates reports brought up as cards, and those report run
+    ``on_the_way`` picked, whose cards are on their way (what a report that
+    was dropped, or that Hermes refused, picked never came up), and the
+    cards no candidate made (a report sent without its candidate list, a
+    follow-up), by their item and words."""
+    return [*conn.execute("SELECT item_id, text, created_at FROM candidates WHERE created_at >= ? "
+                          "AND decision='surfaced' AND (card_id IS NOT NULL OR run_id=?)", (since, on_the_way)),
+            *conn.execute("SELECT item_id, news AS text, created_at FROM cards WHERE created_at >= ? AND id NOT IN "
+                          "(SELECT card_id FROM candidates WHERE card_id IS NOT NULL)", (since,))]
+
+
+def _brought_rows(conn: sqlite3.Connection) -> list[Any]:
+    """The candidates brought up (``bring_up``) as a card Pulse still keeps,
+    newest first, as far back as the journal goes: a thing brought up from
+    an older report's list is still that card when the latest leaves it out
+    again."""
+    return conn.execute("SELECT item_id, text, card_id FROM candidates WHERE decision!='surfaced' "
+                        "AND card_id IN (SELECT id FROM cards) ORDER BY created_at DESC, id").fetchall()
+
+
+def _thing_since(conn: sqlite3.Connection, found: Any, since: float,
+                 on_the_way: str) -> tuple[bool, Optional[int]]:
+    """For the thing candidate ``found`` is about, read from ``since`` (or
+    from ``found``, if older) as ``left_out`` reads it: whether it came up in
+    ``found``'s own run or later, which ``left_out`` leaves out as ``later``,
+    and the kept card another candidate about it was brought up as, however
+    long ago."""
+    since = min(since, found["created_at"])
+    rows = conn.execute("SELECT item_id, text FROM candidates WHERE created_at >= ? AND decision!='surfaced'",
+                        (since,)).fetchall()
+    came = _came_up_rows(conn, since, on_the_way)
+    held = _brought_rows(conn)
+    thing = things([*rows, *came, *held, found])
+    key = thing(found)
+    if key is None:
+        return False, None
+    if _came_up(came, thing).get(key, -math.inf) >= found["created_at"]:
+        return True, None
+    return False, next((int(row["card_id"]) for row in held if thing(row) == key), None)
 
 
 def _insert_candidates(conn: sqlite3.Connection, run_id: str, rows: Sequence[dict[str, Any]], now: float) -> list[int]:
