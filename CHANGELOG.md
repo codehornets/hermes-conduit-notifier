@@ -13,7 +13,7 @@ checks it). The format is fixed, because Conduit reads it:
 - One line per change, starting with `- `. Fixes say what goes wrong without
   the update. Plain words: these show on a phone.
 
-## 0.79.0 (2026-10-25)
+## 0.79.0 (2026-10-26)
 
 ### New and improved
 - Conduit's Predictive settings can suggest your next message after a
@@ -24,6 +24,23 @@ checks it). The format is fixed, because Conduit reads it:
   Hermes Desktop shows no notes for them. A faster model can answer
   instead: set `auxiliary.conduit_predict` (provider and model) in the
   profile's config.
+
+## 0.78.3 (2026-10-26)
+
+### New and improved
+- Not now asks until when: later today, tomorrow or next week (those two in time for that morning's brief). The card leaves the list and comes back as new at that time, at the top, unless the thing got done meanwhile: one about something Pulse remembers has its chat read first, and a thing that got done is marked done instead. Needs Conduit from the `pulse` branch; an older app keeps the plain Not now.
+
+## 0.78.2 (2026-10-26)
+
+### New and improved
+- A note to Pulse, in your own words: what to always bring up, what to leave out. Settings > Pulse has it (Conduit on the `pulse` branch, #1277), and so does `hermes conduit-push pulse note "…"`. Pulse reads it before every report, morning brief and reminder; where it says what to bring up or leave out, it comes before Pulse's own rules.
+
+## 0.78.1 (2026-10-25)
+
+### Fixes
+- A bot's Bot Chat now shows what it made in Artifacts, both in the chat's
+  own list and on the Artifacts page. Before, pictures and files a bot sent
+  in its Bot Chat never appeared there.
 
 ## 0.78.0 (2026-10-25)
 

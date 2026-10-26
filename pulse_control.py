@@ -172,10 +172,21 @@ def backfill_start(pulse_store: Any, home: Path, days: Optional[int] = None,
 
 
 SETTINGS = ("enabled", "memory", "followups", "daily_report", "report_profiles", "report_times", "time_zone",
-            "brief_time", "model", "nudge", "memory_daily_tokens", "followup_daily_tokens")
+            "brief_time", "model", "nudge", "memory_daily_tokens", "followup_daily_tokens", "note")
 # What a daily token budget may be set to.
 MIN_DAILY_TOKENS = 10_000
 MAX_DAILY_TOKENS = 5_000_000
+# How long the user's note to Pulse may be: a few paragraphs, and a bounded
+# share of every prompt it goes into.
+NOTE_LIMIT = 1_500
+
+
+def _encodes(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def update(pulse_store: Any, body: Any) -> None:
@@ -187,7 +198,9 @@ def update(pulse_store: Any, body: Any) -> None:
     "model" (the model Pulse's turns run on), or null for the chat's own;
     "gentle", "balanced" or "eager" for "nudge"; a whole number of tokens,
     MIN_DAILY_TOKENS to MAX_DAILY_TOKENS, for "memory_daily_tokens" and
-    "followup_daily_tokens" (null for follow-ups: the nudge level's)."""
+    "followup_daily_tokens" (null for follow-ups: the nudge level's); a
+    string of at most NOTE_LIMIT characters for "note", what the user asked
+    of Pulse in their own words ("" clears it)."""
     if not isinstance(body, dict):
         raise Refused("invalid", field="")
     for field in body:
@@ -237,6 +250,14 @@ def update(pulse_store: Any, body: Any) -> None:
                 changes[field] = value
             else:
                 raise Refused("invalid", field=field)
+    if "note" in body:
+        value = body["note"].strip() if isinstance(body["note"], str) else None
+        # Prose only: no control characters but line breaks and tabs, and
+        # nothing UTF-8 can't carry (an unpaired surrogate from JSON).
+        if value is None or len(value) > NOTE_LIMIT or any(ord(ch) < 32 and ch not in "\n\t" for ch in value) \
+                or not _encodes(value):
+            raise Refused("invalid", field="note")
+        changes["note"] = value
     for key, value in changes.items():
         pulse_store.set(key, value)
 
@@ -335,11 +356,22 @@ def done(pulse_store: Any, card_id: Any, is_done: Any = True, now: Optional[floa
                                                  now=time.time() if now is None else now))
 
 
-def dismiss(pulse_store: Any, card_id: Any, dismissed: Any = True, now: Optional[float] = None) -> bool:
-    """Swipes a card away ("Not now", nothing learned), or puts it back
-    with False; whether it changed."""
-    return _learning(lambda: pulse_learning.dismiss(pulse_store, card_id, dismissed,
-                                                    now=time.time() if now is None else now))
+def dismiss(pulse_store: Any, card_id: Any, dismissed: Any = True, now: Optional[float] = None,
+            until: Any = None, home: Any = None) -> bool:
+    """Swipes a card away ("Not now", nothing learned) until later today,
+    tomorrow or next week (``until``, pulse_followup.RESTS: it comes back
+    as new then) or for good, or puts it back with False; whether it
+    changed. ``home`` gives the user's time zone (pulse.report_zone)."""
+    now = time.time() if now is None else now
+    rest_until = None
+    if until is not None and dismissed is True:
+        if not isinstance(until, str) or until not in pulse_followup.RESTS:
+            raise Refused("invalid", field="until")
+        if not isinstance(card_id, int) or isinstance(card_id, bool) or pulse_store.card(card_id) is None:
+            raise Refused("invalid", field="card")  # before the zone is read for a card that isn't there
+        zone = pulse.report_zone(pulse_store, Path(home) if home else Path("."), now)
+        rest_until = pulse_followup.rest_time(until, now, zone, pulse_store)
+    return _learning(lambda: pulse_learning.dismiss(pulse_store, card_id, dismissed, now=now, rest_until=rest_until))
 
 
 def acted(pulse_store: Any, card_id: Any, now: Optional[float] = None) -> bool:
@@ -415,6 +447,7 @@ def state(pulse_store: Any, home: Path, now: Optional[float] = None) -> dict[str
         # Whether the budget was set, or comes with the nudge level.
         "followup_daily_tokens_set": _number(pulse_store.get("followup_daily_tokens")),
         "nudge": pulse_learning.nudge(pulse_store),
+        "note": pulse.report.note(pulse_store),
         "levels": pulse_learning.levels(pulse_store),
         "unseen_cards": pulse_store.unseen_cards(),
         "brief_time": pulse.report.clock_text(pulse_store.get("brief_time") or pulse.brief.DEFAULT_TIME),

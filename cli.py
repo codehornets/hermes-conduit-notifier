@@ -50,10 +50,10 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
              "next connects to this dashboard; `hermes conduit-push unpair` cuts it off now",
     )
     pulse = commands.add_parser("pulse", help="Pulse, the proactivity experiment: on, off, status, probe, report, home, outcomes, memory, followups, "
-                                                 "cards, rate, done, learned, nudge, budget, candidates")
+                                                 "cards, rate, done, learned, nudge, budget, candidates, note")
     pulse.add_argument("pulse_action", choices=["on", "off", "status", "probe", "report", "home", "outcomes", "memory",
                                                 "followups", "cards", "rate", "done", "learned", "nudge", "budget",
-                                                "candidates"])
+                                                "candidates", "note"])
     pulse.add_argument("value", nargs="?", default="",
                        help="for home: the id of the chat to use, or 'auto' to find it by title; "
                             "for outcomes: how many to show, or a chat id; "
@@ -66,13 +66,15 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
                             "for learned: 'undo' and a lesson number, or a kind and a loudness to set; "
                             "for nudge: gentle, balanced or eager; "
                             "for budget: memory or followups; "
-                            "for candidates: how many reports to show")
+                            "for candidates: how many reports to show; "
+                            "for note: what you want from Pulse, in your own words, or 'clear'")
     pulse.add_argument("extra", nargs="?", default="",
                        help="for memory forget: the item number; for memory backfill: how many days back "
                             "(it shows what that costs), 'start', 'stop' or 'cancel'; "
                             "for rate: 'up', 'down', or a reason for a thumbs down (not_relevant, already_knew, "
                             "too_late, too_often); for done: 'undo' to take the mark off; for learned: the lesson number, or push, screen, brief or off; "
-                            "for budget: tokens a day, or 'auto' for follow-ups to go with the nudge level")
+                            "for budget: tokens a day, or 'auto' for follow-ups to go with the nudge level; "
+                            "for note: more words of the note (a quoted note needs none)")
     prefs = commands.add_parser(
         "prefs",
         help="Conduit's synced preferences: export them to a file, or import one from another host",
@@ -292,6 +294,7 @@ def _pulse(args: argparse.Namespace) -> int:
     listing = action in ("followups", "cards", "rate", "done", "learned", "candidates") \
         or (action == "memory" and (args.value or "").strip() not in ("on", "off")) \
         or (action == "nudge" and not (args.value or "").strip()) \
+        or (action == "note" and (args.value or "").strip() in ("", "clear")) \
         or (action == "budget" and not str(getattr(args, "extra", "") or "").strip())
     if (action in ("status", "probe", "off", "outcomes") or listing) and not (Path(home) / pulse_delivery.store.DB_NAME).exists():
         # Never turned on: say so without leaving a file behind.
@@ -335,7 +338,11 @@ def _pulse(args: argparse.Namespace) -> int:
         return _pulse_followups(pulse_store, home, (args.value or "").strip())
     if action in ("cards", "rate", "done", "learned"):
         return _pulse_learning(pulse_store, action, (args.value or "").strip(),
-                               str(getattr(args, "extra", "") or "").strip())
+                               str(getattr(args, "extra", "") or "").strip(), home)
+    if action == "note":
+        # An unquoted two-word note is still the whole note.
+        words = ((args.value or "").strip(), str(getattr(args, "extra", "") or "").strip())
+        return _pulse_note(pulse_store, " ".join(word for word in words if word))
     if action == "nudge":
         return _pulse_nudge(pulse_store, (args.value or "").strip())
     if action == "candidates":
@@ -436,6 +443,9 @@ def _pulse(args: argparse.Namespace) -> int:
     else:
         print("Follow-ups: off")
     print(f"Nudging: {pulse_learning.nudge(pulse_store)} (`hermes conduit-push pulse nudge gentle|balanced|eager`)")
+    note = " ".join(pulse.report.note(pulse_store).split())
+    print(f"Note to Pulse: {_printable(note)}" if note
+          else "No note to Pulse (`hermes conduit-push pulse note \"what you want from it\"`)")
     learning_lines = _learning_status(pulse_store)
     if learning_lines:
         print(learning_lines)
@@ -558,6 +568,26 @@ def _pulse_nudge(pulse_store: Any, value: str) -> int:
     return 0
 
 
+def _pulse_note(pulse_store: Any, value: str) -> int:
+    """Shows, sets or clears the user's note to Pulse, which every report,
+    brief and check reads (pulse_report.note)."""
+    from . import pulse_control, pulse_report
+    if value:
+        try:
+            pulse_control.update(pulse_store, {"note": "" if value == "clear" else value})
+        except pulse_control.Refused:
+            print(f"The note can be at most {pulse_control.NOTE_LIMIT} characters.")
+            return 2
+    note = " ".join(pulse_report.note(pulse_store).split())
+    if note:
+        print(f"Note to Pulse: {_printable(note)}")
+        print("Its reports, morning brief and reminders read it before they pick what to say.")
+    else:
+        print("No note to Pulse. `hermes conduit-push pulse note \"what you want from it\"` sets one, in your own "
+              "words: what to always bring up, what to leave out.")
+    return 0
+
+
 def _pulse_budget(pulse_store: Any, which: str, value: str) -> int:
     from . import pulse, pulse_control
     field = {"memory": "memory_daily_tokens", "followups": "followup_daily_tokens"}.get(which)
@@ -636,9 +666,10 @@ def _learning_status(pulse_store: Any) -> str:
     return ("Pulse screen: " + "; ".join(parts)) if parts else ""
 
 
-def _pulse_learning(pulse_store: Any, action: str, value: str, extra: str) -> int:
-    from . import pulse_control, pulse_learning
+def _pulse_learning(pulse_store: Any, action: str, value: str, extra: str, home: Any = None) -> int:
+    from . import pulse, pulse_control, pulse_learning
     if action == "cards":
+        zone = pulse.report_zone(pulse_store, Path(home) if home else Path("."))  # the user's, as `pulse status`
         cards = pulse_store.cards(MEMORY_LIST)
         if not cards:
             print("No cards yet: Pulse hasn't brought you anything.")
@@ -646,7 +677,10 @@ def _pulse_learning(pulse_store: Any, action: str, value: str, extra: str) -> in
         for card in cards:
             rated = f" (rated {card['rating']}{', ' + card['reason'] if card['reason'] else ''})" if card["rating"] else ""
             finished = " (done)" if card["id"] in marks else ""
-            finished += " (put away)" if card.get("dismissed_at") else ""
+            if card.get("dismissed_at"):
+                back = card.get("rest_until")
+                finished += f" (put away, back {datetime.fromtimestamp(back, zone).strftime('%a %H:%M')})" if back \
+                    else " (put away)"
             topic = f" [{card['topic']}]" if card["topic"] else ""
             print(_printable(f"#{card['id']} [{card['level']}]{topic} {card['title']}: {card['news']}{rated}{finished}"))
         return 0

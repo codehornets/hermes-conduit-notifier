@@ -374,6 +374,9 @@ def tick(now: Optional[float] = None) -> None:
     # Even with follow-ups turned off: one already sent still lands.
     followup.settle(pulse_store, now, home)
     brief.settle(pulse_store, now)
+    # Not now until a time that has come: the card comes back as new (one
+    # about something still open after its chat is read, in _memory_run).
+    followup.return_rested(pulse_store, now)
     learning.drop_empty_reports(pulse_store)
     pulse_store.prune_cards(CARDS_KEEP, held_before=now - HELD_DAYS * 86400.0)
     pulse_store.prune_candidates(now - candidates.JOURNAL_DAYS * 86400.0)
@@ -664,7 +667,7 @@ def _report_run(home: Path, chat_id: str, run: dict) -> None:
         route = lent_route(home, chat_id)
         rows, tokens = candidates.ask(lambda instructions, text: _memory_llm(
             instructions, text, purpose="pulse report", max_tokens=candidates.REPLY_TOKENS, route=route), gathered,
-            nudge=learning.nudge(pulse_store))
+            nudge=learning.nudge(pulse_store), note=report.note(pulse_store))
         candidates.decide(pulse_store, rows, now=now)
         ready = {**run, "state": RUN_READY, "since": gathered.since, "tokens": tokens}
         if not pulse_store.finish_run(REPORT_RUN, run, rows, ready, now=now):
@@ -724,7 +727,8 @@ def _send_turn_report(pulse_store: store.PulseStore, home: Path, chat_id: str, n
     recent = candidates.recent_section(pulse_store, report_zone(pulse_store, home, now), now)
     context, since = report.build(home, pulse_store, home_chat_id=chat_id, now=now, extra=recent)
     return _send(pulse_store, kind=REPORT, chat_id=chat_id, text=lambda tag: report.report_text(tag, context, since,
-                                                                                    learning.nudge(pulse_store)))
+                                                                                    learning.nudge(pulse_store),
+                                                                                    report.note(pulse_store)))
 
 
 def _maybe_followup(pulse_store: store.PulseStore, home: Path, now: float) -> bool:
@@ -762,7 +766,8 @@ def _maybe_brief(pulse_store: store.PulseStore, home: Path, now: float) -> bool:
     context = brief.context(home, pulse_store, cards, home_chat_id=chat.chat_id, now=now, zone=zone)
     pulse_store.set(brief.PENDING, {"item_id": item_id, "ids": [card["id"] for card in cards]})
     delivery.submit(pulse_store, _sender(pulse_store), kind=BRIEF,
-                    chat_id=chat.chat_id, text=brief.text_for(context), item_id=item_id, attempt=attempt)
+                    chat_id=chat.chat_id, text=brief.text_for(context, report.note(pulse_store)), item_id=item_id,
+                    attempt=attempt)
     return True
 
 
@@ -822,7 +827,10 @@ def _memory_run(home: Path, home_chat_id: str, now: float, stopped: threading.Ev
         # follow-up budget, whatever follow-ups' switch: they hold report
         # cards too, and a stale card shouldn't reach the brief either way.
         holds = follow_used < follow_cap and bool(pulse_store.held_cards(1))
-        if used >= cap and not follows and not acts and not holds:
+        # Likewise a card swiped away until now, about something still open:
+        # with the budget spent it comes back unread rather than late.
+        rests = any(card["item_id"] is not None for card in pulse_store.rested_cards(now))
+        if used >= cap and not follows and not acts and not holds and not rests:
             return  # `pulse status` says so
         profiles = pulse_store.get("report_profiles")
         sources = memory_sources(pulse_store, home, home_chat_id, profiles)
@@ -852,15 +860,22 @@ def _memory_run(home: Path, home_chat_id: str, now: float, stopped: threading.Ev
                                         budget=float("inf"), done=acted)
                 finally:
                     _count_checks(pulse_store, acted)  # in the totals, not the follow-up day's budget
-            if holds:
+            if holds or rests:
                 try:
-                    followup.check_held(pulse_store, home, lambda instructions, text: ask(
-                                            instructions, text, purpose="pulse follow-up"), zone=zone,
-                                        now=max(now, time.time()),
-                                        still_leader=lambda: not stopped.is_set() and _leads(pulse_store),
-                                        budget=follow_cap - follow_used, done=checked)
-                except Exception:  # noqa: BLE001 — the brief tells them as they were
-                    logger.warning("conduit_push: Pulse held card checks failed", exc_info=True)
+                    if holds:
+                        followup.check_held(pulse_store, home, lambda instructions, text: ask(
+                                                instructions, text, purpose="pulse follow-up"), zone=zone,
+                                            now=max(now, time.time()),
+                                            still_leader=lambda: not stopped.is_set() and _leads(pulse_store),
+                                            budget=follow_cap - follow_used, done=checked)
+                    if rests:
+                        followup.check_rested(pulse_store, home, lambda instructions, text: ask(
+                                                  instructions, text, purpose="pulse follow-up"), zone=zone,
+                                              now=max(now, time.time()),
+                                              still_leader=lambda: not stopped.is_set() and _leads(pulse_store),
+                                              budget=follow_cap - follow_used, done=checked)
+                except Exception:  # noqa: BLE001 — the brief tells them as they were; a rested card waits
+                    logger.warning("conduit_push: Pulse held or rested card checks failed", exc_info=True)
                 finally:
                     if not follows:
                         _count_checks(pulse_store, checked)  # else the follow-up run counts them with its own
