@@ -760,6 +760,41 @@ def test_the_load_sweep_runs_once_a_load_off_the_start_path(hermes, monkeypatch)
             sys.modules.pop(name)
 
 
+@pytest.mark.parametrize("step", ["__init__", "start"])
+def test_a_sweep_that_cant_start_is_left_to_the_next_load(hermes, monkeypatch, caplog, step):
+    furina = _home(hermes, "furina")
+    _room(hermes.root / "state.db", "long-gone", [FURINA, LAIFU], disbanded_at=2.0)
+    _room_session(furina, "f-gone", "long-gone")
+    own = hermes.rooms.disband_room
+
+    def no_thread(self, *args, **kwargs):
+        raise RuntimeError("can't start new thread")
+
+    with monkeypatch.context() as threads, caplog.at_level(logging.WARNING, logger=cleanup.__name__):
+        threads.setattr(threading.Thread, step, no_thread)
+        # The plugin still loads, and disbands are still guarded.
+        assert cleanup.install()
+    assert hermes.rooms.disband_room.__wrapped__ is own
+    assert cleanup._sweeper is None
+    assert not getattr(hermes.rooms, cleanup._SWEPT_FLAG, False)
+    assert "couldn't start" in caplog.text and "next loads" in caplog.text
+
+    # The dashboard's copy, loaded in the same process after it, sweeps.
+    second_package = types.ModuleType("conduit_push_second")
+    second_package.__path__ = [str(ROOT)]
+    monkeypatch.setitem(sys.modules, "conduit_push_second", second_package)
+    second = _load("conduit_push_second.room_cleanup", ROOT / "room_cleanup.py")
+    second.SWEEP_AFTER_S = 0.0
+    try:
+        assert second.install()
+        second._sweeper.join(5)
+        assert _ids(furina) == set()
+    finally:
+        second.uninstall()
+        for name in [name for name in sys.modules if name.startswith("conduit_push_second.")]:
+            sys.modules.pop(name)
+
+
 def test_unloading_stops_a_sweep_that_hasnt_run(hermes, monkeypatch):
     furina = _home(hermes, "furina")
     _room(hermes.root / "state.db", "long-gone", [FURINA, LAIFU], disbanded_at=2.0)
