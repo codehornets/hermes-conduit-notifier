@@ -387,9 +387,11 @@ def tick(now: Optional[float] = None) -> None:
         _maybe_report(pulse_store, home, now)
 
 
-# Why a report or brief card is on the Pulse screen.
+# Why a report or brief card is on the Pulse screen. A report gives none: a
+# card's Why? is a reason of its own (its items' cards carry theirs, when a
+# candidate list gave them), never a stock line.
 TURN_WHY = {
-    REPORT: "Your Pulse report: what Hermes saw in your chats since the last one.",
+    REPORT: "",
     BRIEF: "Your morning brief: what's still outstanding, and the news you asked Pulse to hold for the morning.",
 }
 
@@ -436,7 +438,7 @@ def _turn_cards(pulse_store: store.PulseStore, home: Path, changed: list[dict], 
                         kinds=report.KINDS, item_chat_title=lambda item: followup.chat_title(home, item), now=now,
                         attempt=str(attempt), marks=(TURN_CARDS_DONE, store.SPLIT_REPORTS),
                         keep=TURN_CARDS_DONE_KEEP, links=[pick["id"] for pick in picked],
-                        found_in=candidates.found_in(picked))
+                        found_in=candidates.found_in(picked), whys=candidates.whys(picked))
                 else:
                     _mark_turn_card(pulse_store, attempt)
                 continue
